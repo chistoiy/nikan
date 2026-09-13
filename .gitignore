@@ -46,3 +46,11 @@ app.*.map.json
 
 # 协议参考资料（第三方文件不入库，见 docs/reference-来源与结论.md）
 docs/reference/
+
+# 签名配置（敏感，勿入库）
+android/key.properties
+android/app/*.jks
+android/app/*.keystore
+
+# 发布产物
+dist/
