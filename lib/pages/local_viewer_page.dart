@@ -1,11 +1,13 @@
 
-import 'package:exif/exif.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import '../app_model.dart';
 import '../engine/nikon_engine.dart';
 import '../engine/record_store.dart';
+import '../models/exif_summary.dart';
+import '../util/format.dart';
+import 'widgets/app_widgets.dart';
 import 'widgets/zoom_image.dart';
 
 /// 本地已下载照片查看器：翻页、缩放、EXIF、删除。
@@ -26,15 +28,20 @@ class LocalViewerPage extends StatefulWidget {
 }
 
 class _LocalViewerPageState extends State<LocalViewerPage> {
-  static const yellow = Color(0xFFFFE100);
+  static const yellow = kAccent;
 
   late final PageController _ctrl;
   final Map<String, Uint8List> _bytes = {};
-  final Map<String, Map<String, String>> _exif = {};
+  final Map<String, ExifSummary> _exif = {};  final Set<String> _deletedKeys = {};
   bool _showInfo = true;
-  bool _deleted = false;
 
   AppModel get model => widget.model;
+
+  /// 本页当前可见条目。翻页、标题计数、删除必须全部基于同一份列表，
+  /// 此前 PageView 用过滤后的列表而删除用 widget.entries 的索引，
+  /// 一旦错位就会删掉相邻的照片。
+  List<RecEntry> get _visible =>
+      widget.entries.where((e) => !_deletedKeys.contains(e.key)).toList();
 
   @override
   void initState() {
@@ -59,19 +66,12 @@ class _LocalViewerPageState extends State<LocalViewerPage> {
   }
 
   Future<void> _parseExif(String key, Uint8List bytes) async {
-    try {
-      final tags = await readExifFromBytes(bytes);
-      final info = <String, String>{
-        if (tags['EXIF ISOSpeedRatings']?.printable != null) 'iso': 'ISO ${tags['EXIF ISOSpeedRatings']!.printable}',
-        if (tags['EXIF FNumber']?.printable != null) 'f': 'f/${tags['EXIF FNumber']!.printable}',
-        if (tags['EXIF ExposureTime']?.printable != null) 's': '${tags['EXIF ExposureTime']!.printable}s',
-      };
-      if (mounted) setState(() => _exif[key] = info);
-    } catch (_) {}
+    final info = await ExifSummary.parse(bytes);
+    if (mounted) setState(() => _exif[key] = info);
   }
 
-  Future<void> _deleteCurrent(int index) async {
-    final e = widget.entries[index];
+  /// 删除当前页照片。入参就是当前显示的那一条，不再按索引二次查找。
+  Future<void> _deleteCurrent(RecEntry e) async {
     final ok = await showDialog<bool>(
       context: context,
       builder: (ctx) => AlertDialog(
@@ -89,34 +89,33 @@ class _LocalViewerPageState extends State<LocalViewerPage> {
       ),
     );
     if (ok != true || e.uri == null) return;
-    await NikonEngine.mediaDelete(e.uri!);
-    model.gateway.records.removeKey(e.key);
+    final deleted = await NikonEngine.mediaDelete(e.uri!);
     if (!mounted) return;
-    final remain = widget.entries.length - 1;
-    if (remain == 0) {
-      Navigator.pop(context);
-    } else {
-      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('已删除'), duration: Duration(seconds: 1)));
-      setState(() => _deleted = true);
+    if (!deleted) {
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('删除失败，文件仍在本机')));
+      return;
     }
-  }
-
-  String _fmtSize(num? b) {
-    if (b == null || b <= 0) return '';
-    if (b >= 1048576) return '${(b / 1048576).toStringAsFixed(1)}MB';
-    if (b >= 1024) return '${(b / 1024).toStringAsFixed(0)}KB';
-    return '${b}B';
+    model.gateway.records.removeKey(e.key);
+    setState(() => _deletedKeys.add(e.key));
+    if (_visible.isEmpty) {
+      Navigator.pop(context);
+      return;
+    }
+    ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('已删除'), duration: Duration(seconds: 1)));
   }
 
   @override
   Widget build(BuildContext context) {
-    final entries = widget.entries.where((e) => model.gateway.records.contains(e.name, e.size, e.variant) || !_deleted).toList();
+    final entries = _visible;
+    final rawIndex =
+        _ctrl.hasClients ? (_ctrl.page?.round() ?? widget.initialIndex) : widget.initialIndex;
+    final index = entries.isEmpty ? 0 : rawIndex.clamp(0, entries.length - 1).toInt();
     return Scaffold(
       backgroundColor: Colors.black,
       appBar: AppBar(
         backgroundColor: Colors.black,
-        title: Text('${(_ctrl.hasClients ? _ctrl.page?.round() ?? widget.initialIndex : widget.initialIndex) + 1}'
-            ' / ${entries.length}', style: const TextStyle(fontSize: 15)),
+        title: Text('${entries.isEmpty ? 0 : index + 1} / ${entries.length}',
+            style: const TextStyle(fontSize: 15)),
         actions: [
           IconButton(
             tooltip: '信息',
@@ -126,7 +125,7 @@ class _LocalViewerPageState extends State<LocalViewerPage> {
           IconButton(
             tooltip: '删除',
             icon: const Icon(Icons.delete_outline),
-            onPressed: () => _deleteCurrent(_ctrl.hasClients ? (_ctrl.page?.round() ?? 0) : widget.initialIndex),
+            onPressed: entries.isEmpty ? null : () => _deleteCurrent(entries[index]),
           ),
         ],
       ),
@@ -166,16 +165,16 @@ class _LocalViewerPageState extends State<LocalViewerPage> {
                       const SizedBox(height: 4),
                       Text(
                         [
-                          _fmtSize(e.size.toDouble()),
+                          formatBytes(e.size),
                           if (e.variant != 'original') e.variant,
                           e.time.toString().substring(0, 16),
                         ].where((s) => s.isNotEmpty).join('  ·  '),
                         style: TextStyle(fontSize: 12, color: Colors.white.withValues(alpha: 0.55)),
                       ),
                       const SizedBox(height: 4),
-                      if (exifInfo != null && exifInfo.isNotEmpty)
+                      if (exifInfo != null && !exifInfo.isEmpty)
                         Text(
-                          exifInfo.values.join('   '),
+                          exifInfo.text,
                           style: const TextStyle(fontSize: 12.5, color: yellow),
                         ),
                     ],

@@ -6,6 +6,7 @@ import 'package:flutter/services.dart';
 import '../app_model.dart';
 import '../engine/nikon_engine.dart';
 import '../models/camera_file.dart';
+import 'widgets/app_widgets.dart';
 
 /// 遥控拍摄页：盲拍 / 实时取景 双模式。
 ///
@@ -25,7 +26,7 @@ class RemotePage extends StatefulWidget {
 enum _RemoteMode { blind, liveView }
 
 class _RemotePageState extends State<RemotePage> {
-  static const yellow = Color(0xFFFFE100);
+  static const yellow = kAccent;
 
   StreamSubscription<dynamic>? _events;
   Timer? _frameTimer;
@@ -243,16 +244,7 @@ class _RemotePageState extends State<RemotePage> {
 
   Widget _viewArea(bool disconnected) {
     if (disconnected) {
-      return const Center(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Icon(Icons.wifi_off, size: 56, color: Colors.white24),
-            SizedBox(height: 12),
-            Text('连接已断开', style: TextStyle(fontSize: 15)),
-          ],
-        ),
-      );
+      return const DisconnectedView(message: '连接已断开');
     }
     if (_mode == _RemoteMode.liveView) {
       if (_frame != null) {

@@ -77,82 +77,100 @@ class PtpIpClient(
             closing = false
             linkDeadNotified = false
             log("连接 $host:$PORT …")
-            val c = newSocket()
             try {
-                c.connect(InetSocketAddress(host, PORT), DIAL_TIMEOUT_MS)
-            } catch (e: Exception) {
-                closeQuietly(c)
-                throw IOException("无法连接 $host:$PORT（${e.message}）。请确认手机已连上相机热点。")
+                connectLocked(host, friendlyName)
+            } catch (t: Throwable) {
+                // 握手任一步失败都要回收已建立的 socket：上层会重试多次，
+                // 泄漏的连接会持续占用相机侧的连接槽位。
+                abortConnectLocked()
+                throw t
             }
-            c.soTimeout = IO_TIMEOUT_MS
-            val cin = BufferedInputStream(c.getInputStream(), STREAM_BUFFER_BYTES)
-            val cout = BufferedOutputStream(c.getOutputStream(), STREAM_BUFFER_BYTES)
-
-            val initPayload = Ptp.WMU_INITIATOR_GUID +
-                PtpWire.encodeUtf16LeNullTerm(friendlyName) +
-                ByteArray(4).also { PtpWire.putU32(it, 0, Ptp.PROTOCOL_VERSION_10) }
-            PtpWire.writePacket(cout, Ptp.PKT_INIT_CMD_REQ, initPayload)
-            val ack = PtpWire.readPacket(cin)
-            if (ack.type == Ptp.PKT_INIT_FAIL) {
-                closeQuietly(c)
-                throw IOException("相机拒绝连接（InitFail）— 是否已有 SnapBridge 或其他主机在连接？")
-            }
-            if (ack.type != Ptp.PKT_INIT_CMD_ACK) {
-                closeQuietly(c)
-                throw IOException("握手异常：期待 InitCommandAck(2)，收到包类型 ${ack.type}")
-            }
-            val connNumber = PtpWire.getU32(ack.payload, 0)
-            val (name, _) = PtpWire.decodeUtf16Le(ack.payload, 20)
-            cameraName = name
-            log("命令握手成功：连接号=$connNumber 相机名=\"$name\"")
-
-            val e = newSocket()
-            try {
-                e.connect(InetSocketAddress(host, PORT), DIAL_TIMEOUT_MS)
-            } catch (ex: Exception) {
-                closeQuietly(c)
-                closeQuietly(e)
-                throw IOException("无法建立事件连接（${ex.message}）")
-            }
-            e.soTimeout = 0
-            val ein = BufferedInputStream(e.getInputStream(), 1 shl 16)
-            val eout = BufferedOutputStream(e.getOutputStream(), 1 shl 16)
-            PtpWire.writePacket(
-                eout, Ptp.PKT_INIT_EVT_REQ,
-                ByteArray(4).also { PtpWire.putU32(it, 0, connNumber) },
-            )
-            val eack = PtpWire.readPacket(ein)
-            if (eack.type == Ptp.PKT_INIT_FAIL) {
-                closeQuietly(c)
-                closeQuietly(e)
-                throw IOException("相机拒绝事件连接（InitFail）")
-            }
-            if (eack.type != Ptp.PKT_INIT_EVT_ACK) {
-                closeQuietly(c)
-                closeQuietly(e)
-                throw IOException("事件握手异常：期待 InitEventAck(4)，收到包类型 ${eack.type}")
-            }
-            log("事件握手成功")
-
-            cmd = c
-            evt = e
-            cmdIn = cin
-            cmdOut = cout
-
-            startEventReader(ein, eout)
-
-            try {
-                transact(Ptp.OP_OPEN_SESSION, longArrayOf(1))
-            } catch (ex: PtpException) {
-                if (ex.code != Ptp.RESP_SESSION_ALREADY_OPEN) {
-                    close()
-                    throw IOException("OpenSession 失败：${ex.message}")
-                }
-                log("会话已打开（重连场景），继续")
-            }
-            deviceInfo = PtpDatasets.parseDeviceInfo(transact(Ptp.OP_GET_DEVICE_INFO).data)
-            log("设备信息：$deviceInfo")
         }
+    }
+
+    /** 连接流程主体，必须持有 txnLock。 */
+    private fun connectLocked(host: String, friendlyName: String) {
+        val c = newSocket()
+        try {
+            c.connect(InetSocketAddress(host, PORT), DIAL_TIMEOUT_MS)
+        } catch (e: Exception) {
+            closeQuietly(c)
+            throw IOException("无法连接 $host:$PORT（${e.message}）。请确认手机已连上相机热点。")
+        }
+        c.soTimeout = IO_TIMEOUT_MS
+        val cin = BufferedInputStream(c.getInputStream(), STREAM_BUFFER_BYTES)
+        val cout = BufferedOutputStream(c.getOutputStream(), STREAM_BUFFER_BYTES)
+
+        val initPayload = Ptp.WMU_INITIATOR_GUID +
+            PtpWire.encodeUtf16LeNullTerm(friendlyName) +
+            ByteArray(4).also { PtpWire.putU32(it, 0, Ptp.PROTOCOL_VERSION_10) }
+        PtpWire.writePacket(cout, Ptp.PKT_INIT_CMD_REQ, initPayload)
+        val ack = PtpWire.readPacket(cin)
+        if (ack.type == Ptp.PKT_INIT_FAIL) {
+            throw IOException("相机拒绝连接（InitFail）— 是否已有 SnapBridge 或其他主机在连接？")
+        }
+        if (ack.type != Ptp.PKT_INIT_CMD_ACK) {
+            throw IOException("握手异常：期待 InitCommandAck(2)，收到包类型 ${ack.type}")
+        }
+        val connNumber = PtpWire.getU32(ack.payload, 0)
+        val (name, _) = PtpWire.decodeUtf16Le(ack.payload, 20)
+        cameraName = name
+        log("命令握手成功：连接号=$connNumber 相机名=\"$name\"")
+
+        val e = newSocket()
+        try {
+            e.connect(InetSocketAddress(host, PORT), DIAL_TIMEOUT_MS)
+        } catch (ex: Exception) {
+            closeQuietly(e)
+            throw IOException("无法建立事件连接（${ex.message}）")
+        }
+        e.soTimeout = 0
+        val ein = BufferedInputStream(e.getInputStream(), 1 shl 16)
+        val eout = BufferedOutputStream(e.getOutputStream(), 1 shl 16)
+        PtpWire.writePacket(
+            eout, Ptp.PKT_INIT_EVT_REQ,
+            ByteArray(4).also { PtpWire.putU32(it, 0, connNumber) },
+        )
+        val eack = PtpWire.readPacket(ein)
+        if (eack.type == Ptp.PKT_INIT_FAIL) {
+            closeQuietly(e)
+            throw IOException("相机拒绝事件连接（InitFail）")
+        }
+        if (eack.type != Ptp.PKT_INIT_EVT_ACK) {
+            closeQuietly(e)
+            throw IOException("事件握手异常：期待 InitEventAck(4)，收到包类型 ${eack.type}")
+        }
+        log("事件握手成功")
+
+        cmd = c
+        evt = e
+        cmdIn = cin
+        cmdOut = cout
+
+        startEventReader(ein, eout)
+
+        try {
+            transact(Ptp.OP_OPEN_SESSION, longArrayOf(1))
+        } catch (ex: PtpException) {
+            if (ex.code != Ptp.RESP_SESSION_ALREADY_OPEN) {
+                throw IOException("OpenSession 失败：${ex.message}")
+            }
+            log("会话已打开（重连场景），继续")
+        }
+        deviceInfo = PtpDatasets.parseDeviceInfo(transact(Ptp.OP_GET_DEVICE_INFO).data)
+        log("设备信息：$deviceInfo")
+    }
+
+    /** 握手失败时的清理：只关底层 socket，不发协议层结束会话，并抑制断线回调。 */
+    private fun abortConnectLocked() {
+        closing = true
+        closeQuietly(cmd)
+        closeQuietly(evt)
+        cmd = null
+        evt = null
+        cmdIn = null
+        cmdOut = null
+        deviceInfo = null
     }
 
     fun close() {
@@ -258,56 +276,94 @@ class PtpIpClient(
         return DlMode.FULL
     }
 
+    /**
+     * 下载对象并写入 out，返回**实际写入的字节数**。
+     *
+     * 返回值必须由调用方与 GetObjectInfo 得到的 size 比对：分块模式下相机可能
+     * 少传数据就结束，若按请求长度推进偏移就会静默丢数据，而文件被当成完整保存。
+     */
     fun getObjectToStream(
         handle: Long,
         size: Long,
         out: OutputStream,
         onProgress: (received: Long, total: Long) -> Unit,
-    ) {
-        when (resolveDlMode(handle, size)) {
-            DlMode.HISPEED -> downloadChunked(handle, size, out, onProgress) { off, want ->
-                doTransact(hiSpeedOp, longArrayOf(handle, off, want)) { chunk, _, _ ->
-                    out.write(chunk)
-                    out.flush()
-                }.let { res -> if (res.params.isNotEmpty()) res.params[0] else want }
+    ): Long {
+        if (size <= 0) throw IOException("对象大小无效（$size），拒绝下载以免生成空文件")
+        lastProgressNotified = 0L
+        val written = when (resolveDlMode(handle, size)) {
+            DlMode.HISPEED -> downloadChunked(size, out, onProgress) { off, want ->
+                writeChunk(out, hiSpeedOp, handle, off, want)
             }
-            DlMode.PARTIAL -> downloadChunked(handle, size, out, onProgress) { off, want ->
-                doTransact(
-                    Ptp.OP_GET_PARTIAL_OBJECT,
-                    longArrayOf(handle, off, want),
-                ) { chunk, _, _ ->
-                    out.write(chunk)
-                    out.flush()
-                }.let { res -> if (res.params.isNotEmpty()) res.params[0] else want }
+            DlMode.PARTIAL -> downloadChunked(size, out, onProgress) { off, want ->
+                writeChunk(out, Ptp.OP_GET_PARTIAL_OBJECT, handle, off, want)
             }
-            DlMode.FULL -> doTransact(Ptp.OP_GET_OBJECT, longArrayOf(handle)) { chunk, received, total ->
-                out.write(chunk)
-                out.flush()
-                if (received - lastProgressNotified >= PROGRESS_STEP || received >= (if (total > 0) total else size)) {
-                    lastProgressNotified = received
-                    onProgress(received, if (total > 0) total else size)
-                }
+            DlMode.FULL -> transactToStream(Ptp.OP_GET_OBJECT, longArrayOf(handle), out, size, onProgress)
+        }
+        if (written != size) throw IOException("传输不完整：期望 $size 字节，实际收到 $written 字节")
+        return written
+    }
+
+    /**
+     * 取一个分块写入 out，返回本次实际写入字节数。
+     * 相机在响应参数里声明了长度时，必须与实际写入量一致——否则不能以声明值推进偏移。
+     */
+    private fun writeChunk(out: OutputStream, op: Int, handle: Long, offset: Long, want: Long): Long {
+        var written = 0L
+        val res = doTransact(op, longArrayOf(handle, offset, want)) { chunk, _, _ ->
+            out.write(chunk)
+            written += chunk.size
+        }
+        out.flush()
+        if (res.params.isNotEmpty()) {
+            val declared = res.params[0]
+            if (declared != written) {
+                throw IOException("分块长度不一致：相机声明 $declared 字节，实际收到 $written 字节（offset=$offset）")
             }
         }
+        return written
+    }
+
+    /** 整文件下载：数据阶段直接落流，返回实际写入字节数。 */
+    private fun transactToStream(
+        op: Int,
+        params: LongArray,
+        out: OutputStream,
+        size: Long,
+        onProgress: (received: Long, total: Long) -> Unit,
+    ): Long {
+        var written = 0L
+        doTransact(op, params) { chunk, _, total ->
+            out.write(chunk)
+            written += chunk.size
+            val span = if (total > 0) total else size
+            if (written - lastProgressNotified >= PROGRESS_STEP || written >= span) {
+                lastProgressNotified = written
+                onProgress(written, span)
+            }
+        }
+        out.flush()
+        return written
     }
 
     private var lastProgressNotified = 0L
 
+    /** 循环拉取分块直到累计写入 size 字节，返回实际写入总量。 */
     private inline fun downloadChunked(
-        handle: Long,
         size: Long,
         out: OutputStream,
         onProgress: (received: Long, total: Long) -> Unit,
         chunk: (offset: Long, want: Long) -> Long,
-    ) {
+    ): Long {
         var offset = 0L
         while (offset < size) {
             val want = minOf(PARTIAL_CHUNK_BYTES, size - offset)
             val read = chunk(offset, want)
             if (read <= 0L) throw IOException("分块读取提前结束（offset=$offset/$size）")
+            if (read > want) throw IOException("分块返回超出请求长度（请求 $want，返回 $read）")
             offset += read
             onProgress(offset, size)
         }
+        return offset
     }
 
     /**
@@ -421,9 +477,11 @@ class PtpIpClient(
                         else -> log("事件通道：包类型 ${pkt.type}（忽略）")
                     }
                 }
-            } catch (e: Exception) {
+            } catch (t: Throwable) {
+                // 必须是 Throwable：解析异常里的 OutOfMemoryError 等 Error 若逃逸，
+                // 线程会静默死亡且不触发断线回调，UI 将永远停在"已连接"却收不到事件。
                 if (!closing) {
-                    notifyLinkDead(e.message ?: "事件连接丢失")
+                    notifyLinkDead(t.message ?: "事件连接丢失")
                 }
             }
         }.apply {

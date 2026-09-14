@@ -1,15 +1,22 @@
-import 'dart:async';
-import 'dart:math';
-
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import '../app_model.dart';
 import '../models/camera_file.dart';
 import 'viewer_page.dart';
+import 'widgets/app_widgets.dart';
+import 'widgets/drag_selection.dart';
+import 'widgets/gallery_cell.dart';
+import 'widgets/gallery_filter_bar.dart';
+import 'widgets/gallery_options_sheet.dart';
+import 'widgets/gallery_status_bars.dart';
 
 /// 相册页：3 列缩略图网格、按需加载、类型/文件夹筛选、
 /// 长按进入选择 + 按住滑动批量勾选（微信式）、批量下载。
+///
+/// 呈现部件已拆到 widgets/：单元格 GalleryCell、筛选栏 GalleryFilterBar、
+/// 状态条 gallery_status_bars、选项弹窗 gallery_options_sheet，
+/// 滑动多选状态机在 DragSelection。本文件只负责装配与相机交互。
 class GalleryPage extends StatefulWidget {
   const GalleryPage({super.key, required this.model});
 
@@ -20,33 +27,57 @@ class GalleryPage extends StatefulWidget {
 }
 
 class _GalleryPageState extends State<GalleryPage> {
-  static const yellow = Color(0xFFFFE100);
   static const int _cols = 3;
   static const double _gap = 2;
 
-  final Set<int> _selected = {};
-  bool _selectMode = false;
-  bool _dragSelecting = false;
-  bool _dragAdd = true; // 滑动选择的方向：true 选中 / false 取消
-  int? _anchorIdx; // 长按起点的列表索引
-  Offset? _dragLastLocal;
-  Timer? _autoScrollTimer;
   String _kind = 'all'; // all / jpeg / raw / video
   String _folder = '全部';
   final GlobalKey _gridKey = GlobalKey();
   final ScrollController _gridCtrl = ScrollController();
+  List<CameraFile>? _filteredCache;
+
+  /// 滑动多选状态机（长按起选、滑动范围、边缘自动滚动）
+  late final DragSelection<int> _sel = DragSelection<int>(
+    keyAt: (i) => _filtered[i].handle,
+    itemCount: () => _filtered.length,
+    indexAt: _indexAt,
+    scrollController: _gridCtrl,
+    viewportBox: () => _gridKey.currentContext?.findRenderObject() as RenderBox?,
+    onChanged: () => setState(() {}),
+  );
 
   AppModel get model => widget.model;
 
   @override
+  void initState() {
+    super.initState();
+    model.addListener(_onModelChanged);
+  }
+
+  @override
   void dispose() {
-    _autoScrollTimer?.cancel();
+    model.removeListener(_onModelChanged);
+    _sel.dispose();
     _gridCtrl.dispose();
     super.dispose();
   }
 
-  List<CameraFile> get _filtered {
-    var list = model.files;
+  /// 模型变化时丢弃筛选缓存，并剔除已不在列表里的选择
+  void _onModelChanged() {
+    _filteredCache = null;
+    if (_sel.selected.isEmpty) return;
+    _sel.prune(model.files.map((f) => f.handle).toSet());
+  }
+
+  // ------------------------------------------------------------ 筛选与排序
+
+  /// 当前筛选+排序后的列表。
+  /// 必须返回新列表：此前默认筛选下直接对 `model.files` 本体排序，
+  /// 等于在渲染期改写全局状态，并把正在被 ViewerPage 持有的引用一起重排。
+  List<CameraFile> get _filtered => _filteredCache ??= _computeFiltered();
+
+  List<CameraFile> _computeFiltered() {
+    var list = List<CameraFile>.of(model.files);
     if (_kind != 'all') list = list.where((f) => f.kind == _kind).toList();
     if (_folder != '全部') list = list.where((f) => f.folder == _folder).toList();
     int cmp(CameraFile a, CameraFile b) {
@@ -61,7 +92,7 @@ class _GalleryPageState extends State<GalleryPage> {
         case 'nameAsc':
         case 'nameDesc':
           final na = a.name, nb = b.name;
-          if (na == null && nb == null) return 0;
+          if (na == null && nb == null) return a.handle.compareTo(b.handle);
           if (na == null) return 1;
           if (nb == null) return -1;
           final c = na.compareTo(nb);
@@ -75,32 +106,43 @@ class _GalleryPageState extends State<GalleryPage> {
     return list..sort(cmp);
   }
 
-  String get _variantLabel => switch (model.downloadVariant) {
-        '2M' => '2M',
-        '8M' => '8M',
-        _ => '原图',
-      };
+  /// 改筛选条件：丢弃筛选缓存，并把选择集收敛到新列表上。
+  /// 不收敛的话"已选 N"会包含看不见的条目，"取消全选"也按不干净。
+  void _setFilter({String? kind, String? folder}) => setState(() {
+        if (kind != null) _kind = kind;
+        if (folder != null) _folder = folder;
+        _filteredCache = null;
+        _sel.prune(_filtered.map((f) => f.handle).toSet());
+      });
 
-  void _toggle(int handle) {
-    setState(() {
-      if (!_selected.remove(handle)) _selected.add(handle);
-      if (_selectMode && _selected.isEmpty) _selectMode = false;
-    });
+  void _showOptions() {
+    final folders = model.files
+        .map((f) => f.folder)
+        .where((s) => s.isNotEmpty)
+        .toSet()
+        .toList()
+      ..sort((a, b) => b.compareTo(a));
+    showGalleryOptionsSheet(
+      context: context,
+      folders: folders,
+      kind: _kind,
+      folder: _folder,
+      sortMode: model.sortMode,
+      variant: model.downloadVariant,
+      onKind: (v) => _setFilter(kind: v),
+      onFolder: (v) => _setFilter(folder: v),
+      onSort: model.setSortMode,
+      onVariant: model.setDownloadVariant,
+    );
   }
 
-  void _exitSelect() {
-    setState(() {
-      _selectMode = false;
-      _selected.clear();
-      _dragSelecting = false;
-      _anchorIdx = null;
-      _stopAutoScroll();
-    });
-  }
+  // ------------------------------------------------------------ 索引换算
 
-  void _stopAutoScroll() {
-    _autoScrollTimer?.cancel();
-    _autoScrollTimer = null;
+  /// 全局坐标 → 网格单元格索引
+  int? _indexAt(Offset global) {
+    final box = _gridKey.currentContext?.findRenderObject() as RenderBox?;
+    if (box == null) return null;
+    return _indexOf(box.globalToLocal(global), box.size.width);
   }
 
   /// 数据空间单元格索引：屏幕局部坐标 + 列表滚动偏移（否则滚动后选错行）
@@ -118,87 +160,34 @@ class _GalleryPageState extends State<GalleryPage> {
     return idx;
   }
 
-  /// 选中/取消 锚点→当前索引 的连续范围（微信式：跨行按路径覆盖）
-  void _applyRange(int cur, bool add) {
-    final anchor = _anchorIdx;
-    if (anchor == null) return;
-    final files = _filtered;
-    final lo = min(anchor, cur), hi = max(anchor, cur);
-    var changed = false;
-    for (var i = lo; i <= hi && i < files.length; i++) {
-      if (add) {
-        changed |= _selected.add(files[i].handle);
-      } else {
-        changed |= _selected.remove(files[i].handle);
-      }
-    }
-    if (changed) setState(() {});
-  }
+  // ------------------------------------------------------------ 动作
 
-  /// 按屏幕坐标换算网格行，整行选中/取消（微信式滑动选择）。
-  void _selectRowAt(Offset globalPosition, bool add) {
-    final box = _gridKey.currentContext?.findRenderObject() as RenderBox?;
-    if (box == null) return;
-    final local = box.globalToLocal(globalPosition);
-    _dragLastLocal = local;
-    final idx = _indexOf(local, box.size.width);
-    if (idx != null) _applyRange(idx, add);
-    _updateAutoScroll(local, box.size.height, add);
-  }
-
-  /// 指针停在网格上下边缘时慢速自动滚动，便于继续向后选择
-  void _updateAutoScroll(Offset local, double height, bool add) {
-    const edge = 90.0;
-    const step = 7.0;
-    double? delta;
-    if (local.dy < edge && local.dy > 0) delta = -step;
-    if (local.dy > height - edge && local.dy < height) delta = step;
-    if (delta == null) {
-      _stopAutoScroll();
-      return;
-    }
-    if (_autoScrollTimer != null) return;
-    final d = delta;
-    _autoScrollTimer = Timer.periodic(const Duration(milliseconds: 16), (_) {
-      if (!_dragSelecting || !_gridCtrl.hasClients) {
-        _stopAutoScroll();
-        return;
-      }
-      final pos = _gridCtrl.position;
-      final next = (pos.pixels + d).clamp(0.0, pos.maxScrollExtent);
-      pos.jumpTo(next);
-      final box = _gridKey.currentContext?.findRenderObject() as RenderBox?;
-      if (box != null && _dragLastLocal != null) {
-        final local = box.globalToLocal(_dragLastLocal!);
-        final idx = _indexOf(local, box.size.width);
-    if (idx != null) _applyRange(idx, add);
-      }
-    });
-  }
-
-  /// 打开大图查看器
-  void _openViewer(int index) {
+  /// 打开大图查看器。传入当次渲染所用的列表，避免查看器内部重算导致索引错位。
+  void _openViewer(int index, List<CameraFile> files) {
     Navigator.push(
       context,
       MaterialPageRoute(
-        builder: (_) => ViewerPage(model: model, files: _filtered, initialIndex: index),
+        builder: (_) =>
+            ViewerPage(model: model, files: List<CameraFile>.of(files), initialIndex: index),
       ),
     );
   }
 
   Future<void> _download() async {
-    final picks = _filtered.where((f) => _selected.contains(f.handle)).toList();
+    // 刷新或改筛选后选中集里可能残留已不在列表里的句柄，先剪掉，
+    // 避免出现"已选 N 只下载了 M 张"却毫无提示。
+    _sel.prune(_filtered.map((f) => f.handle).toSet());
+    final picks = _filtered.where((f) => _sel.selected.contains(f.handle)).toList();
     if (picks.isEmpty) return;
     final result = await model.download(picks);
     if (!mounted) return;
     if (result.isNotEmpty) {
       ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(result)));
     }
-    setState(() {
-      _selectMode = false;
-      _selected.clear();
-    });
+    _sel.exitSelect();
   }
+
+  // ------------------------------------------------------------ 装配
 
   @override
   Widget build(BuildContext context) {
@@ -208,42 +197,50 @@ class _GalleryPageState extends State<GalleryPage> {
         if (model.connState != 'connected') {
           return Scaffold(
             appBar: AppBar(title: const Text('照片')),
-            body: Center(
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  const Icon(Icons.wifi_off, size: 56, color: Colors.white24),
-                  const SizedBox(height: 12),
-                  const Text('连接已断开', style: TextStyle(fontSize: 15)),
-                  const SizedBox(height: 20),
-                  FilledButton(
-                    onPressed: () => Navigator.pop(context),
-                    child: const Text('返回重新连接'),
-                  ),
-                ],
+            body: DisconnectedView(
+              message: '连接已断开',
+              action: FilledButton(
+                onPressed: () => Navigator.pop(context),
+                child: const Text('返回重新连接'),
               ),
             ),
           );
         }
         final files = _filtered;
         return Scaffold(
-          appBar: _selectMode ? _selectionAppBar() : _normalAppBar(),
+          appBar: _sel.selectMode ? _selectionAppBar() : _normalAppBar(),
           body: Column(
             children: [
-              _filterChips(),
-              if (model.hasNewPhotos) _newPhotoBanner(),
-              if (!model.indexingDone && model.files.isNotEmpty) _indexBar(),
-              if (model.downloading) _downloadBar(),
+              GalleryFilterBar(
+                kind: _kind,
+                folder: _folder,
+                onKind: (v) => _setFilter(kind: v),
+                onFolderTap: _showOptions,
+              ),
+              if (model.hasNewPhotos)
+                NewPhotosBanner(onRefresh: () {
+                  model.consumeNewPhotos();
+                  model.loadFiles();
+                }),
+              if (!model.indexingDone && model.files.isNotEmpty)
+                IndexProgressBar(indexed: model.indexedCount, total: model.files.length),
+              if (model.downloading)
+                DownloadProgressBar(
+                  done: model.dlDone,
+                  total: model.dlTotal,
+                  fileFrac: model.dlFileFrac,
+                  speedMBps: model.dlSpeed,
+                  currentName: model.dlCurrentName,
+                  onCancel: () => model.cancelRequested = true,
+                ),
               Expanded(child: _body(files)),
             ],
           ),
-          bottomNavigationBar: _selectMode ? _bottomBar() : null,
+          bottomNavigationBar: _sel.selectMode ? _bottomBar() : null,
         );
       },
     );
   }
-
-  // ------------------------------------------------------------ 顶栏
 
   PreferredSizeWidget _normalAppBar() => AppBar(
         title: Text('照片${model.files.isEmpty ? '' : ' ${model.files.length}'}'),
@@ -261,162 +258,19 @@ class _GalleryPageState extends State<GalleryPage> {
         ],
       );
 
-  PreferredSizeWidget _selectionAppBar() => AppBar(
-        leading: IconButton(icon: const Icon(Icons.close), onPressed: _exitSelect),
-        title: Text('已选 ${_selected.length}'),
-        actions: [
-          TextButton(
-            onPressed: () {
-              setState(() {
-                final all = _filtered.map((f) => f.handle).toSet();
-                if (all.length == _selected.length) {
-                  _selected.clear();
-                } else {
-                  _selected
-                    ..clear()
-                    ..addAll(all);
-                }
-              });
-            },
-            child: Text(
-              _selected.length == _filtered.length ? '取消全选' : '全选',
-              style: const TextStyle(color: yellow),
-            ),
-          ),
-        ],
-      );
-
-  // ------------------------------------------------------------ 筛选与状态条
-
-  Widget _filterChips() {
-    Widget chip(String label, String value) => Padding(
-          padding: const EdgeInsets.only(right: 8),
-          child: ChoiceChip(
-            label: Text(label),
-            selected: _kind == value,
-            selectedColor: yellow,
-            labelStyle: TextStyle(
-              fontSize: 12.5,
-              color: _kind == value ? Colors.black : Colors.white70,
-            ),
-            checkmarkColor: Colors.black,
-            visualDensity: VisualDensity.compact,
-            side: BorderSide(color: _kind == value ? yellow : Colors.white24),
-            backgroundColor: const Color(0xFF161616),
-            onSelected: (_) => setState(() => _kind = value),
-          ),
-        );
-    return Container(
-      width: double.infinity,
-      padding: const EdgeInsets.fromLTRB(12, 8, 0, 8),
-      color: const Color(0xFF0A0A0A),
-      child: SingleChildScrollView(
-        scrollDirection: Axis.horizontal,
-        child: Row(
-          children: [
-            chip('全部', 'all'),
-            chip('JPEG', 'jpeg'),
-            chip('RAW', 'raw'),
-            chip('视频', 'video'),
-            const SizedBox(width: 4),
-            ActionChip(
-              label: Text(
-                _folder == '全部' ? '文件夹' : _folder,
-                style: const TextStyle(fontSize: 12.5, color: Colors.white70),
-              ),
-              visualDensity: VisualDensity.compact,
-              side: const BorderSide(color: Colors.white24),
-              backgroundColor: const Color(0xFF161616),
-              onPressed: _showOptions,
-            ),
-          ],
+  PreferredSizeWidget _selectionAppBar() {
+    final allSelected = _sel.allSelected(_filtered.map((f) => f.handle));
+    return AppBar(
+      leading: IconButton(icon: const Icon(Icons.close), onPressed: _sel.exitSelect),
+      title: Text('已选 ${_sel.selected.length}'),
+      actions: [
+        TextButton(
+          onPressed: () => _sel.toggleAll(_filtered.map((f) => f.handle)),
+          child: Text(allSelected ? '取消全选' : '全选', style: const TextStyle(color: kAccent)),
         ),
-      ),
+      ],
     );
   }
-
-  Widget _newPhotoBanner() => Material(
-        color: const Color(0xFF232312),
-        child: InkWell(
-          onTap: () {
-            model.consumeNewPhotos();
-            model.loadFiles();
-          },
-          child: Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 9),
-            child: Row(
-              children: [
-                const Icon(Icons.notification_add_outlined, size: 15, color: yellow),
-                const SizedBox(width: 8),
-                const Text('发现新照片，点击刷新', style: TextStyle(fontSize: 12.5, color: yellow)),
-                const Spacer(),
-                const Icon(Icons.chevron_right, size: 16, color: yellow),
-              ],
-            ),
-          ),
-        ),
-      );
-
-  Widget _indexBar() {
-    final frac = model.files.isEmpty ? 0.0 : model.indexedCount / model.files.length;
-    return Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
-      child: Row(
-        children: [
-          Text('索引 ${model.indexedCount}/${model.files.length}',
-              style: TextStyle(fontSize: 11, color: Colors.white.withValues(alpha: 0.45))),
-          const SizedBox(width: 10),
-          Expanded(
-            child: ClipRRect(
-              borderRadius: BorderRadius.circular(2),
-              child: LinearProgressIndicator(value: frac, minHeight: 2, backgroundColor: Colors.white12),
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _downloadBar() {
-    final overall = model.dlTotal > 0 ? (model.dlDone + model.dlFileFrac) / model.dlTotal : 0.0;
-    return Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-      child: Row(
-        children: [
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(
-                  '${model.dlDone}/${model.dlTotal}'
-                  '${model.dlCurrentName.isEmpty ? '' : ' · ${model.dlCurrentName}'}'
-                  '${model.dlSpeed > 0 ? ' · ${model.dlSpeed.toStringAsFixed(1)}MB/s' : ''}',
-                  style: TextStyle(fontSize: 11, color: Colors.white.withValues(alpha: 0.6)),
-                  overflow: TextOverflow.ellipsis,
-                ),
-                const SizedBox(height: 4),
-                ClipRRect(
-                  borderRadius: BorderRadius.circular(2),
-                  child: LinearProgressIndicator(
-                    value: overall.clamp(0.0, 1.0),
-                    minHeight: 3,
-                    backgroundColor: Colors.white12,
-                    valueColor: const AlwaysStoppedAnimation(yellow),
-                  ),
-                ),
-              ],
-            ),
-          ),
-          TextButton(
-            onPressed: () => model.cancelRequested = true,
-            child: const Text('取消', style: TextStyle(fontSize: 12.5)),
-          ),
-        ],
-      ),
-    );
-  }
-
-  // ------------------------------------------------------------ 网格
 
   Widget _body(List<CameraFile> files) {
     if (model.loadingFiles && model.files.isEmpty) {
@@ -427,7 +281,8 @@ class _GalleryPageState extends State<GalleryPage> {
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
-            Text('加载失败：${model.filesError}', style: const TextStyle(fontSize: 13, color: Colors.white54)),
+            Text('加载失败：${model.filesError}',
+                style: const TextStyle(fontSize: 13, color: Colors.white54)),
             const SizedBox(height: 16),
             FilledButton(onPressed: () => model.loadFiles(), child: const Text('重试')),
           ],
@@ -435,35 +290,16 @@ class _GalleryPageState extends State<GalleryPage> {
       );
     }
     if (files.isEmpty) {
-      return Center(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            const Icon(Icons.photo_library_outlined, size: 56, color: Colors.white24),
-            const SizedBox(height: 12),
-            Text(
-              model.files.isEmpty ? '存储卡里没有照片' : '当前筛选条件下没有照片',
-              style: TextStyle(fontSize: 13, color: Colors.white.withValues(alpha: 0.5)),
-            ),
-          ],
-        ),
+      return EmptyState(
+        icon: Icons.photo_library_outlined,
+        message: model.files.isEmpty ? '存储卡里没有照片' : '当前筛选条件下没有照片',
       );
     }
     return Listener(
       behavior: HitTestBehavior.translucent,
-      onPointerMove: (d) {
-        if (_dragSelecting) _selectRowAt(d.position, _dragAdd);
-      },
-      onPointerUp: (_) {
-        _dragSelecting = false;
-        _anchorIdx = null;
-        _stopAutoScroll();
-      },
-      onPointerCancel: (_) {
-        _dragSelecting = false;
-        _anchorIdx = null;
-        _stopAutoScroll();
-      },
+      onPointerMove: (d) => _sel.updateDrag(d.position),
+      onPointerUp: (_) => _sel.endDrag(),
+      onPointerCancel: (_) => _sel.endDrag(),
       child: GridView.builder(
         key: _gridKey,
         controller: _gridCtrl,
@@ -475,199 +311,38 @@ class _GalleryPageState extends State<GalleryPage> {
           childAspectRatio: 1,
         ),
         itemCount: files.length,
-        itemBuilder: (context, i) => _cell(files[i], i),
+        itemBuilder: (context, i) => _cell(files[i], i, files),
       ),
     );
   }
 
-  Widget _cell(CameraFile f, int index) {
-    if (!f.infoLoaded || !f.hasThumb) {
+  Widget _cell(CameraFile f, int index, List<CameraFile> files) {
+    if (model.gateway.needsLoad(f, withThumb: true)) {
       WidgetsBinding.instance.addPostFrameCallback((_) {
         if (mounted) model.gateway.ensureLoaded(f, withThumb: true);
       });
     }
-    final bytes = f.hasThumb ? model.gateway.memThumb(f.handle) : null;
-    final isSel = _selected.contains(f.handle);
-    final downloaded = model.isDownloaded(f);
-    return GestureDetector(
-      behavior: HitTestBehavior.opaque,
-      onTap: () => _selectMode ? _toggle(f.handle) : _openViewer(index),
-      onLongPressStart: (d) {
+    return GalleryCell(
+      file: f,
+      thumb: f.hasThumb ? model.gateway.memThumb(f.handle) : null,
+      selected: _sel.selected.contains(f.handle),
+      downloaded: model.isDownloaded(f),
+      onTap: () => _sel.selectMode ? _sel.toggle(f.handle) : _openViewer(index, files),
+      onLongPress: () {
         HapticFeedback.mediumImpact();
-        if (!_selectMode) setState(() => _selectMode = true);
-        _dragAdd = !_selected.contains(f.handle);
-        _anchorIdx = index;
-        _dragSelecting = true;
-        _applyRange(index, _dragAdd);
+        _sel.beginDrag(index);
       },
-      child: Stack(
-        fit: StackFit.expand,
-        children: [
-          Container(
-            color: const Color(0xFF161616),
-            alignment: Alignment.center,
-            child: bytes == null
-                ? const SizedBox(
-                    width: 18,
-                    height: 18,
-                    child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white24),
-                  )
-                : null,
-          ),
-          if (bytes != null)
-            Image.memory(bytes, fit: BoxFit.cover, gaplessPlayback: true),
-          if (f.kind == 'raw')
-            _badgeText(f.ext ?? 'RAW')
-          else if (f.kind == 'video')
-            _badgeText('视频'),
-          if (downloaded)
-            const Positioned(
-              left: 5,
-              bottom: 5,
-              child: Icon(Icons.check_circle, size: 15, color: Color(0xFF4CD964)),
-            ),
-          Positioned(
-            right: 0,
-            bottom: 0,
-            child: GestureDetector(
-              behavior: HitTestBehavior.opaque,
-              onTap: () {
-                HapticFeedback.selectionClick();
-                if (!_selectMode) setState(() => _selectMode = true);
-                _toggle(f.handle);
-              },
-              child: const Padding(
-                padding: EdgeInsets.all(8),
-                child: SizedBox(width: 22, height: 22),
-              ),
-            ),
-          ),
-          if (isSel)
-            const Positioned(
-              right: 8,
-              bottom: 8,
-              child: IgnorePointer(
-                child: Icon(Icons.check_circle, size: 22, color: yellow),
-              ),
-            ),
-        ],
-      ),
+      onToggleSelect: () => _sel.enterSelectAndToggle(f.handle),
     );
   }
-
-  Widget _badgeText(String text) => Positioned(
-        top: 4,
-        left: 4,
-        child: Container(
-          padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 1),
-          decoration: BoxDecoration(color: Colors.black54, borderRadius: BorderRadius.circular(3)),
-          child: Text(text, style: const TextStyle(fontSize: 9, color: Colors.white, fontWeight: FontWeight.w600)),
-        ),
-      );
-
-  // ------------------------------------------------------------ 选项
-
-  void _showOptions() {
-    final folders = model.files
-        .map((f) => f.folder)
-        .where((s) => s.isNotEmpty)
-        .toSet()
-        .toList()
-      ..sort((a, b) => b.compareTo(a));
-    showModalBottomSheet(
-      context: context,
-      backgroundColor: const Color(0xFF161616),
-      shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(16))),
-      builder: (ctx) => SafeArea(
-        child: ListView(
-          shrinkWrap: true,
-          padding: const EdgeInsets.symmetric(vertical: 10),
-          children: [
-            const Padding(
-              padding: EdgeInsets.fromLTRB(18, 8, 18, 6),
-              child: Text('文件类型', style: TextStyle(fontSize: 13, color: Colors.white38)),
-            ),
-            _option(ctx, '全部类型', '全部', _kind == 'all', () {
-              setState(() => _kind = 'all');
-              Navigator.pop(ctx);
-            }),
-            _option(ctx, 'JPEG 照片', '全部', _kind == 'jpeg', () {
-              setState(() => _kind = 'jpeg');
-              Navigator.pop(ctx);
-            }),
-            _option(ctx, 'RAW (NEF)', '全部', _kind == 'raw', () {
-              setState(() => _kind = 'raw');
-              Navigator.pop(ctx);
-            }),
-            _option(ctx, '视频', '全部', _kind == 'video', () {
-              setState(() => _kind = 'video');
-              Navigator.pop(ctx);
-            }),
-            const Padding(
-              padding: EdgeInsets.fromLTRB(18, 14, 18, 6),
-              child: Text('文件夹', style: TextStyle(fontSize: 13, color: Colors.white38)),
-            ),
-            _option(ctx, '所有文件夹', 'x', _folder == '全部', () {
-              setState(() => _folder = '全部');
-              Navigator.pop(ctx);
-            }),
-            ...folders.map((name) => _option(ctx, name, 'x', _folder == name, () {
-                  setState(() => _folder = name);
-                  Navigator.pop(ctx);
-                })),
-            const Padding(
-              padding: EdgeInsets.fromLTRB(18, 14, 18, 6),
-              child: Text('排序', style: TextStyle(fontSize: 13, color: Colors.white38)),
-            ),
-            _option(ctx, '最新优先', 'x', model.sortMode == 'newest', () {
-              model.setSortMode('newest');
-              Navigator.pop(ctx);
-            }),
-            _option(ctx, '最早优先', 'x', model.sortMode == 'oldest', () {
-              model.setSortMode('oldest');
-              Navigator.pop(ctx);
-            }),
-            _option(ctx, '文件名 A→Z', 'x', model.sortMode == 'nameAsc', () {
-              model.setSortMode('nameAsc');
-              Navigator.pop(ctx);
-            }),
-            _option(ctx, '文件名 Z→A', 'x', model.sortMode == 'nameDesc', () {
-              model.setSortMode('nameDesc');
-              Navigator.pop(ctx);
-            }),
-            const Padding(
-              padding: EdgeInsets.fromLTRB(18, 14, 18, 6),
-              child: Text('下载画质（仅 JPEG 生效）', style: TextStyle(fontSize: 13, color: Colors.white38)),
-            ),
-            _option(ctx, '原图', 'x', model.downloadVariant == 'original', () {
-              model.setDownloadVariant('original');
-              Navigator.pop(ctx);
-            }),
-            _option(ctx, '8M（长边 3840）', 'x', model.downloadVariant == '8M', () {
-              model.setDownloadVariant('8M');
-              Navigator.pop(ctx);
-            }),
-            _option(ctx, '2M（长边 1920）', 'x', model.downloadVariant == '2M', () {
-              model.setDownloadVariant('2M');
-              Navigator.pop(ctx);
-            }),
-          ],
-        ),
-      ),
-    );
-  }
-
-  Widget _option(BuildContext ctx, String label, String _, bool selected, VoidCallback onTap) => ListTile(
-        dense: true,
-        title: Text(label, style: const TextStyle(fontSize: 14.5)),
-        trailing: selected ? const Icon(Icons.check, color: yellow, size: 20) : null,
-        onTap: onTap,
-      );
-
-  // ------------------------------------------------------------ 底栏
 
   Widget _bottomBar() {
-    final count = _selected.length;
+    final count = _sel.selected.length;
+    final variantLabel = switch (model.downloadVariant) {
+      '2M' => '2M',
+      '8M' => '8M',
+      _ => '原图',
+    };
     return SafeArea(
       top: false,
       child: Container(
@@ -698,7 +373,7 @@ class _GalleryPageState extends State<GalleryPage> {
                   const SizedBox(width: 10),
                   PopupMenuButton<String>(
                     tooltip: '下载画质',
-                    onSelected: (v) => model.setDownloadVariant(v),
+                    onSelected: model.setDownloadVariant,
                     itemBuilder: (_) => const [
                       PopupMenuItem(value: 'original', child: Text('原图', style: TextStyle(fontSize: 14))),
                       PopupMenuItem(value: '8M', child: Text('8M (长边3840)', style: TextStyle(fontSize: 14))),
@@ -714,7 +389,8 @@ class _GalleryPageState extends State<GalleryPage> {
                       child: Row(
                         mainAxisSize: MainAxisSize.min,
                         children: [
-                          Text(_variantLabel, style: const TextStyle(fontSize: 13.5, color: Colors.white)),
+                          Text(variantLabel,
+                              style: const TextStyle(fontSize: 13.5, color: Colors.white)),
                           const Icon(Icons.arrow_drop_down, size: 18, color: Colors.white70),
                         ],
                       ),
@@ -725,5 +401,4 @@ class _GalleryPageState extends State<GalleryPage> {
       ),
     );
   }
-
 }

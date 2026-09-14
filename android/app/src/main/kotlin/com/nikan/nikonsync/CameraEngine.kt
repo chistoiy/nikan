@@ -252,27 +252,42 @@ object CameraEngine {
         disconnectQuiet()
         log("开始握手（friendlyName=\"$friendlyName\"）")
         val c = PtpIpClient(socketFactory(), ::log)
-        c.connect(ip, friendlyName)
+        try {
+            c.connect(ip, friendlyName)
+        } catch (e: Exception) {
+            // 握手失败也要回收客户端，否则每次重试都会泄漏一条已建立的 TCP 连接
+            runCatching { c.close() }
+            throw e
+        }
+        // 先登记为当前会话再装回调：回调内用 client === c 判定归属，
+        // 若先装回调，握手刚结束就断线时会被误判成"旧会话"而漏报断线。
+        client = c
+        deviceInfo = c.deviceInfo
+        cameraIp = ip
         c.eventHandler = { code, params ->
-            if (code == Ptp.EVT_OBJECT_ADDED && params.isNotEmpty()) {
+            if (client === c && code == Ptp.EVT_OBJECT_ADDED && params.isNotEmpty()) {
                 emit(mapOf("type" to "objectAdded", "handle" to params[0]))
             }
         }
         c.disconnectHandler = { reason ->
-            stopKeepAlive()
-            liveViewOn = false
-            KeepAliveService.stop(appContext!!)
-            client = null
-            deviceInfo = null
-            cameraIp = null
-            emit(mapOf("type" to "status", "state" to "disconnected", "reason" to reason))
+            // 旧会话的死亡回调可能在新连接建立后才到达（旧事件线程/旧保活任务），
+            // 那种情况必须忽略，否则会把新连接的状态打回未连接。
+            if (client === c) {
+                stopKeepAlive()
+                liveViewOn = false
+                KeepAliveService.stop(appContext!!)
+                client = null
+                deviceInfo = null
+                cameraIp = null
+                emit(mapOf("type" to "status", "state" to "disconnected", "reason" to reason))
+            } else {
+                log("忽略非当前会话的断线通知：$reason")
+            }
         }
-        client = c
-        deviceInfo = c.deviceInfo
-        cameraIp = ip
+        if (client !== c) throw IOException("握手完成后连接立即失效，请重试")
         startKeepAlive()
         KeepAliveService.start(appContext!!)
-        val di = c.deviceInfo!!
+        val di = c.deviceInfo ?: throw IOException("握手完成但未取得设备信息，请重试")
         emit(mapOf("type" to "status", "state" to "connected", "ip" to ip))
         return mapOf(
             "manufacturer" to di.manufacturer,
@@ -605,18 +620,24 @@ object CameraEngine {
                         ?: throw IOException("在所选目录创建文件失败")
                     created = doc
                     isSafDoc = true
-                    resolver.openOutputStream(doc)?.use { out ->
-                        if (resized != null) out.write(resized)
-                        else c.getObjectToStream(handle, size, out) { r, t -> emitProgress(r, t, t0) }
-                    } ?: throw IOException("打开所选目录输出流失败")
+                    val outSaf = resolver.openOutputStream(doc) ?: throw IOException("打开所选目录输出流失败")
+                    // written 是实际落盘的字节数：分块模式少传时 getObjectToStream 会抛异常，
+                    // 绝不会把截断的文件当成成功返回。
+                    val written = outSaf.use { out ->
+                        if (resized != null) {
+                            out.write(resized)
+                            resized.size.toLong()
+                        } else {
+                            c.getObjectToStream(handle, size, out) { r, t -> emitProgress(r, t, t0) }
+                        }
+                    }
                     val ms = SystemClock.elapsedRealtime() - t0
-                    val bytes = resized?.size?.toLong() ?: size
-                    val speed = if (ms > 0) (size / 1048576.0) / (ms / 1000.0) else 0.0
-                    log("下载完成：$fileName → 自定义目录（%.1f MB/s）".format(speed))
-                    emit(mapOf("type" to "progress", "received" to size, "total" to size, "speedMBps" to speed))
+                    val speed = if (ms > 0) (written / 1048576.0) / (ms / 1000.0) else 0.0
+                    log("下载完成：$fileName → 自定义目录（$written 字节，%.1f MB/s）".format(speed))
+                    emit(mapOf("type" to "progress", "received" to written, "total" to written, "speedMBps" to speed))
                     return mapOf(
                         "uri" to doc.toString(),
-                        "bytes" to bytes,
+                        "bytes" to written,
                         "ms" to ms,
                         "speedMBps" to speed,
                         "path" to "所选目录/$fileName",
@@ -638,21 +659,25 @@ object CameraEngine {
                 }
                 val uri = resolver.insert(collection, values) ?: throw IOException("MediaStore 创建文件失败")
                 created = uri
-                resolver.openOutputStream(uri)?.use { out ->
-                    if (resized != null) out.write(resized)
-                    else c.getObjectToStream(handle, size, out) { r, t -> emitProgress(r, t, t0) }
-                } ?: throw IOException("打开输出流失败")
+                val outMs = resolver.openOutputStream(uri) ?: throw IOException("打开输出流失败")
+                val written = outMs.use { out ->
+                    if (resized != null) {
+                        out.write(resized)
+                        resized.size.toLong()
+                    } else {
+                        c.getObjectToStream(handle, size, out) { r, t -> emitProgress(r, t, t0) }
+                    }
+                }
                 values.clear()
                 values.put(MediaStore.MediaColumns.IS_PENDING, 0)
                 resolver.update(uri, values, null, null)
                 val ms = SystemClock.elapsedRealtime() - t0
-                val bytes = resized?.size?.toLong() ?: size
-                val speed = if (ms > 0) (size / 1048576.0) / (ms / 1000.0) else 0.0
-                log("下载完成：$fileName → $relPath（%.1f MB/s）".format(speed))
-                emit(mapOf("type" to "progress", "received" to size, "total" to size, "speedMBps" to speed))
+                val speed = if (ms > 0) (written / 1048576.0) / (ms / 1000.0) else 0.0
+                log("下载完成：$fileName → $relPath（$written 字节，%.1f MB/s）".format(speed))
+                emit(mapOf("type" to "progress", "received" to written, "total" to written, "speedMBps" to speed))
                 return mapOf(
                     "uri" to uri.toString(),
-                    "bytes" to bytes,
+                    "bytes" to written,
                     "ms" to ms,
                     "speedMBps" to speed,
                     "path" to "$relPath/$fileName",
@@ -665,8 +690,10 @@ object CameraEngine {
                     else runCatching { resolver.delete(created, null, null) }
                 }
                 attempt++
-                if (attempt == 1 && e is PtpException && c.effectiveDlMode != PtpIpClient.DlMode.FULL) {
-                    log("分块下载失败（${e.message}），改用整文件下载重试")
+                // 降级条件不能只看 PtpException：分块提前结束抛的是 IOException，
+                // 而那恰恰是最该退回整文件下载的情形。
+                if (attempt == 1 && c.effectiveDlMode != PtpIpClient.DlMode.FULL) {
+                    log("下载失败（$fileName）：${e.message}；改用整文件下载重试")
                     c.degradeToFullDownload()
                     continue
                 }

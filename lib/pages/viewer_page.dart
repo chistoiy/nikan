@@ -1,10 +1,12 @@
 import 'dart:typed_data';
 
-import 'package:exif/exif.dart';
 import 'package:flutter/material.dart';
 
 import '../app_model.dart';
 import '../models/camera_file.dart';
+import '../models/exif_summary.dart';
+import '../util/format.dart';
+import 'widgets/app_widgets.dart';
 import 'widgets/zoom_image.dart';
 
 /// 全屏大图查看器：左右翻页、双指缩放、原图拉取、EXIF 信息（ISO/光圈/快门）。
@@ -24,16 +26,10 @@ class ViewerPage extends StatefulWidget {
   State<ViewerPage> createState() => _ViewerPageState();
 }
 
-class _ExifInfo {
-  String? iso;
-  String? fNumber;
-  String? exposure;
-}
-
 class _ViewerPageState extends State<ViewerPage> {
   late final PageController _ctrl;
   final Map<int, Uint8List> _full = {};
-  final Map<int, _ExifInfo> _exif = {};
+  final Map<int, ExifSummary> _exif = {};
   bool _showInfo = true;
 
   AppModel get model => widget.model;
@@ -63,21 +59,8 @@ class _ViewerPageState extends State<ViewerPage> {
   }
 
   Future<void> _parseExif(int handle, Uint8List bytes) async {
-    try {
-      final tags = await readExifFromBytes(bytes);
-      final info = _ExifInfo()
-        ..iso = tags['EXIF ISOSpeedRatings']?.printable
-        ..fNumber = tags['EXIF FNumber']?.printable
-        ..exposure = tags['EXIF ExposureTime']?.printable;
-      if (mounted) setState(() => _exif[handle] = info);
-    } catch (_) {}
-  }
-
-  String _fmtSize(num? b) {
-    if (b == null || b <= 0) return '';
-    if (b >= 1048576) return '${(b / 1048576).toStringAsFixed(1)}MB';
-    if (b >= 1024) return '${(b / 1024).toStringAsFixed(0)}KB';
-    return '${b}B';
+    final info = await ExifSummary.parse(bytes);
+    if (mounted) setState(() => _exif[handle] = info);
   }
 
   @override
@@ -150,21 +133,18 @@ class _ViewerPageState extends State<ViewerPage> {
                       Text(
                         [
                           if (f.dateText != null) f.dateText!,
-                          if (f.width != null && (f.width ?? 0) > 0) '${f.width}×${f.height}',
-                          _fmtSize(f.size),
+                          if (f.width != null && f.height != null && f.width! > 0) '${f.width}×${f.height}',
+                          formatBytes(f.size),
                           if (f.ext != null) f.ext!,
                         ].where((s) => s.isNotEmpty).join('  ·  '),
                         style: TextStyle(fontSize: 12, color: Colors.white.withValues(alpha: 0.55)),
                       ),
                       const SizedBox(height: 4),
                       Text(
-                        [
-                          if (exifInfo?.iso != null) 'ISO ${exifInfo!.iso}',
-                          if (exifInfo?.fNumber != null) 'f/${exifInfo!.fNumber}',
-                          if (exifInfo?.exposure != null) '${exifInfo!.exposure}s',
-                          if (exifInfo == null && f.kind != 'video') 'EXIF 解析中…',
-                        ].join('   '),
-                        style: const TextStyle(fontSize: 12.5, color: Color(0xFFFFE100)),
+                        exifInfo == null
+                            ? (f.kind == 'video' ? '' : 'EXIF 解析中…')
+                            : exifInfo.text,
+                        style: const TextStyle(fontSize: 12.5, color: kAccent),
                       ),
                     ],
                   ),

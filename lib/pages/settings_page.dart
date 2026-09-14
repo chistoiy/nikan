@@ -1,7 +1,8 @@
 import 'package:flutter/material.dart';
 
 import '../app_model.dart';
-import 'debug_page.dart';
+import 'debug/debug_page.dart';
+import 'widgets/app_widgets.dart';
 
 /// 设置页：存储与下载设置 + 内嵌协议验证面板。
 class SettingsPage extends StatefulWidget {
@@ -14,7 +15,12 @@ class SettingsPage extends StatefulWidget {
 }
 
 class _SettingsPageState extends State<SettingsPage> {
-  static const yellow = Color(0xFFFFE100);
+  static const yellow = kAccent;
+
+  /// 面板自己用 ValueListenableBuilder 订阅日志，不依赖 AppModel。
+  /// 固化成常量实例复用：外层 AnimatedBuilder 重建时，同一 widget 实例会
+  /// 被 Flutter 跳过 build（否则每次通知都要重建这 677 行的协议面板）。
+  static const _debugPanel = DebugPanel(embedded: true);
 
   AppModel get model => widget.model;
 
@@ -57,7 +63,7 @@ class _SettingsPageState extends State<SettingsPage> {
           padding: const EdgeInsets.all(12),
           children: [
             _sectionTitle('存储与下载'),
-            _card(Column(
+            AppCard(child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 ListTile(
@@ -115,7 +121,7 @@ class _SettingsPageState extends State<SettingsPage> {
             )),
             const SizedBox(height: 12),
             _sectionTitle('协议验证面板'),
-            _card(const DebugPanel(embedded: true), padding: const EdgeInsets.all(6)),
+            AppCard(padding: const EdgeInsets.all(6), child: _debugPanel),
             const SizedBox(height: 20),
           ],
         ),
@@ -126,12 +132,5 @@ class _SettingsPageState extends State<SettingsPage> {
   Widget _sectionTitle(String text) => Padding(
         padding: const EdgeInsets.fromLTRB(4, 4, 4, 8),
         child: Text(text, style: const TextStyle(fontSize: 13, color: Colors.white38)),
-      );
-
-  Widget _card(Widget child, {EdgeInsets padding = const EdgeInsets.all(14)}) => Card(
-        elevation: 0,
-        clipBehavior: Clip.antiAlias,
-        color: const Color(0xFF161616),
-        child: Padding(padding: padding, child: child),
       );
 }

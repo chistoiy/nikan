@@ -19,9 +19,26 @@ class AppModel extends ChangeNotifier {
     });
     gateway.records.load().then((_) => notifyListeners());
     settings.load().then((_) => notifyListeners());
-    gateway.onFileUpdated = notifyListeners;
+    gateway.onFileUpdated = _notifyThrottled;
+    // 下载记录变化也要驱动重建：否则删除后列表要等下一次引擎通知才刷新
+    gateway.records.addListener(_notifyThrottled);
     NikonEngine.getSaveFolder().then((v) {
       saveFolderUri = v;
+      notifyListeners();
+    });
+  }
+
+  Timer? _notifyTimer;
+  bool _notifyPending = false;
+
+  /// 节流通知。后台索引会为每个文件触发一次回调，直接 notifyListeners 等于
+  /// 按文件数重建所有页面（几千张照片 = 几千次全页重建 + 排序）。
+  /// 状态本身是实时读取的，最后一次变更必定会被渲染，只是最多延迟 150ms。
+  void _notifyThrottled() {
+    if (_notifyPending) return;
+    _notifyPending = true;
+    _notifyTimer = Timer(const Duration(milliseconds: 150), () {
+      _notifyPending = false;
       notifyListeners();
     });
   }
@@ -216,6 +233,8 @@ class AppModel extends ChangeNotifier {
       files = next;
       loadingFiles = false;
       notifyListeners();
+      // 重新枚举说明用户主动刷新或相机有新照片：给此前读取失败的句柄一次重试机会
+      gateway.resetFailures();
       _startIndexing();
       _autoProbe();
     } catch (e) {
@@ -345,6 +364,8 @@ class AppModel extends ChangeNotifier {
 
   @override
   void dispose() {
+    _notifyTimer?.cancel();
+    gateway.records.removeListener(_notifyThrottled);
     _sub?.cancel();
     super.dispose();
   }

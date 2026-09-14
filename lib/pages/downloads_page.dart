@@ -1,6 +1,3 @@
-import 'dart:async';
-import 'dart:math';
-
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
@@ -8,6 +5,8 @@ import '../app_model.dart';
 import '../engine/nikon_engine.dart';
 import '../engine/record_store.dart';
 import 'local_viewer_page.dart';
+import 'widgets/app_widgets.dart';
+import 'widgets/drag_selection.dart';
 
 /// 手机页：已下载照片管理。按日期分组展示，滑动范围多选，批量删除。
 class DownloadsPage extends StatefulWidget {
@@ -20,25 +19,51 @@ class DownloadsPage extends StatefulWidget {
 }
 
 class _DownloadsPageState extends State<DownloadsPage> {
-  static const yellow = Color(0xFFFFE100);
+  static const yellow = kAccent;
   static const int _cols = 3;
   static const double _gap = 2;
 
-  final Set<String> _selected = {}; // RecEntry.key
-  bool _selectMode = false;
-  bool _dragSelecting = false;
-  bool _dragAdd = true;
-  int? _anchorIdx;
-  Offset? _lastGlobal;
-  Timer? _autoScrollTimer;
   final ScrollController _scrollCtrl = ScrollController();
   final Map<String, GlobalKey> _cellKeys = {};
   final Map<String, Uint8List?> _thumbs = {};
   bool _deleting = false;
+  List<RecEntry>? _entriesCache;
+
+  /// 滑动多选状态机（列表版：用命中测试把屏幕坐标换算成索引）
+  late final DragSelection<String> _sel = DragSelection<String>(
+    keyAt: (i) => _entries[i].key,
+    itemCount: () => _entries.length,
+    indexAt: _hitIndex,
+    scrollController: _scrollCtrl,
+    viewportBox: () => context.findRenderObject() as RenderBox?,
+    onChanged: () => setState(() {}),
+  );
 
   AppModel get model => widget.model;
 
-  List<RecEntry> get _entries => model.gateway.records.all;
+  /// 记录列表。records.all 每次调用都会重新排序，而拖动选择会高频读取它
+  /// （命中测试逐格查询、范围选中逐项换算），因此按通知缓存一份。
+  List<RecEntry> get _entries => _entriesCache ??= model.gateway.records.all;
+
+  @override
+  void initState() {
+    super.initState();
+    model.addListener(_onModelChanged);
+  }
+
+  @override
+  void dispose() {
+    model.removeListener(_onModelChanged);
+    _sel.dispose();
+    _scrollCtrl.dispose();
+    super.dispose();
+  }
+
+  void _onModelChanged() {
+    _entriesCache = null;
+    if (_sel.selected.isEmpty) return;
+    _sel.prune(_entries.map((e) => e.key).toSet());
+  }
 
   /// 按日期分组（时间倒序天然成组）
   List<MapEntry<String, List<RecEntry>>> get _sections {
@@ -49,13 +74,6 @@ class _DownloadsPageState extends State<DownloadsPage> {
       out.last.value.add(e);
     }
     return out;
-  }
-
-  void _toggle(String key) {
-    setState(() {
-      if (!_selected.remove(key)) _selected.add(key);
-      if (_selectMode && _selected.isEmpty) _selectMode = false;
-    });
   }
 
   GlobalKey _keyOf(RecEntry e) => _cellKeys.putIfAbsent(e.key, GlobalKey.new);
@@ -74,70 +92,6 @@ class _DownloadsPageState extends State<DownloadsPage> {
     return null;
   }
 
-  void _applyRange(int cur, bool add) {
-    final anchor = _anchorIdx;
-    if (anchor == null) return;
-    final entries = _entries;
-    final lo = min(anchor, cur), hi = max(anchor, cur);
-    var changed = false;
-    for (var i = lo; i <= hi && i < entries.length; i++) {
-      if (add) {
-        changed |= _selected.add(entries[i].key);
-      } else {
-        changed |= _selected.remove(entries[i].key);
-      }
-    }
-    if (changed) setState(() {});
-  }
-
-  void _onDragMove(Offset global, bool add) {
-    _lastGlobal = global;
-    final hit = _hitIndex(global);
-    if (hit != null) _applyRange(hit, add);
-    _updateAutoScroll(global, add);
-  }
-
-  void _updateAutoScroll(Offset global, bool add) {
-    final box = context.findRenderObject() as RenderBox?;
-    if (box == null) return;
-    final local = box.globalToLocal(global);
-    const edge = 90.0;
-    const step = 7.0;
-    double? delta;
-    if (local.dy < edge && local.dy > 0) delta = -step;
-    if (local.dy > box.size.height - edge && local.dy < box.size.height) delta = step;
-    if (delta == null) {
-      _stopAutoScroll();
-      return;
-    }
-    if (_autoScrollTimer != null) return;
-    final d = delta;
-    _autoScrollTimer = Timer.periodic(const Duration(milliseconds: 16), (_) {
-      if (!_dragSelecting || !_scrollCtrl.hasClients) {
-        _stopAutoScroll();
-        return;
-      }
-      final pos = _scrollCtrl.position;
-      pos.jumpTo((pos.pixels + d).clamp(0.0, pos.maxScrollExtent));
-      if (_lastGlobal != null) {
-        final hit = _hitIndex(_lastGlobal!);
-        if (hit != null) _applyRange(hit, add);
-      }
-    });
-  }
-
-  void _stopAutoScroll() {
-    _autoScrollTimer?.cancel();
-    _autoScrollTimer = null;
-  }
-
-  @override
-  void dispose() {
-    _autoScrollTimer?.cancel();
-    _scrollCtrl.dispose();
-    super.dispose();
-  }
-
   Future<void> _loadThumb(RecEntry e) async {
     final key = e.key;
     if (_thumbs.containsKey(key)) return;
@@ -154,7 +108,7 @@ class _DownloadsPageState extends State<DownloadsPage> {
   }
 
   Future<void> _deleteSelected() async {
-    final picks = _entries.where((e) => _selected.contains(e.key)).toList();
+    final picks = _entries.where((e) => _sel.selected.contains(e.key)).toList();
     if (picks.isEmpty) return;
     final ok = await showDialog<bool>(
       context: context,
@@ -180,14 +134,11 @@ class _DownloadsPageState extends State<DownloadsPage> {
       model.gateway.records.removeKey(e.key);
       done++;
     }
-    setState(() {
-      _deleting = false;
-      _selectMode = false;
-      _selected.clear();
-    });
-    if (mounted) {
-      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('已删除 $done 张照片')));
-    }
+    // 删除是逐个 await 的，期间用户可能已返回上一页
+    if (!mounted) return;
+    setState(() => _deleting = false);
+    _sel.exitSelect();
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('已删除 $done 张照片')));
   }
 
   @override
@@ -197,36 +148,27 @@ class _DownloadsPageState extends State<DownloadsPage> {
       builder: (context, _) {
         final sections = _sections;
         final entries = _entries;
+        // 每段在展平列表中的起始下标：滑动选择的命中测试返回展平索引，
+        // 单元格需要知道自己在整表里的位置才能确定锚点
+        final sectionBase = <int>[];
+        var acc = 0;
+        for (final s in sections) {
+          sectionBase.add(acc);
+          acc += s.value.length;
+        }
         return Scaffold(
           backgroundColor: const Color(0xFF0A0A0A),
           appBar: AppBar(
-            title: _selectMode ? Text('已选 ${_selected.length}') : const Text('手机'),
-            leading: _selectMode
-                ? IconButton(
-                    icon: const Icon(Icons.close),
-                    onPressed: () => setState(() {
-                      _selectMode = false;
-                      _selected.clear();
-                    }),
-                  )
+            title: _sel.selectMode ? Text('已选 ${_sel.selected.length}') : const Text('手机'),
+            leading: _sel.selectMode
+                ? IconButton(icon: const Icon(Icons.close), onPressed: _sel.exitSelect)
                 : null,
             actions: [
-              if (_selectMode)
+              if (_sel.selectMode)
                 TextButton(
-                  onPressed: () {
-                    setState(() {
-                      final all = entries.map((e) => e.key).toSet();
-                      if (all.length == _selected.length) {
-                        _selected.clear();
-                      } else {
-                        _selected
-                          ..clear()
-                          ..addAll(all);
-                      }
-                    });
-                  },
+                  onPressed: () => _sel.toggleAll(entries.map((e) => e.key)),
                   child: Text(
-                    _selected.length == entries.length ? '取消全选' : '全选',
+                    _sel.allSelected(entries.map((e) => e.key)) ? '取消全选' : '全选',
                     style: const TextStyle(color: yellow),
                   ),
                 ),
@@ -235,38 +177,19 @@ class _DownloadsPageState extends State<DownloadsPage> {
           body: _deleting
               ? const Center(child: CircularProgressIndicator(strokeWidth: 2))
               : entries.isEmpty
-                  ? Center(
-                      child: Column(
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                          const Icon(Icons.photo_library_outlined, size: 56, color: Colors.white24),
-                          const SizedBox(height: 12),
-                          Text(
-                            '还没有从相机下载的照片',
-                            style: TextStyle(fontSize: 13, color: Colors.white.withValues(alpha: 0.5)),
-                          ),
-                        ],
-                      ),
+                  ? const EmptyState(
+                      icon: Icons.photo_library_outlined,
+                      message: '还没有从相机下载的照片',
                     )
                   : Listener(
                       behavior: HitTestBehavior.translucent,
-                      onPointerMove: (d) {
-                        if (_dragSelecting) _onDragMove(d.position, _dragAdd);
-                      },
-                      onPointerUp: (_) {
-                        _dragSelecting = false;
-                        _anchorIdx = null;
-                        _stopAutoScroll();
-                      },
-                      onPointerCancel: (_) {
-                        _dragSelecting = false;
-                        _anchorIdx = null;
-                        _stopAutoScroll();
-                      },
+                      onPointerMove: (d) => _sel.updateDrag(d.position),
+                      onPointerUp: (_) => _sel.endDrag(),
+                      onPointerCancel: (_) => _sel.endDrag(),
                       child: CustomScrollView(
                         controller: _scrollCtrl,
                         slivers: [
-                          for (final section in sections) ...[
+                          for (final (si, section) in sections.indexed) ...[
                             SliverToBoxAdapter(
                               child: Container(
                                 padding: const EdgeInsets.fromLTRB(16, 14, 16, 8),
@@ -284,7 +207,7 @@ class _DownloadsPageState extends State<DownloadsPage> {
                                 childAspectRatio: 1,
                               ),
                               delegate: SliverChildBuilderDelegate(
-                                (context, i) => _cell(section.value[i]),
+                                (context, i) => _cell(section.value[i], sectionBase[si] + i),
                                 childCount: section.value.length,
                               ),
                             ),
@@ -293,22 +216,22 @@ class _DownloadsPageState extends State<DownloadsPage> {
                         ],
                       ),
                     ),
-          bottomNavigationBar: _selectMode ? _bottomBar() : null,
+          bottomNavigationBar: _sel.selectMode ? _bottomBar() : null,
         );
       },
     );
   }
 
-  Widget _cell(RecEntry e) {
+  Widget _cell(RecEntry e, int index) {
     WidgetsBinding.instance.addPostFrameCallback((_) => _loadThumb(e));
     final bytes = _thumbs[e.key];
-    final isSel = _selected.contains(e.key);
+    final isSel = _sel.selected.contains(e.key);
     return GestureDetector(
       key: _keyOf(e),
       behavior: HitTestBehavior.opaque,
       onTap: () {
-        if (_selectMode) {
-          _toggle(e.key);
+        if (_sel.selectMode) {
+          _sel.toggle(e.key);
           return;
         }
         if (e.uri == null) return;
@@ -327,11 +250,7 @@ class _DownloadsPageState extends State<DownloadsPage> {
       },
       onLongPressStart: (_) {
         HapticFeedback.mediumImpact();
-        if (!_selectMode) setState(() => _selectMode = true);
-        _dragAdd = !_selected.contains(e.key);
-        _anchorIdx = _entries.indexOf(e);
-        _dragSelecting = true;
-        _applyRange(_anchorIdx!, _dragAdd);
+        _sel.beginDrag(index);
       },
       child: Stack(
         fit: StackFit.expand,
@@ -363,8 +282,7 @@ class _DownloadsPageState extends State<DownloadsPage> {
               behavior: HitTestBehavior.opaque,
               onTap: () {
                 HapticFeedback.selectionClick();
-                if (!_selectMode) setState(() => _selectMode = true);
-                _toggle(e.key);
+                _sel.enterSelectAndToggle(e.key);
               },
               child: const Padding(
                 padding: EdgeInsets.all(8),
@@ -384,7 +302,7 @@ class _DownloadsPageState extends State<DownloadsPage> {
   }
 
   Widget _bottomBar() {
-    final count = _selected.length;
+    final count = _sel.selected.length;
     return SafeArea(
       top: false,
       child: Container(

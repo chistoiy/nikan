@@ -17,6 +17,12 @@ class PtpException(val code: Int, message: String) : IOException("PTP ${Ptp.resp
 object PtpWire {
     const val HEADER_SIZE = 8
 
+    /**
+     * 单包长度上限。长度字段来自对端，损坏或异常值会走到 ByteArray 巨量分配
+     * （甚至因 toInt() 溢出变成负长度）。相机实际报文远小于此值。
+     */
+    const val MAX_PACKET_BYTES = 16 shl 20
+
     fun putU16(b: ByteArray, off: Int, v: Int) {
         b[off] = (v and 0xFF).toByte()
         b[off + 1] = ((v shr 8) and 0xFF).toByte()
@@ -63,7 +69,11 @@ object PtpWire {
         readFully(input, hdr)
         val len = getU32(hdr, 0)
         val type = getU32(hdr, 4).toInt()
-        if (len < HEADER_SIZE) throw WireException("非法包长度 $len")
+        // 必须先校验长度再分配：损坏的长度会造成 OOM 或 NegativeArraySizeException，
+        // 而事件读取线程一旦抛出 Error 就会静默死亡（UI 仍显示已连接却收不到任何事件）。
+        if (len < HEADER_SIZE || len > MAX_PACKET_BYTES) {
+            throw WireException("非法包长度 $len（允许 $HEADER_SIZE~$MAX_PACKET_BYTES）")
+        }
         val payloadLen = (len - HEADER_SIZE).toInt()
         val payload = ByteArray(payloadLen)
         if (payloadLen > 0) readFully(input, payload)
@@ -149,12 +159,24 @@ class ByteReader(private val b: ByteArray) {
     }
 
     fun u16Array(): IntArray {
-        val n = u32().toInt()
+        val n = countOf(2)
         return IntArray(n) { u16() }
     }
 
     fun u32Array(): LongArray {
-        val n = u32().toInt()
+        val n = countOf(4)
         return LongArray(n) { u32() }
+    }
+
+    /**
+     * 读取数组元素个数并按剩余字节数校验。个数来自对端，若直接拿去分配数组，
+     * 损坏的长度（如 0x40000000）会立刻触发巨量分配。
+     */
+    private fun countOf(elemBytes: Int): Int {
+        val n = u32()
+        if (n < 0 || n > remaining / elemBytes) {
+            throw WireException("数组元素个数非法（$n 个，剩余 $remaining 字节，每元素 $elemBytes 字节）")
+        }
+        return n.toInt()
     }
 }
