@@ -459,6 +459,7 @@ internal object PtpUsbProbe {
         PtpWire.putU16(buf, 6, op)
         PtpWire.putU32(buf, 8, txn)
         params.forEachIndexed { i, v -> PtpWire.putU32(buf, HEADER_BYTES + i * 4, v) }
+        log("USB → 发命令 0x%04X txn=$txn 共 ${buf.size}B 原始=${hexOf(buf)}".format(op))
         sendContainer(c, eout, buf, "命令 0x" + "%04X".format(op), log)
 
         while (true) {
@@ -512,11 +513,21 @@ internal object PtpUsbProbe {
         val type = PtpWire.getU16(h, 4)
         val code = PtpWire.getU16(h, 6)
         val txn = PtpWire.getU32(h, 8)
+        // 打出收到的容器头原始字节：帧格式是否有问题，看这个最直接
+        probeLog(
+            "USB ← 收容器 len=$len type=$type code=0x%04X txn=$txn 原始=%s".format(
+                code, hexOf(h),
+            ),
+        )
         if (len < HEADER_BYTES || len > MAX_PAYLOAD) {
             throw IOException("USB 容器长度非法：$len")
         }
         return UsbHeader(type, code, txn, (len - HEADER_BYTES).toInt())
     }
+
+    /** 容器头十六进制。Kotlin 的 Byte 是有符号的，必须先掩码再格式化，否则 0xFF 会打成负数。 */
+    private fun hexOf(b: ByteArray): String =
+        b.joinToString(" ") { "%02X".format(it.toInt() and 0xFF) }
 
     private fun readPayload(c: UsbDeviceConnection, ein: UsbEndpoint, len: Int): ByteArray {
         if (len <= 0) return ByteArray(0)
