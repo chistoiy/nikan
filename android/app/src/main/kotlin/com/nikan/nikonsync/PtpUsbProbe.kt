@@ -637,24 +637,39 @@ internal object PtpUsbProbe {
         return b
     }
 
-    /** Bulk 读可能少于请求长度，必须循环补齐 */
+    /**
+     * Bulk 读，循环补齐并在无数据时**重读**。
+     *
+     * ⚠️ 这里**绝对不能**对 IN 端点做 clearHalt。
+     * CLEAR_FEATURE(ENDPOINT_HALT) 会复位端点并**丢弃设备正在发送的数据**，
+     * 相机随即以 0x2007 IncompleteTransfer 结束该数据阶段——实测就是这样把
+     * GetDeviceInfo 的数据弄丢的，日志时序：
+     *   +2ms 读返回 -1  →  +3ms 对 0x81 做了 clearHalt  →  +153ms 收到 0x2007
+     * 那个 0x2007 是"清除 STALL"这个动作自己造出来的，所以"清除后重试"
+     * 永远救不回来（清一次丢一次）。
+     *
+     * 正确做法：短延迟后重读。bulkTransfer 在无数据时会立刻返回 -1
+     * （并不遵守传入的超时），因此重读循环本身就是实际的等待机制。
+     */
     private fun readFully(c: UsbDeviceConnection, ein: UsbEndpoint, buf: ByteArray, want: Int) {
         var off = 0
+        var empty = 0
         while (off < want) {
-            var n = runCatching { c.bulkTransfer(ein, buf, off, want - off, BULK_TIMEOUT_MS) }
+            val n = runCatching { c.bulkTransfer(ein, buf, off, want - off, BULK_TIMEOUT_MS) }
                 .getOrDefault(-1)
-            if (n <= 0) {
-                // bulkTransfer 在"端点被 STALL"和"超时"两种情况下都返回 -1，
-                // 无法直接区分。端点 STALL 是可恢复的（清一下就好），
-                // 所以先清除再重试一次，避免把可恢复的 halt 误判成链路故障。
-                probeLog("USB 读取受阻（已收 $off/$want，返回 $n），清除 IN 端点 STALL 后重试")
-                clearHalt(c, ein, probeLog)
-                Thread.sleep(150)
-                n = runCatching { c.bulkTransfer(ein, buf, off, want - off, BULK_TIMEOUT_MS) }
-                    .getOrDefault(-1)
+            if (n > 0) {
+                off += n
+                empty = 0
+                continue
             }
-            if (n <= 0) throw IOException("USB 读取失败（已收 $off/$want，清除 STALL 后仍返回 $n）")
-            off += n
+            empty++
+            if (empty == 1 || empty % 20 == 0) {
+                probeLog("USB 暂无可读数据（已收 $off/$want，第 $empty 次），继续等待")
+            }
+            if (empty > 100) { // 100 × 20ms ≈ 2s，作为实际的读超时
+                throw IOException("USB 读取失败（已收 $off/$want，等待约 2s 仍无数据）")
+            }
+            Thread.sleep(20)
         }
     }
 
