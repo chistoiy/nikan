@@ -638,38 +638,37 @@ internal object PtpUsbProbe {
     }
 
     /**
-     * Bulk 读，循环补齐并在无数据时**重读**。
+     * Bulk 读，循环补齐；无数据时**以较长间隔**重读。
      *
-     * ⚠️ 这里**绝对不能**对 IN 端点做 clearHalt。
-     * CLEAR_FEATURE(ENDPOINT_HALT) 会复位端点并**丢弃设备正在发送的数据**，
-     * 相机随即以 0x2007 IncompleteTransfer 结束该数据阶段——实测就是这样把
-     * GetDeviceInfo 的数据弄丢的，日志时序：
-     *   +2ms 读返回 -1  →  +3ms 对 0x81 做了 clearHalt  →  +153ms 收到 0x2007
-     * 那个 0x2007 是"清除 STALL"这个动作自己造出来的，所以"清除后重试"
-     * 永远救不回来（清一次丢一次）。
+     * 两条来自真机日志对比的教训：
      *
-     * 正确做法：短延迟后重读。bulkTransfer 在无数据时会立刻返回 -1
-     * （并不遵守传入的超时），因此重读循环本身就是实际的等待机制。
+     * 1. **绝不能对 IN 端点做 clearHalt**。CLEAR_FEATURE(ENDPOINT_HALT) 会复位端点并
+     *    丢弃设备正在发送的数据——实测那样做会让相机回 0x2007 IncompleteTransfer，
+     *    等于"清一次丢一次"，永远救不回来。
+     *
+     * 2. **重读间隔不能短**。Android 的 bulkTransfer 底层是 USBDEVFS_BULK ioctl，
+     *    在上一笔传输尚未完成时立刻再发，很可能中止那个进行中的 URB。
+     *    实测对比：间隔 150ms 时 +153ms 就收到了响应；改成 20ms 密集重试后，
+     *    2 秒内一个字节都收不到——密集重试反而把设备正要送出的数据打断了。
+     *    因此用 200ms 间隔、最多 15 次（约 3 秒）。
      */
     private fun readFully(c: UsbDeviceConnection, ein: UsbEndpoint, buf: ByteArray, want: Int) {
         var off = 0
-        var empty = 0
+        var attempt = 0
         while (off < want) {
             val n = runCatching { c.bulkTransfer(ein, buf, off, want - off, BULK_TIMEOUT_MS) }
                 .getOrDefault(-1)
             if (n > 0) {
                 off += n
-                empty = 0
+                attempt = 0
                 continue
             }
-            empty++
-            if (empty == 1 || empty % 20 == 0) {
-                probeLog("USB 暂无可读数据（已收 $off/$want，第 $empty 次），继续等待")
+            attempt++
+            if (attempt > 15) {
+                throw IOException("USB 读取失败（已收 $off/$want，等待约 3s 仍无数据）")
             }
-            if (empty > 100) { // 100 × 20ms ≈ 2s，作为实际的读超时
-                throw IOException("USB 读取失败（已收 $off/$want，等待约 2s 仍无数据）")
-            }
-            Thread.sleep(20)
+            probeLog("USB 暂无数据（已收 $off/$want，第 $attempt 次），200ms 后重读")
+            Thread.sleep(200)
         }
     }
 
