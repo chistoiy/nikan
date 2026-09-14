@@ -82,9 +82,17 @@ internal object PtpUsbProbe {
             if (!openSession(conn, epIn, epOut, log, out)) return out
 
             // ---- 2) GetDeviceInfo：顺带对比操作集大小 ----
-            val (code, payload) = command(conn, epIn, epOut, Ptp.OP_GET_DEVICE_INFO, LongArray(0), log)
+            var info = command(conn, epIn, epOut, Ptp.OP_GET_DEVICE_INFO, LongArray(0), log)
+            if (info.first != Ptp.RESP_OK) {
+                out += "GetDeviceInfo → ${Ptp.respName(info.first)}"
+                // 沿用会话失败时的降级路径：关闭残留会话重开，再试一次
+                if (resetSession(conn, epIn, epOut, log, out)) {
+                    info = command(conn, epIn, epOut, Ptp.OP_GET_DEVICE_INFO, LongArray(0), log)
+                }
+            }
+            val (code, payload) = info
             if (code != Ptp.RESP_OK) {
-                out += "GetDeviceInfo 失败：${Ptp.respName(code)}"
+                out += "GetDeviceInfo 仍然失败：${Ptp.respName(code)}，后续步骤跳过"
                 return out
             }
             val di = runCatching { PtpDatasets.parseDeviceInfo(payload) }.getOrNull()
@@ -344,31 +352,49 @@ internal object PtpUsbProbe {
         val (code, _) = command(c, ein, eout, Ptp.OP_OPEN_SESSION, longArrayOf(1), log)
         out += "OpenSession → ${Ptp.respName(code)}"
         log("USB OpenSession → ${Ptp.respName(code)}")
-        if (code == Ptp.RESP_OK) {
-            // 关键：TransactionID 是**按会话**递增的，PTP 要求每个新会话的第一笔操作
-            // 事务号为 1。此前事务号跨会话连续累加（重开后 GetDeviceInfo 拿到 4），
-            // 相机直接以 0x2007 IncompleteTransfer 拒绝了它——现象就是"拿不到数据阶段"。
-            txnId = 0L
-            Thread.sleep(300) // 会话刚建立时相机可能还在初始化，留一点余量
-            return true
-        }
 
-        if (code == Ptp.RESP_SESSION_ALREADY_OPEN) {
-            out += "相机上已有残留会话（多为系统 MTP 服务建立），先关闭再重开"
-            val (closeCode, _) = runCatching {
-                command(c, ein, eout, Ptp.OP_CLOSE_SESSION, LongArray(0), log)
-            }.getOrElse { Ptp.RESP_OK to ByteArray(0) }
-            log("USB CloseSession → ${Ptp.respName(closeCode)}")
-            out += "CloseSession → ${Ptp.respName(closeCode)}"
-            Thread.sleep(400) // 给相机释放会话的时间
-            drainInput(c, ein, log)
-            val (again, _) = command(c, ein, eout, Ptp.OP_OPEN_SESSION, longArrayOf(1), log)
-            out += "重新 OpenSession → ${Ptp.respName(again)}"
-            log("USB 重新 OpenSession → ${Ptp.respName(again)}")
-            if (again == Ptp.RESP_OK) return true
+        // 会话已存在时**直接沿用**。理由：
+        // 残留会话很可能就是上一次中断的探测自己留下的，而 PTP 允许直接使用已打开的会话。
+        // 此前选择"先关闭再重开"，实测 CloseSession 之后相机会重置 USB 端点状态，
+        // 下一笔命令发送失败（-1，且清除 STALL 无效）——而且是非确定性的。
+        //
+        // ⚠️ 同时放弃"新会话事务号归零"：OpenSession 自己就占一个事务号，
+        // 归零会让紧随其后的 GetDeviceInfo 与它**撞号**，相机以 IncompleteTransfer 拒绝。
+        // 正确做法是同一连接内事务号单调递增。
+        if (code == Ptp.RESP_OK || code == Ptp.RESP_SESSION_ALREADY_OPEN) {
+            if (code == Ptp.RESP_SESSION_ALREADY_OPEN) {
+                out += "沿用相机上已打开的会话（残留会话多为上一次中断的探测所留）"
+            }
+            Thread.sleep(300)
+            return true
         }
         out += "会话打开失败，后续步骤跳过"
         return false
+    }
+
+    /**
+     * 降级路径：沿用会话后第一笔操作仍失败时，关闭残留会话再重开一次。
+     * 只在必要时才走——CloseSession 会扰动 USB 端点状态，能不用就不用。
+     */
+    private fun resetSession(
+        c: UsbDeviceConnection,
+        ein: UsbEndpoint,
+        eout: UsbEndpoint,
+        log: (String) -> Unit,
+        out: MutableList<String>,
+    ): Boolean {
+        out += "沿用会话失败，降级为：关闭残留会话后重开"
+        val (closeCode, _) = runCatching {
+            command(c, ein, eout, Ptp.OP_CLOSE_SESSION, LongArray(0), log)
+        }.getOrElse { Ptp.RESP_OK to ByteArray(0) }
+        log("USB CloseSession → ${Ptp.respName(closeCode)}")
+        out += "CloseSession → ${Ptp.respName(closeCode)}"
+        Thread.sleep(500)
+        drainInput(c, ein, log)
+        val (again, _) = command(c, ein, eout, Ptp.OP_OPEN_SESSION, longArrayOf(1), log)
+        out += "重新 OpenSession → ${Ptp.respName(again)}"
+        log("USB 重新 OpenSession → ${Ptp.respName(again)}")
+        return again == Ptp.RESP_OK
     }
 
     /**
