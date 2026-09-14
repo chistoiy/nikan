@@ -65,6 +65,80 @@ internal object PtpUsbProbe {
     /** 本次运行的日志出口（run() 开头设置）。供深层读写函数使用，避免层层透传。 */
     private var probeLog: (String) -> Unit = {}
 
+    /** 运行期持有的 Context（重枚举恢复时需要重新枚举设备） */
+    private var ctxRef: Context? = null
+
+    /**
+     * 设备重新枚举后的恢复。
+     *
+     * 实测：相机在探测过程中会从 `/dev/bus/usb/001/003` 换到 `004`
+     * （`dumpsys usb` 的 host_manager 里能看到 mode=0 → mode=-1 → mode=0 的换址）。
+     * **设备地址一变，手里的 UsbDeviceConnection 即失效**，此后所有 bulkTransfer
+     * 返回 -1，且清除端点 STALL 无效——因为根本不是端点的问题。
+     * 唯一出路是按 VID/PID 重新找到设备、重新 claim。
+     */
+    private fun reopenAfterEnumeration(log: (String) -> Unit): Boolean {
+        val ctx = ctxRef ?: return false
+        val mgr = ctx.getSystemService(Context.USB_SERVICE) as? UsbManager ?: return false
+        val vid = device?.vendorId
+        val pid = device?.productId
+        closeQuietly(log)
+        val dev = mgr.deviceList.values.firstOrNull {
+            (vid == null || it.vendorId == vid) && (pid == null || it.productId == pid)
+        }
+        if (dev == null) {
+            log("USB 重枚举恢复失败：按 VID/PID 找不到设备（可能已拔出）")
+            return false
+        }
+        val ptp = pickStillImageInterface(dev)
+        if (ptp == null) {
+            log("USB 重枚举恢复失败：新设备没有 Still Image 接口")
+            return false
+        }
+        if (!mgr.hasPermission(dev)) {
+            log("USB 重枚举恢复失败：新地址需要重新授权（系统对话框不会自动弹）")
+            return false
+        }
+        val c = mgr.openDevice(dev) ?: return false
+        if (!c.claimInterface(ptp, true)) {
+            runCatching { c.close() }
+            log("USB 重枚举恢复失败：claimInterface 被拒")
+            return false
+        }
+        val ein = findBulk(ptp, UsbConstants.USB_DIR_IN)
+        val eout = findBulk(ptp, UsbConstants.USB_DIR_OUT)
+        if (ein == null || eout == null) {
+            runCatching { c.releaseInterface(ptp) }
+            runCatching { c.close() }
+            return false
+        }
+        device = dev
+        conn = c
+        iface = ptp
+        epIn = ein
+        epOut = eout
+        log("USB 设备已重枚举并重新打开成功（${dev.deviceName}）")
+        return true
+    }
+
+    /** 执行命令；传输失败时尝试"重枚举恢复"再重试一次。 */
+    private fun commandRecovering(
+        op: Int,
+        params: LongArray,
+        what: String,
+        out: MutableList<String>,
+    ): Pair<Int, ByteArray> {
+        val first = runCatching { command(conn!!, epIn!!, epOut!!, op, params, probeLog) }
+        if (first.isSuccess) return first.getOrThrow()
+        val err = first.exceptionOrNull()
+        out += "$what 传输失败：${err?.message}"
+        probeLog("USB $what 传输失败：${err?.message}，尝试重枚举恢复")
+        if (!reopenAfterEnumeration(probeLog)) {
+            throw (err as? IOException ?: IOException("USB $what 失败"))
+        }
+        return command(conn!!, epIn!!, epOut!!, op, params, probeLog)
+    }
+
     /**
      * U0 入口：跑完"探测 → 会话 → 操作集 → 测速"全流程，返回可读结论。
      * 需要用户在弹出的系统对话框里点一次"允许"。
@@ -72,6 +146,7 @@ internal object PtpUsbProbe {
     fun run(ctx: Context, log: (String) -> Unit): List<String> {
         val out = ArrayList<String>()
         probeLog = log
+        ctxRef = ctx
         try {
             openDevice(ctx, log, out) ?: return out
             val conn = conn ?: return out
@@ -82,12 +157,12 @@ internal object PtpUsbProbe {
             if (!openSession(conn, epIn, epOut, log, out)) return out
 
             // ---- 2) GetDeviceInfo：顺带对比操作集大小 ----
-            var info = command(conn, epIn, epOut, Ptp.OP_GET_DEVICE_INFO, LongArray(0), log)
+            var info = commandRecovering(Ptp.OP_GET_DEVICE_INFO, LongArray(0), "GetDeviceInfo", out)
             if (info.first != Ptp.RESP_OK) {
                 out += "GetDeviceInfo → ${Ptp.respName(info.first)}"
                 // 沿用会话失败时的降级路径：关闭残留会话重开，再试一次
                 if (resetSession(conn, epIn, epOut, log, out)) {
-                    info = command(conn, epIn, epOut, Ptp.OP_GET_DEVICE_INFO, LongArray(0), log)
+                    info = commandRecovering(Ptp.OP_GET_DEVICE_INFO, LongArray(0), "GetDeviceInfo", out)
                 }
             }
             val (code, payload) = info
@@ -349,7 +424,7 @@ internal object PtpUsbProbe {
         log: (String) -> Unit,
         out: MutableList<String>,
     ): Boolean {
-        val (code, _) = command(c, ein, eout, Ptp.OP_OPEN_SESSION, longArrayOf(1), log)
+        val (code, _) = commandRecovering(Ptp.OP_OPEN_SESSION, longArrayOf(1), "OpenSession", out)
         out += "OpenSession → ${Ptp.respName(code)}"
         log("USB OpenSession → ${Ptp.respName(code)}")
 
@@ -385,13 +460,13 @@ internal object PtpUsbProbe {
     ): Boolean {
         out += "沿用会话失败，降级为：关闭残留会话后重开"
         val (closeCode, _) = runCatching {
-            command(c, ein, eout, Ptp.OP_CLOSE_SESSION, LongArray(0), log)
+            commandRecovering(Ptp.OP_CLOSE_SESSION, LongArray(0), "CloseSession", out)
         }.getOrElse { Ptp.RESP_OK to ByteArray(0) }
         log("USB CloseSession → ${Ptp.respName(closeCode)}")
         out += "CloseSession → ${Ptp.respName(closeCode)}"
         Thread.sleep(500)
         drainInput(c, ein, log)
-        val (again, _) = command(c, ein, eout, Ptp.OP_OPEN_SESSION, longArrayOf(1), log)
+        val (again, _) = commandRecovering(Ptp.OP_OPEN_SESSION, longArrayOf(1), "OpenSession", out)
         out += "重新 OpenSession → ${Ptp.respName(again)}"
         log("USB 重新 OpenSession → ${Ptp.respName(again)}")
         return again == Ptp.RESP_OK
