@@ -291,6 +291,31 @@ class _GalleryPageState extends State<GalleryPage> {
     }
   }
 
+  /// 状态条：按「进行中的下载 > 新照片 > 索引」的优先级**只显示一条**。
+  /// 三块状态条此前各自判断、可以同时出现，最多挤掉网格 100dp 以上。
+  Widget _statusBar(int total) {
+    if (model.downloading) {
+      return DownloadProgressBar(
+        done: model.dlDone,
+        total: model.dlTotal,
+        fileFrac: model.dlFileFrac,
+        speedMBps: model.dlSpeed,
+        currentName: model.dlCurrentName,
+        onCancel: () => model.cancelRequested = true,
+      );
+    }
+    if (model.hasNewPhotos) {
+      return NewPhotosBanner(onRefresh: () {
+        model.consumeNewPhotos();
+        model.loadFiles();
+      });
+    }
+    if (!model.indexingDone && model.files.isNotEmpty) {
+      return IndexProgressBar(indexed: model.indexedCount, total: total);
+    }
+    return const SizedBox.shrink();
+  }
+
   /// 待下载任务条：把"还差多少"和"一键传完"放在第一眼位置。
   ///
   /// 有筛选时按钮传的是**筛选范围内**的未下载文件，文案也相应区分，
@@ -383,22 +408,8 @@ class _GalleryPageState extends State<GalleryPage> {
                 groupByDay: _groupByDay,
                 onToggleGroupByDay: () => _setFilter(groupByDay: !_groupByDay),
               ),
-              if (model.hasNewPhotos)
-                NewPhotosBanner(onRefresh: () {
-                  model.consumeNewPhotos();
-                  model.loadFiles();
-                }),
-              if (!model.indexingDone && model.files.isNotEmpty)
-                IndexProgressBar(indexed: model.indexedCount, total: model.files.length),
-              if (model.downloading)
-                DownloadProgressBar(
-                  done: model.dlDone,
-                  total: model.dlTotal,
-                  fileFrac: model.dlFileFrac,
-                  speedMBps: model.dlSpeed,
-                  currentName: model.dlCurrentName,
-                  onCancel: () => model.cancelRequested = true,
-                ),
+              // 状态条只显示一条：此前三块各自判断、可同时堆叠，最多挤掉网格 100dp 以上
+              _statusBar(files.length),
               Expanded(child: _body(files)),
             ],
           ),
