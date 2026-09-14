@@ -345,6 +345,10 @@ internal object PtpUsbProbe {
         out += "OpenSession → ${Ptp.respName(code)}"
         log("USB OpenSession → ${Ptp.respName(code)}")
         if (code == Ptp.RESP_OK) {
+            // 关键：TransactionID 是**按会话**递增的，PTP 要求每个新会话的第一笔操作
+            // 事务号为 1。此前事务号跨会话连续累加（重开后 GetDeviceInfo 拿到 4），
+            // 相机直接以 0x2007 IncompleteTransfer 拒绝了它——现象就是"拿不到数据阶段"。
+            txnId = 0L
             Thread.sleep(300) // 会话刚建立时相机可能还在初始化，留一点余量
             return true
         }
