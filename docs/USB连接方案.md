@@ -61,13 +61,31 @@
 
 **唯一目标：拿到真实的 MB/s，以及确认能否 PTP 会话。**
 
-- Manifest 加 `<uses-feature android:name="android.hardware.usb.host" />`
-  与 `device_filter.xml`（vendor/product id 留空或用尼康的 0x04B0）达到"插入即启动"
-- `UsbManager.deviceList` 枚举 → 找 PTP 接口（class 6 / subclass 1 / protocol 1）
-  → `requestPermission` → `claimInterface(force = true)`
-- 实现最小 USB 事务：`OpenSession` → `GetDeviceInfo` → 打印型号与操作集数量
-- **`GetObject` 拉一张最大的 NEF/MOV，计时算 MB/s**
-- 顺便 dump USB 模式下的操作集，与 Wi-Fi 下的 126 个对比（看实时取景码 0x92xx 是否放行）
+> **状态：已实现，待测。** 入口在设置页 → 高级 → 开发者选项 → `USB:吞吐测速`。
+> 一次运行会把下面四项结论全部写进日志，复制日志即可判断方案是否成立。
+
+已实现的内容（`android/.../PtpUsbProbe.kt`）：
+
+- `AndroidManifest` 加 `android.hardware.usb.host`（`required=false`，无 OTG 的机型仍可只用 Wi-Fi）
+- `res/xml/device_filter.xml` 按尼康厂商 ID（0x04B0）匹配，插入相机即拉起应用
+- 找 PTP 静态接口（class 6 / subclass 1 / protocol 1）→ `requestPermission`（等用户点一次）
+  → `claimInterface(force = true)`（系统自带 MTP 服务可能已占用）→ 定位 Bulk 端点
+- 实现 12 字节 PTP/USB 容器（`长度 u32 + 类型 u16 + 码 u16 + 事务号 u32`），
+  命令/数据/响应三段；Bulk 读循环补齐（部分读是常态）
+- `OpenSession` → `GetDeviceInfo`（**复用 `PtpDatasets.parseDeviceInfo`**）
+- **实测吞吐**：找最大的对象做 `GetObject`，只统计字节数不落内存（避免大文件 OOM），
+  并校验头两字节是 JPEG SOI——防止"测得很快但数据是错的"
+- 操作集对比：统计 `0x92xx` 段（实时取景族）在 USB 下是否放行
+
+**测试步骤**：
+1. 相机菜单把 USB 模式设为 **PTP**（不是 MTP），并退出「连接至智能设备」
+2. 用**数据线**（非纯充电线）连接手机，App 会自动弹出
+3. 设置页 → 高级 → 开发者选项 → `USB:吞吐测速`，点系统弹窗的「允许」
+4. 复制日志发回
+
+⚠️ **运行时会占用 USB 接口并打开 PTP 会话**。若此时 Wi-Fi 已连接，相机可能因
+"同时只允许一个会话"而断开 Wi-Fi——所以按钮标签里写了"会中断 Wi-Fi"。
+测 USB 时请不要先连 Wi-Fi。
 
 **Go 条件**：能 OpenSession + 能读出文件 + 吞吐 ≥ 10MB/s。
 **No-Go 应对**：若拿不到接口，先排查 MediaProvider 抢占与相机 USB 模式；

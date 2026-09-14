@@ -212,6 +212,12 @@ object NikonsyncPlugin {
                         }
                         "probeLiveView" -> CameraEngine.probeLiveView()
                         "probeLvFrames" -> CameraEngine.probeLvFrames()
+                        // USB 连接模式 U0 实验（见 docs/USB连接方案.md）：
+                        // 会等用户点一次系统授权弹窗，最长 60s，必须留在工作线程
+                        "usbProbe" -> {
+                            val ctx = appContext ?: throw IllegalStateException("插件未注册")
+                            PtpUsbProbe.run(ctx) { CameraEngine.log(it) }
+                        }
                         "probeLiveView2" -> CameraEngine.probeLiveView2()
                         "probeLiveView5" -> {
                             val args = call.arguments as? Map<*, *>

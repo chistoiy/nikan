@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!--
+      USB 连接模式（PTP over USB）的设备匹配。
+      vendor-id 0x04B0 = 1200 是尼康的 USB 厂商 ID，覆盖所有尼康机身；
+      具体是否提供 PTP 接口由相机自身的 USB 模式决定（必须在相机菜单里选 PTP 而非 MTP）。
+    -->
+    <usb-device vendor-id="1200" />
+</resources>

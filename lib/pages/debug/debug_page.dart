@@ -100,6 +100,13 @@ class _DebugPanelState extends State<DebugPanel> {
       run: (_) => NikonEngine.probeLvFrames(),
     ),
     _Probe(
+      // 会自行占用 USB 接口并打开 PTP 会话：若当前是 Wi-Fi 已连接状态，
+      // 相机可能因"同时只允许一个会话"而断开 Wi-Fi——所以标签里直接写明白
+      label: 'USB:吞吐测速（会中断 Wi-Fi）',
+      detail: 'USB 连接模式 U0 实验（设备枚举 / 打开会话 / 操作集对比 / 实测 MB/s）',
+      run: (_) => NikonEngine.usbProbe(),
+    ),
+    _Probe(
       label: '试验:取景2',
       detail: '实时取景链路探针2（0x9206→拉帧→0x9201）',
       run: (_) => NikonEngine.probeLiveView2(),

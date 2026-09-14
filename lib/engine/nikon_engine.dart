@@ -148,6 +148,13 @@ class NikonEngine {
     return List<String>.from(r as List);
   }
 
+  /// USB 连接模式 U0 实验：枚举设备 → 打开会话 → 读操作集 → 实测吞吐。
+  /// 需要用户在系统弹窗里点一次授权，因此原生侧是长任务（最长等 60 秒）。
+  static Future<List<String>> usbProbe() async {
+    final r = await _m.invokeMethod('usbProbe');
+    return List<String>.from(r as List);
+  }
+
   /// 取景中候选操作响应码全量探针
   static Future<List<String>> probeLiveView3(int handle) async {
     final r = await _m.invokeMethod('probeLiveView3', {'handle': handle});
