@@ -39,6 +39,14 @@ class _GalleryPageState extends State<GalleryPage> {
 
   /// 只看未下载（与 _kind 是正交维度，因此单独一个开关）
   bool _undownloadedOnly = false;
+
+  /// 按拍摄日期分组显示（分组后点日期头部即可整选当天）
+  bool _groupByDay = false;
+
+  /// 分组模式下的逐格命中测试表。
+  /// 分组后行高不再固定（夹着日期头部），坐标换算失效，改用矩形命中
+  /// ——与手机页同一套做法。
+  final Map<int, GlobalKey> _cellKeys = {};
   final GlobalKey _gridKey = GlobalKey();
   final ScrollController _gridCtrl = ScrollController();
   List<CameraFile>? _filteredCache;
@@ -47,7 +55,7 @@ class _GalleryPageState extends State<GalleryPage> {
   late final DragSelection<int> _sel = DragSelection<int>(
     keyAt: (i) => _filtered[i].handle,
     itemCount: () => _filtered.length,
-    indexAt: _indexAt,
+    indexAt: (g) => _groupByDay ? _hitIndex(g) : _indexAt(g),
     scrollController: _gridCtrl,
     viewportBox: () => _gridKey.currentContext?.findRenderObject() as RenderBox?,
     onChanged: () => setState(() {}),
@@ -116,10 +124,12 @@ class _GalleryPageState extends State<GalleryPage> {
 
   /// 改筛选条件：丢弃筛选缓存，并把选择集收敛到新列表上。
   /// 不收敛的话"已选 N"会包含看不见的条目，"取消全选"也按不干净。
-  void _setFilter({String? kind, String? folder, bool? undownloaded}) => setState(() {
+  void _setFilter({String? kind, String? folder, bool? undownloaded, bool? groupByDay}) =>
+      setState(() {
         if (kind != null) _kind = kind;
         if (folder != null) _folder = folder;
         if (undownloaded != null) _undownloadedOnly = undownloaded;
+        if (groupByDay != null) _groupByDay = groupByDay;
         _filteredCache = null;
         _sel.prune(_filtered.map((f) => f.handle).toSet());
       });
@@ -152,6 +162,57 @@ class _GalleryPageState extends State<GalleryPage> {
     final box = _gridKey.currentContext?.findRenderObject() as RenderBox?;
     if (box == null) return null;
     return _indexOf(box.globalToLocal(global), box.size.width);
+  }
+
+  GlobalKey _keyOf(int handle) => _cellKeys.putIfAbsent(handle, GlobalKey.new);
+
+  /// 分组模式下的索引换算：逐个单元格做矩形包含判断。
+  /// 未构建的单元格没有 context，直接跳过（只有可见的才可能命中）。
+  int? _hitIndex(Offset global) {
+    final files = _filtered;
+    for (var i = 0; i < files.length; i++) {
+      final ctx = _cellKeys[files[i].handle]?.currentContext;
+      if (ctx == null) continue;
+      final box = ctx.findRenderObject() as RenderBox?;
+      if (box == null || !box.attached) continue;
+      if ((box.localToGlobal(Offset.zero) & box.size).contains(global)) return i;
+    }
+    return null;
+  }
+
+  /// 是否处于任何筛选状态（决定一键下载的范围与文案）
+  bool get _filterActive => _kind != 'all' || _folder != '全部' || _undownloadedOnly;
+
+  /// 条目所属的日期标题。PTP 原始时间 "YYYYMMDDThhmmss" 最可靠，
+  /// 退到相机给的可读字符串；两者都没有说明详情尚未读到。
+  static String _dayOf(CameraFile f) {
+    final raw = f.dateRaw;
+    if (raw != null && raw.length >= 8) {
+      final y = raw.substring(0, 4);
+      final m = int.tryParse(raw.substring(4, 6));
+      final d = int.tryParse(raw.substring(6, 8));
+      if (m != null && d != null) return '$m月$d日 · $y';
+    }
+    final text = f.dateText;
+    return (text != null && text.isNotEmpty) ? text : '未知日期';
+  }
+
+  /// 按天切分当前列表。列表已排序，同一天的条目通常连续；
+  /// 若排序把同一天拆开（如按文件名排序），会如实出现两个同名分组。
+  List<({String day, int base, List<CameraFile> files})> _daySections(List<CameraFile> files) {
+    final out = <({String day, int base, List<CameraFile> files})>[];
+    String? curDay;
+    List<CameraFile>? bucket;
+    for (var i = 0; i < files.length; i++) {
+      final day = _dayOf(files[i]);
+      if (bucket == null || day != curDay) {
+        bucket = <CameraFile>[];
+        out.add((day: day, base: i, files: bucket));
+        curDay = day;
+      }
+      bucket.add(files[i]);
+    }
+    return out;
   }
 
   /// 数据空间单元格索引：屏幕局部坐标 + 列表滚动偏移（否则滚动后选错行）
@@ -199,18 +260,18 @@ class _GalleryPageState extends State<GalleryPage> {
     _sel.exitSelect();
   }
 
-  /// 一键下载全部未下载。
+  /// 下载给定范围内的未下载文件。
   ///
-  /// 这是技术方案里承诺过、但一直没实现的"全量增量下载"的入口——
-  /// 去重（records.contains）与批量下载队列早就具备，缺的只是入口。
-  Future<void> _downloadAllPending(int pending) async {
-    final picks = model.files.where((f) => !model.isDownloaded(f)).toList();
+  /// 范围由调用方决定：无筛选时是整个卡，有筛选（类型/目录/未下载）时是筛选结果。
+  /// 这是技术方案里承诺过、但一直没实现的"全量增量下载"。
+  Future<void> _downloadPending(List<CameraFile> scope) async {
+    final picks = scope.where((f) => !model.isDownloaded(f)).toList();
     if (picks.isEmpty) return;
     final ok = await showDialog<bool>(
       context: context,
       builder: (ctx) => AlertDialog(
         backgroundColor: const Color(0xFF1E1E1E),
-        title: Text('下载 $pending 张未下载的照片？', style: const TextStyle(fontSize: 16)),
+        title: Text('下载 ${picks.length} 张未下载的照片？', style: const TextStyle(fontSize: 16)),
         content: const Text(
           '按当前画质设置逐张下载，已下载过的会自动跳过。\n'
           '尚未读取详情的文件会先补读再下载，数量多时需要一些时间。',
@@ -231,7 +292,14 @@ class _GalleryPageState extends State<GalleryPage> {
   }
 
   /// 待下载任务条：把"还差多少"和"一键传完"放在第一眼位置。
-  Widget _taskBar(int pending, int downloaded) {
+  ///
+  /// 有筛选时按钮传的是**筛选范围内**的未下载文件，文案也相应区分，
+  /// 避免"显示 231 张、实际只传了 40 张"这种对不上的情况。
+  Widget _taskBar(int pendingAll) {
+    final filtered = _filterActive;
+    final pendingFiltered = _filtered.where((f) => !model.isDownloaded(f)).length;
+    final target = filtered ? pendingFiltered : pendingAll;
+    if (target == 0) return const SizedBox.shrink();
     return Container(
       color: const Color(0xFF1F1F14),
       padding: const EdgeInsets.fromLTRB(14, 9, 8, 9),
@@ -242,13 +310,15 @@ class _GalleryPageState extends State<GalleryPage> {
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 Text(
-                  '还有 $pending 张未下载',
+                  filtered ? '筛选范围内还有 $target 张未下载' : '还有 $pendingAll 张未下载',
                   style: const TextStyle(
                       fontSize: 12.5, fontWeight: FontWeight.w600, color: kAccent),
                 ),
                 const SizedBox(height: 2),
                 Text(
-                  '已下载 $downloaded · 卡内 ${model.files.length}',
+                  filtered
+                      ? '当前筛选 ${_filtered.length} 张 · 卡内 ${model.files.length}'
+                      : '已下载 ${model.files.length - pendingAll} · 卡内 ${model.files.length}',
                   style: TextStyle(fontSize: 11, color: Colors.white.withValues(alpha: 0.55)),
                 ),
               ],
@@ -267,8 +337,8 @@ class _GalleryPageState extends State<GalleryPage> {
                 padding: const EdgeInsets.symmetric(horizontal: 14),
                 textStyle: const TextStyle(fontSize: 12.5, fontWeight: FontWeight.w600),
               ),
-              onPressed: () => _downloadAllPending(pending),
-              child: const Text('一键下载'),
+              onPressed: () => _downloadPending(filtered ? _filtered : model.files),
+              child: Text(filtered ? '下载 $target 张' : '一键下载'),
             ),
         ],
       ),
@@ -297,12 +367,11 @@ class _GalleryPageState extends State<GalleryPage> {
         final files = _filtered;
         // 待下载数量：未读到详情的文件按"未下载"计，随索引进度收敛
         final pending = model.files.where((f) => !model.isDownloaded(f)).length;
-        final downloaded = model.files.length - pending;
         return Scaffold(
           appBar: _sel.selectMode ? _selectionAppBar() : _normalAppBar(),
           body: Column(
             children: [
-              if (model.files.isNotEmpty && pending > 0) _taskBar(pending, downloaded),
+              _taskBar(pending),
               GalleryFilterBar(
                 kind: _kind,
                 folder: _folder,
@@ -311,6 +380,8 @@ class _GalleryPageState extends State<GalleryPage> {
                 undownloadedOnly: _undownloadedOnly,
                 undownloadedCount: pending,
                 onToggleUndownloaded: () => _setFilter(undownloaded: !_undownloadedOnly),
+                groupByDay: _groupByDay,
+                onToggleGroupByDay: () => _setFilter(groupByDay: !_groupByDay),
               ),
               if (model.hasNewPhotos)
                 NewPhotosBanner(onRefresh: () {
@@ -390,23 +461,86 @@ class _GalleryPageState extends State<GalleryPage> {
         message: model.files.isEmpty ? '存储卡里没有照片' : '当前筛选条件下没有照片',
       );
     }
-    return Listener(
-      behavior: HitTestBehavior.translucent,
-      onPointerMove: (d) => _sel.updateDrag(d.position),
-      onPointerUp: (_) => _sel.endDrag(),
-      onPointerCancel: (_) => _sel.endDrag(),
-      child: GridView.builder(
+    return _selectionHost(_groupByDay ? _groupedGrid(files) : _flatGrid(files));
+  }
+
+  static const SliverGridDelegate _gridDelegate = SliverGridDelegateWithFixedCrossAxisCount(
+    crossAxisCount: _cols,
+    crossAxisSpacing: _gap,
+    mainAxisSpacing: _gap,
+    childAspectRatio: _cellAspect,
+  );
+
+  /// 滑动选择的手势宿主：两种布局共用同一套指针处理
+  Widget _selectionHost(Widget child) => Listener(
+        behavior: HitTestBehavior.translucent,
+        onPointerMove: (d) => _sel.updateDrag(d.position),
+        onPointerUp: (_) => _sel.endDrag(),
+        onPointerCancel: (_) => _sel.endDrag(),
+        child: child,
+      );
+
+  Widget _flatGrid(List<CameraFile> files) => GridView.builder(
         key: _gridKey,
         controller: _gridCtrl,
         padding: const EdgeInsets.only(bottom: 96),
-        gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
-          crossAxisCount: _cols,
-          crossAxisSpacing: _gap,
-          mainAxisSpacing: _gap,
-          childAspectRatio: _cellAspect,
-        ),
+        gridDelegate: _gridDelegate,
         itemCount: files.length,
         itemBuilder: (context, i) => _cell(files[i], i, files),
+      );
+
+  /// 按天分组视图：点日期头部即整选/取消当天的照片。
+  /// 分组后行高不固定，因此滑动选择改用逐格命中（见 _hitIndex）。
+  Widget _groupedGrid(List<CameraFile> files) {
+    final sections = _daySections(files);
+    return CustomScrollView(
+      key: _gridKey,
+      controller: _gridCtrl,
+      slivers: [
+        for (final s in sections) ...[
+          SliverToBoxAdapter(child: _dayHeader(s)),
+          SliverGrid(
+            gridDelegate: _gridDelegate,
+            delegate: SliverChildBuilderDelegate(
+              (context, i) => _cell(s.files[i], s.base + i, files),
+              childCount: s.files.length,
+            ),
+          ),
+        ],
+        const SliverPadding(padding: EdgeInsets.only(bottom: 96)),
+      ],
+    );
+  }
+
+  Widget _dayHeader(({String day, int base, List<CameraFile> files}) s) {
+    final handles = s.files.map((f) => f.handle).toList();
+    final allSel = _sel.allSelected(handles);
+    final selCount = handles.where(_sel.selected.contains).length;
+    return Semantics(
+      button: true,
+      label: '${s.day}，${s.files.length} 张，点击${allSel ? '取消选择' : '全选'}当天',
+      child: InkWell(
+        onTap: () => _sel.toggleGroup(handles),
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(14, 12, 14, 6),
+          child: Row(
+            children: [
+              Text(s.day,
+                  style: const TextStyle(fontSize: 13.5, fontWeight: FontWeight.w600)),
+              const SizedBox(width: 8),
+              Text('${s.files.length} 张',
+                  style: TextStyle(
+                      fontSize: 11.5, color: Colors.white.withValues(alpha: 0.45))),
+              if (selCount > 0) ...[
+                const SizedBox(width: 8),
+                Text('已选 $selCount', style: const TextStyle(fontSize: 11.5, color: kAccent)),
+              ],
+              const Spacer(),
+              Icon(allSel ? Icons.check_circle : Icons.add_circle_outline,
+                  size: 18, color: allSel ? kAccent : Colors.white24),
+            ],
+          ),
+        ),
       ),
     );
   }
@@ -418,6 +552,7 @@ class _GalleryPageState extends State<GalleryPage> {
       });
     }
     return GalleryCell(
+      key: _keyOf(f.handle),
       file: f,
       thumb: f.hasThumb ? model.gateway.memThumb(f.handle) : null,
       selected: _sel.selected.contains(f.handle),

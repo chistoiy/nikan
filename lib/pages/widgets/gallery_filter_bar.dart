@@ -13,6 +13,8 @@ class GalleryFilterBar extends StatelessWidget {
     required this.undownloadedOnly,
     required this.undownloadedCount,
     required this.onToggleUndownloaded,
+    required this.groupByDay,
+    required this.onToggleGroupByDay,
   });
 
   final String kind; // all / jpeg / raw / video
@@ -24,6 +26,10 @@ class GalleryFilterBar extends StatelessWidget {
   final bool undownloadedOnly;
   final int undownloadedCount;
   final VoidCallback onToggleUndownloaded;
+
+  /// 按拍摄日期分组显示
+  final bool groupByDay;
+  final VoidCallback onToggleGroupByDay;
 
   @override
   Widget build(BuildContext context) {
@@ -76,6 +82,21 @@ class GalleryFilterBar extends StatelessWidget {
                   onSelected: (_) => onToggleUndownloaded(),
                 ),
               ),
+            const SizedBox(width: 4),
+            FilterChip(
+              label: Text(
+                '按天分组',
+                style: TextStyle(fontSize: 12.5, color: groupByDay ? Colors.black : Colors.white70),
+              ),
+              selected: groupByDay,
+              selectedColor: kAccent,
+              checkmarkColor: Colors.black,
+              showCheckmark: true,
+              visualDensity: VisualDensity.compact,
+              side: BorderSide(color: groupByDay ? kAccent : Colors.white24),
+              backgroundColor: const Color(0xFF161616),
+              onSelected: (_) => onToggleGroupByDay(),
+            ),
             const SizedBox(width: 4),
             ActionChip(
               label: Text(

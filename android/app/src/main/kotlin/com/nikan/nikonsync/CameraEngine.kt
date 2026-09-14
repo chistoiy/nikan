@@ -282,8 +282,16 @@ object CameraEngine {
         deviceInfo = c.deviceInfo
         cameraIp = ip
         c.eventHandler = { code, params ->
-            if (client === c && code == Ptp.EVT_OBJECT_ADDED && params.isNotEmpty()) {
-                emit(mapOf("type" to "objectAdded", "handle" to params[0]))
+            if (client === c) {
+                when {
+                    code == Ptp.EVT_OBJECT_ADDED && params.isNotEmpty() ->
+                        emit(mapOf("type" to "objectAdded", "handle" to params[0]))
+                    // 相机在拨轮/曝光变化时会推 DevicePropChanged（实测推的正是
+                    // 0x5007 焦距、0x500D 光圈、0x500E 快门、0x500F ISO）。
+                    // 转给 Flutter 侧，遥控页据此实时刷新参数显示。
+                    code == Ptp.EVT_DEVICE_PROP_CHANGED && params.isNotEmpty() ->
+                        emit(mapOf("type" to "devicePropChanged", "code" to params[0]))
+                }
             }
         }
         c.disconnectHandler = { reason ->

@@ -104,10 +104,31 @@ class _RemotePageState extends State<RemotePage> {
   void _onEvent(dynamic e) {
     if (e is! Map) return;
     final map = e.cast<String, dynamic>();
-    if (map['type'] == 'objectAdded') {
-      _onNewPhoto((map['handle'] as num).toInt());
+    switch (map['type']) {
+      case 'objectAdded':
+        _onNewPhoto((map['handle'] as num).toInt());
+      case 'devicePropChanged':
+        _onPropChanged((map['code'] as num).toInt());
     }
   }
+
+  /// 相机主动推送的属性变化 → 节流刷新参数显示。
+  ///
+  /// 相机在拨轮/曝光变化时会推 DevicePropChanged（0x500D 光圈 / 0x500E 快门 / 0x500F ISO）。
+  /// 此前参数只在本页 initState 与每次拍摄后各取一次，所以相机端改了设置 App 上毫无反应。
+  ///
+  /// 必须节流：`shotParams()` 一次要 4 个 PTP 事务，而取景帧循环与它共用同一条串行通道，
+  /// 高频刷新会直接压低帧率。其余属性码（焦距等）界面不显示，忽略。
+  void _onPropChanged(int code) {
+    if (code != 0x500D && code != 0x500E && code != 0x500F) return;
+    final now = DateTime.now().millisecondsSinceEpoch;
+    if (now - _lastParamsAt < _paramsRefreshMs) return;
+    _lastParamsAt = now;
+    _loadParams();
+  }
+
+  static const int _paramsRefreshMs = 1500;
+  int _lastParamsAt = 0;
 
   Future<void> _onNewPhoto(int handle) async {
     if (!_seenHandles.add(handle)) return;
