@@ -1,0 +1,900 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>尼康速传 · UI 优化设计稿</title>
+<style>
+  :root{
+    --accent:#FFE100; --bg:#0B0B0C; --card:#161616; --card2:#1E1E1E;
+    --line:#2E2E2E; --txt:#EDEDED; --txt2:#A8A8A8; --txt3:#6E6E6E;
+    --danger:#E53935; --ok:#4CD964; --phone-w:300px; --phone-h:667px;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--txt);
+    font-family:-apple-system,"PingFang SC","Microsoft YaHei","Noto Sans CJK SC",sans-serif;
+    line-height:1.7;-webkit-font-smoothing:antialiased}
+  .wrap{max-width:1180px;margin:0 auto;padding:48px 28px 96px}
+
+  h1{font-size:30px;margin:0 0 6px;letter-spacing:-.3px}
+  h2{font-size:21px;margin:64px 0 8px;padding-top:22px;border-top:1px solid var(--line)}
+  h3{font-size:16px;margin:32px 0 10px;color:var(--accent)}
+  h4{font-size:14px;margin:20px 0 8px;color:var(--txt)}
+  p{margin:10px 0;color:var(--txt2);font-size:14px}
+  .sub{color:var(--txt3);font-size:13.5px;margin:0 0 28px}
+  code{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:12.5px;
+    background:#ffffff0f;border:1px solid var(--line);border-radius:4px;padding:1px 5px;color:#D8D8D8}
+
+  .lede{background:linear-gradient(180deg,#191914,#141414);border:1px solid #34341f;
+    border-radius:12px;padding:20px 22px;margin:24px 0}
+  .lede p{color:#D6D6C8;margin:6px 0}
+  .lede strong{color:var(--accent)}
+
+  /* ---------- 对比区 ---------- */
+  .compare{display:flex;gap:36px;flex-wrap:wrap;justify-content:center;margin:26px 0 8px}
+  .col{display:flex;flex-direction:column;align-items:center;gap:10px}
+  .col-label{font-size:12px;letter-spacing:.12em;text-transform:uppercase;color:var(--txt3)}
+  .col-label.now{color:#E58A8A}
+  .col-label.next{color:var(--ok)}
+
+  /* ---------- 手机框架 ---------- */
+  .phone{width:var(--phone-w);height:var(--phone-h);background:#0A0A0A;
+    border:1px solid var(--line);border-radius:22px;overflow:hidden;
+    display:flex;flex-direction:column;position:relative;flex:none}
+  .phone.sm{--phone-w:280px;--phone-h:622px}
+
+  .statusbar{height:20px;display:flex;align-items:center;justify-content:space-between;
+    padding:0 14px;font-size:9px;color:#8b8b8b;flex:none}
+  .appbar{height:44px;display:flex;align-items:center;gap:8px;padding:0 4px 0 14px;flex:none}
+  .appbar .t{font-size:14.5px;font-weight:600;flex:1}
+  .appbar .icon{width:28px;height:28px;border-radius:50%;display:flex;align-items:center;
+    justify-content:center;color:#C9C9C9;font-size:13px}
+  .appbar .back{width:28px;height:28px;display:flex;align-items:center;justify-content:center;color:#C9C9C9}
+  .body{flex:1;display:flex;flex-direction:column;overflow:hidden;min-height:0}
+  .bottombar{height:56px;border-top:1px solid #1c1c1c;display:flex;align-items:center;
+    justify-content:space-around;flex:none;background:#0F0F0F}
+  .tab{display:flex;flex-direction:column;align-items:center;gap:2px;font-size:9.5px;color:#7d7d7d}
+  .tab.on{color:#0A0A0A;background:var(--accent);border-radius:14px;padding:4px 20px}
+  .tab .dot{width:15px;height:15px;border-radius:4px;border:1.5px solid currentColor}
+
+  /* ---------- 通用小件 ---------- */
+  .card{background:var(--card);border-radius:10px;padding:11px 12px;margin:0 12px 9px}
+  .card.tight{padding:8px 10px}
+  .btn{display:flex;align-items:center;justify-content:center;height:34px;border-radius:17px;
+    font-size:12.5px;font-weight:600;background:var(--accent);color:#0A0A0A;margin:0 12px 8px}
+  .btn.ghost{background:transparent;border:1px solid #4a4a4a;color:#EDEDED;font-weight:400}
+  .btn.sm{height:28px;font-size:11.5px;border-radius:14px;margin:0}
+  .row{display:flex;align-items:center;gap:8px}
+  .spacer{flex:1}
+  .hint{font-size:10px;color:var(--txt3);line-height:1.5}
+  .kv{font-size:10.5px;color:var(--txt2);line-height:1.6}
+  .pill{font-size:10px;padding:2px 9px;border-radius:11px;background:var(--card2);
+    border:1px solid var(--line);color:var(--txt2);white-space:nowrap}
+  .pill.on{background:var(--accent);color:#0A0A0A;border-color:var(--accent);font-weight:600}
+
+  /* ---------- 网格 ---------- */
+  .grid{display:grid;grid-template-columns:repeat(3,1fr);gap:2px;padding:0 0 8px}
+  .grid.sq .cell{aspect-ratio:1}
+  .grid.r32 .cell{aspect-ratio:3/2}
+  .cell{background:#1d1d1d;position:relative;display:flex;align-items:center;
+    justify-content:center;overflow:hidden}
+  .cell::after{content:"";width:16px;height:12px;border:1.2px solid #3a3a3a;border-radius:2px}
+  .cell.sel{outline:2px solid var(--accent);outline-offset:-2px}
+  .cell .chk{position:absolute;right:4px;bottom:4px;width:14px;height:14px;border-radius:50%;
+    border:1.5px solid #ffffff66;background:#0000004d}
+  .cell.sel .chk{background:var(--accent);border-color:var(--accent)}
+  .cell .chk::before{content:"✓";position:absolute;inset:0;display:flex;align-items:center;
+    justify-content:center;font-size:9px;color:#0A0A0A;font-weight:700;opacity:0}
+  .cell.sel .chk::before{opacity:1}
+  .cell .tag{position:absolute;left:3px;top:3px;font-size:7.5px;background:#000000a6;
+    color:#fff;padding:1px 3px;border-radius:2px;font-weight:600}
+  .cell .done{position:absolute;left:4px;bottom:4px;font-size:9px;color:var(--ok)}
+  .cell.star{background:#232320}
+  .cell.raw{background:#26221c}
+  .cell.vid{background:#1c2226}
+
+  /* ---------- 标注 ---------- */
+  .notes{max-width:640px;margin:14px auto 0;font-size:13px;color:var(--txt2)}
+  .notes ol{margin:8px 0;padding-left:22px}
+  .notes li{margin:5px 0}
+  .notes b{color:var(--txt)}
+  .bad{color:#E58A8A;font-weight:600}
+  .good{color:#7BD98A;font-weight:600}
+
+  table{width:100%;border-collapse:collapse;margin:16px 0;font-size:13px}
+  th,td{text-align:left;padding:9px 10px;border-bottom:1px solid var(--line);vertical-align:top}
+  th{color:var(--txt3);font-weight:500;font-size:12px}
+  td{color:var(--txt2)}
+  td b{color:var(--txt)}
+
+  .swatches{display:flex;gap:12px;flex-wrap:wrap;margin:14px 0}
+  .sw{width:96px}
+  .sw .box{height:52px;border-radius:8px;border:1px solid var(--line)}
+  .sw .n{font-size:11px;color:var(--txt3);margin-top:5px}
+  .sw .v{font-size:11px;color:var(--txt2);font-family:ui-monospace,monospace}
+
+  .scale-row{display:flex;align-items:baseline;gap:14px;padding:7px 0;border-bottom:1px solid #1e1e1e}
+  .scale-row .lbl{width:78px;font-size:11px;color:var(--txt3)}
+  .note-inline{background:#ffffff08;border-left:2px solid var(--accent);padding:10px 14px;
+    border-radius:0 6px 6px 0;margin:16px 0;font-size:13px;color:var(--txt2)}
+  .note-inline b{color:var(--txt)}
+  footer{margin-top:80px;padding-top:22px;border-top:1px solid var(--line);
+    font-size:12px;color:var(--txt3)}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <h1>尼康速传 · UI 优化设计稿</h1>
+  <p class="sub">基于真机实测几何（400 × 890 dp，小米 23127PN0CC）+ 全量源码审查 · 2026-09-14</p>
+
+  <div class="lede">
+    <p><strong>一句话结论：</strong>功能已经够用，但界面停留在"能用"——信息层级扁平、关键决策缺上下文、大屏竖直空间浪费严重。</p>
+    <p>实测发现两屏各有约 <strong>150dp 的死区</strong>（连接页 672→826dp、遥控页 507→659dp），而用户最需要的"卡里多少张、还有多少没传"这个数字，界面上根本没有。</p>
+    <p>优化方向不是换皮，而是把界面从"罗列功能"改成<strong>推进任务</strong>：让用户一眼看到差多少、一步开始传、传完知道结果。</p>
+    <p style="padding-top:8px;border-top:1px solid #34341f">
+      <strong>遥控页另有两条不是布局问题、而是真缺陷：</strong>
+      相机横放时取景画面<strong>转了 90°</strong>（Flutter 图片解码不处理 EXIF Orientation，见 §2.5 缺陷 A）；
+      取景<strong>色彩与相机 LCD 不一致</strong>（疑为色彩空间标记被忽略，见 §2.5 缺陷 B）。
+      这两条都要<b>先用探针拿真机证据再改</b>，不能凭猜。另有一个隐藏关系：缺陷 A 修好之后，
+      竖向取景会自然填满整屏，遥控页"画面太小、浪费屏幕"的抱怨随之消失。
+    </p>
+  </div>
+
+  <h2>0 · 现状实测</h2>
+  <p>下表是抓取真机无障碍树得到的真实布局坐标（已换算为 dp）。问题不是主观感受，是量出来的。</p>
+
+  <table>
+    <tr><th>屏幕 / 区域</th><th>竖直占用（dp）</th><th>观察</th></tr>
+    <tr>
+      <td><b>连接页 · 顶部</b><br>AppBar + 步骤引导 + Wi-Fi 卡片 + 两个按钮</td>
+      <td>0 → 672</td>
+      <td>内容全部挤在上 3/4</td>
+    </tr>
+    <tr>
+      <td><b>连接页 · 死区</b></td>
+      <td>672 → 826（<span class="bad">154dp</span>）</td>
+      <td>到 Tab 栏之间整段空白，无任何内容</td>
+    </tr>
+    <tr>
+      <td><b>遥控页 · 取景区</b></td>
+      <td>242 → 507（265dp）</td>
+      <td>画面区偏小，3:2 取景被压成 16:9 比例框</td>
+    </tr>
+    <tr>
+      <td><b>遥控页 · 死区</b></td>
+      <td>507 → 659（<span class="bad">152dp</span>）</td>
+      <td>画面与模式切换之间整段空白</td>
+    </tr>
+    <tr>
+      <td><b>遥控页 · 控件区</b></td>
+      <td>659 → 890（231dp）</td>
+      <td>控件区比画面区还高，主次颠倒</td>
+    </tr>
+    <tr>
+      <td><b>设置页 · 协议验证面板</b></td>
+      <td>430 → 890（459dp）</td>
+      <td>占掉整个下半屏；面向开发者的工具直接暴露给用户</td>
+    </tr>
+  </table>
+
+  <div class="note-inline">
+    <b>补充实测：</b>遥控页抓到的拍摄参数是 <code>f/0.6</code> <code>1/5000s</code> <code>ISO 2500</code>。
+    其中 <b>f/0.6 在物理上不存在</b>（任何镜头都不可能有此光圈）。设备属性解析回来的原始值没有做有效性校验就直接显示，
+    用户看到会以为相机坏了。这是本次审查发现的唯一一处<b>显示错误</b>（非布局问题）。
+  </div>
+
+  <h2>1 · 设计原则</h2>
+  <p>后面所有改动都从这三条推出来，避免变成凭喜好的调整。</p>
+
+  <table>
+    <tr><th>原则</th><th>含义</th><th>针对的现状问题</th></tr>
+    <tr>
+      <td><b>① 先答"差多少"</b></td>
+      <td>界面第一眼必须回答：卡里有多少张、已经传了多少、还剩多少。数字比图标重要。</td>
+      <td>现在没有任何地方显示"待传数量"，用户不知道要不要点全选</td>
+    </tr>
+    <tr>
+      <td><b>② 一步开始，而非先配置</b></td>
+      <td>常用动作（传新照片、看未下载）零层级直达；配置项（排序、画质、文件夹）收进可点开的摘要行。</td>
+      <td>筛选/排序/画质现在全埋在同一个底部弹窗里，页面上看不到当前状态</td>
+    </tr>
+    <tr>
+      <td><b>③ 空间给内容，不给空白</b></td>
+      <td>20:9 屏幕的纵向空间要么给缩略图，要么给画面。杜绝 150dp 级死区。</td>
+      <td>两屏各有 150dp 死区；缩略图还是 1:1 裁切，浪费了画面又切坏了构图</td>
+    </tr>
+  </table>
+
+  <h2>2 · 逐屏方案</h2>
+
+  <!-- ================= 相册页 ================= -->
+  <h3>2.1 相机相册 —— 核心屏，改动最大</h3>
+  <div class="compare">
+
+    <!-- BEFORE -->
+    <div class="col">
+      <div class="col-label now">现状</div>
+      <div class="phone">
+        <div class="statusbar"><span>13:52</span><span>▮▮▮ 100%</span></div>
+        <div class="appbar">
+          <div class="t">照片 1499</div>
+          <div class="icon">⚙</div><div class="icon">⟳</div>
+        </div>
+        <div class="body">
+          <div style="padding:7px 12px;display:flex;gap:6px;overflow:hidden">
+            <span class="pill on">全部</span><span class="pill">JPEG</span>
+            <span class="pill">RAW</span><span class="pill">视频</span><span class="pill">文件夹</span>
+          </div>
+          <div style="margin:0 12px 4px;font-size:9.5px;color:var(--txt3)">索引 847/1499 ────────</div>
+          <div class="grid sq">
+            <div class="cell"><span class="chk"></span></div>
+            <div class="cell raw"><span class="tag">NEF</span><span class="chk"></span></div>
+            <div class="cell"><span class="chk"></span></div>
+            <div class="cell"><span class="tag">NEF</span><span class="chk"></span></div>
+            <div class="cell vid"><span class="tag">视频</span><span class="chk"></span></div>
+            <div class="cell"><span class="chk"></span></div>
+            <div class="cell"><span class="chk"></span></div>
+            <div class="cell"><span class="chk"></span></div>
+            <div class="cell"><span class="chk"></span></div>
+            <div class="cell"><span class="chk"></span></div>
+            <div class="cell"><span class="chk"></span></div>
+            <div class="cell"><span class="chk"></span></div>
+          </div>
+        </div>
+        <div class="bottombar">
+          <div class="tab on"><span class="dot"></span>相机</div>
+          <div class="tab"><span class="dot"></span>手机</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- AFTER -->
+    <div class="col">
+      <div class="col-label next">优化后</div>
+      <div class="phone">
+        <div class="statusbar"><span>13:52</span><span>▮▮▮ 100%</span></div>
+        <div class="appbar">
+          <div class="t">照片 · 1499</div>
+          <div class="icon">⌕</div><div class="icon">⋮</div>
+        </div>
+        <div class="body">
+          <!-- 任务条：答"差多少" -->
+          <div class="card tight" style="background:#1F1F14;border:1px solid #3a3a22;margin-top:6px">
+            <div class="row">
+              <div>
+                <div style="font-size:11.5px;font-weight:600;color:var(--accent)">还有 231 张未下载</div>
+                <div class="hint">已下载 1268 · 卡内共 1499（8.4 GB）</div>
+              </div>
+              <div class="spacer"></div>
+              <div class="btn sm" style="background:var(--accent);padding:0 12px;display:flex">一键下载</div>
+            </div>
+          </div>
+          <!-- 摘要行：当前状态可见，点开才配置 -->
+          <div class="row" style="padding:2px 14px 7px;gap:6px">
+            <span class="pill on">全部</span>
+            <span class="pill">未下载 231</span>
+            <div class="spacer"></div>
+            <span style="font-size:10px;color:var(--txt2)">最新优先 · 原图 ⌄</span>
+          </div>
+          <div class="grid r32">
+            <div class="cell"></div>
+            <div class="cell raw"><span class="tag">NEF</span><span class="chk"></span></div>
+            <div class="cell"><span class="done">✓</span><span class="chk"></span></div>
+            <div class="cell"><span class="tag">NEF</span><span class="chk"></span></div>
+            <div class="cell vid"><span class="tag">0:42</span><span class="chk"></span></div>
+            <div class="cell"><span class="done">✓</span><span class="chk"></span></div>
+            <div class="cell sel"><span class="chk"></span></div>
+            <div class="cell sel"><span class="tag">NEF</span><span class="chk"></span></div>
+            <div class="cell sel"><span class="done">✓</span><span class="chk"></span></div>
+            <div class="cell"></div>
+            <div class="cell"></div>
+            <div class="cell"></div>
+            <div class="cell"></div>
+            <div class="cell"></div>
+            <div class="cell"></div>
+            <div class="cell"></div>
+            <div class="cell"></div>
+            <div class="cell"></div>
+          </div>
+        </div>
+        <div class="bottombar" style="background:#0F0F0F;justify-content:space-between;padding:0 12px">
+          <span style="font-size:11.5px;color:var(--txt2)">已选 3 张 · 原图</span>
+          <span class="pill on" style="font-weight:600;padding:5px 14px">下载 3 张</span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="notes">
+    <ol>
+      <li><b>新增"任务条"（最重要）</b>：把"还有 231 张未下载"和"一键下载"放在第一眼位置。这是把技术方案里承诺过、但一直没实现的<b>全量增量下载</b>补上——后端其实早已具备能力（<code>records.contains</code> 去重 + 批量下载），只差一个入口。</li>
+      <li><b>筛选条改为"状态可见 + 点开配置"</b>：现在排序/画质藏在同一个底部弹窗里，页面上看不到当前用的是哪个。改成右侧摘要 <code>最新优先 · 原图 ⌄</code>，点一下才展开。新增 <b>未下载</b> 快捷筛（231 张的入口）。</li>
+      <li><b>缩略图 1:1 → 3:2</b>：相机出片是 3:2，正方形裁切会把构图切坏（横竖构图都受损）。改 3:2 后每屏能显示更多张，也更符合摄影预期。</li>
+      <li><b>勾选圆点常显</b>：现在只有长按才进入选择模式，右下角是个 <b>22×22 的隐形热区</b>，用户根本发现不了。改成常显半透明圆点，看见即可点。</li>
+      <li><b>未下载标记</b>：现在只标"已下载 ✓"，未下载的没有区分。改成"未下载"格子高亮（<code>.cell.star</code>），让待传对象自己浮出来。</li>
+      <li><b>状态条合并为一条</b>：现在"新照片横幅 / 索引进度 / 下载进度"三条可能同时堆叠，把网格挤掉 100dp+。改为<b>只显示优先级最高的一条</b>（进行中的下载 &gt; 新照片 &gt; 索引）。</li>
+    </ol>
+  </div>
+
+  <!-- ================= 连接页 ================= -->
+  <h3>2.2 连接页 —— 把说明文档改成可执行向导</h3>
+  <div class="compare">
+
+    <div class="col">
+      <div class="col-label now">现状</div>
+      <div class="phone">
+        <div class="statusbar"><span>13:52</span><span>▮▮▮ 100%</span></div>
+        <div class="appbar"><div class="t">尼康速传</div><div class="icon">⚙</div></div>
+        <div class="body">
+          <div class="card" style="margin-top:6px">
+            <div style="font-size:12px;font-weight:700;color:var(--accent);margin-bottom:6px">Wi-Fi 连接</div>
+            <div class="kv"><b>1</b>　在相机设定菜单选择「连接至智能设备」→「Wi-Fi 连接」</div>
+            <div class="kv"><b>2</b>　选择「建立 Wi-Fi 连接」，相机屏幕显示 SSID 和密码</div>
+            <div class="kv"><b>3</b>　手机连接该 Wi-Fi 网络后返回本应用</div>
+          </div>
+          <div class="card tight">
+            <div class="row">
+              <div class="kv">已连接 Wi-Fi（名称未知）<br><span style="font-size:11px">192.168.31.173</span></div>
+              <div class="spacer"></div><span style="color:var(--txt3)">›</span>
+            </div>
+          </div>
+          <div class="btn">连接相机</div>
+          <div class="btn ghost">打开手机 Wi-Fi 设置</div>
+          <div style="flex:1"></div>
+          <div style="text-align:center;font-size:9.5px;color:#3a3a3a;padding-bottom:8px">
+            ← 实测 154dp 空白区 →
+          </div>
+        </div>
+        <div class="bottombar">
+          <div class="tab on"><span class="dot"></span>相机</div>
+          <div class="tab"><span class="dot"></span>手机</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="col">
+      <div class="col-label next">优化后</div>
+      <div class="phone">
+        <div class="statusbar"><span>13:52</span><span>▮▮▮ 100%</span></div>
+        <div class="appbar"><div class="t">尼康速传</div><div class="icon">⚙</div></div>
+        <div class="body">
+          <!-- 分步向导：每步带行动按钮 -->
+          <div class="card" style="margin-top:6px;padding:0;overflow:hidden">
+            <div class="row" style="padding:10px 12px;background:#1F1F14;gap:9px">
+              <div style="width:16px;height:16px;border-radius:50%;background:var(--ok);color:#0A0A0A;
+                font-size:10px;display:flex;align-items:center;justify-content:center;font-weight:700">✓</div>
+              <div style="font-size:11px;color:var(--txt2)">相机已开热点（Z50_2_A1B2）</div>
+            </div>
+            <div class="row" style="padding:10px 12px;background:#1F1F14;gap:9px">
+              <div style="width:16px;height:16px;border-radius:50%;border:1.5px solid var(--txt3);
+                font-size:9px;display:flex;align-items:center;justify-content:center;color:var(--txt3)">2</div>
+              <div style="flex:1">
+                <div style="font-size:11.5px;color:var(--txt);font-weight:600">连接相机热点</div>
+                <div class="hint">当前：家庭 Wi-Fi · 192.168.31.173</div>
+              </div>
+              <div class="btn sm ghost" style="padding:0 10px;display:flex">去连接</div>
+            </div>
+            <div class="row" style="padding:10px 12px;gap:9px;opacity:.45">
+              <div style="width:16px;height:16px;border-radius:50%;border:1.5px solid var(--txt3);
+                font-size:9px;display:flex;align-items:center;justify-content:center;color:var(--txt3)">3</div>
+              <div style="font-size:11.5px">连接并读取照片</div>
+            </div>
+          </div>
+          <div class="btn" style="margin-top:2px">连接相机</div>
+
+          <!-- 用掉的死区：最近连接 -->
+          <div style="padding:6px 14px 4px;font-size:11px;color:var(--txt3)">最近连接</div>
+          <div class="card tight">
+            <div class="row">
+              <div>
+                <div style="font-size:11.5px;font-weight:600">Nikon Z50 II</div>
+                <div class="hint">上次连接：2 小时前 · 1499 张照片</div>
+              </div>
+              <div class="spacer"></div>
+              <div class="pill on" style="font-weight:600">重连</div>
+            </div>
+          </div>
+          <div class="card tight">
+            <div class="kv" style="font-size:10px;color:var(--txt3)">
+              提示：相机热点没有互联网，连接后手机蜂窝数据仍可正常使用。
+            </div>
+          </div>
+          <div style="flex:1"></div>
+        </div>
+        <div class="bottombar">
+          <div class="tab on"><span class="dot"></span>相机</div>
+          <div class="tab"><span class="dot"></span>手机</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="notes">
+    <ol>
+      <li><b>说明文字 → 可勾选步骤</b>：现在三步说明是一整块静态文本（无障碍读出来是"Wi-Fi 连接 1 在相机设定菜单…2 选择…3 手机连接…"），而真正要点的"打开手机 Wi-Fi 设置"按钮在下方一行之外。改成三步清单，<b>每步自带行动按钮</b>，完成自动打勾——用户不必把说明和按钮对应起来。</li>
+      <li><b>补上"最近连接"卡片</b>：填掉 154dp 死区，同时给出"重连"快捷入口。现在每次连相机都要走完整流程。</li>
+      <li><b>连接过程分阶段</b>（需配合代码改动）：现在连接中只有一个转圈。握手要重试多次、相机侧还要等状态恢复，用户会以为卡死。应显示 <code>查找相机 → 握手 → 读取文件列表</code> 三个阶段。</li>
+      <li><b>补一句蜂窝数据提示</b>：App 已实现 socket 绑定 Wi-Fi 网络（蜂窝照常可用），但界面从没告诉用户，很多人会以为连相机就断网而不敢用。</li>
+    </ol>
+  </div>
+
+  <!-- ================= 遥控页 ================= -->
+  <h3>2.3 遥控拍摄 —— 主次归位</h3>
+  <div class="compare">
+
+    <div class="col">
+      <div class="col-label now">现状</div>
+      <div class="phone">
+        <div class="statusbar"><span>13:52</span><span>▮▮▮ 100%</span></div>
+        <div class="appbar"><div class="back">‹</div><div class="t" style="text-align:center;font-size:13.5px">遥控拍摄</div><div style="width:28px"></div></div>
+        <div class="body">
+          <div style="height:118px;background:#141414;display:flex;align-items:center;
+            justify-content:center;margin:0 0 2px">
+            <span style="font-size:10px;color:#3f3f3f">取景画面（偏小）</span>
+          </div>
+          <div style="flex:1;display:flex;align-items:center;justify-content:center">
+            <span style="font-size:9.5px;color:#3a3a3a">← 实测 152dp 空白区 →</span>
+          </div>
+          <div class="row" style="justify-content:center;gap:0;margin-bottom:6px">
+            <span class="pill" style="border-radius:11px 0 0 11px;padding:5px 22px">盲拍</span>
+            <span class="pill on" style="border-radius:0 11px 11px 0;padding:5px 22px">实时取景</span>
+          </div>
+          <div class="row" style="justify-content:center;gap:18px;font-size:10.5px;color:var(--txt2);margin-bottom:10px">
+            <span style="color:#E58A8A">f/0.6</span><span>1/5000s</span><span>ISO 2500</span><span>100%</span>
+          </div>
+          <div class="row" style="gap:8px;padding:0 12px">
+            <div class="btn sm ghost" style="flex:1">对焦</div>
+            <div class="btn sm ghost" style="flex:1">拍后自动下载</div>
+          </div>
+          <div style="display:flex;justify-content:center;padding:14px 0 8px">
+            <div style="width:58px;height:58px;border-radius:50%;background:var(--accent)"></div>
+          </div>
+          <div style="text-align:center;font-size:9.5px;color:var(--txt3);padding-bottom:6px">
+            实时取景 · 照片将拍摄到存储卡
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="col">
+      <div class="col-label next">优化后</div>
+      <div class="phone">
+        <div class="statusbar"><span>13:52</span><span>▮▮▮ 100%</span></div>
+        <div class="appbar"><div class="back">‹</div><div class="t" style="text-align:center;font-size:13.5px">遥控拍摄</div><div class="icon">⚙</div></div>
+        <div class="body">
+          <div style="padding:0 12px 8px">
+            <div class="row" style="background:#1b1b1b;border-radius:9px;padding:3px">
+              <div style="flex:1;text-align:center;font-size:11px;color:var(--txt2);padding:5px">盲拍</div>
+              <div style="flex:1;text-align:center;font-size:11px;font-weight:600;
+                background:var(--accent);color:#0A0A0A;border-radius:7px;padding:5px">实时取景</div>
+            </div>
+          </div>
+          <!-- 取景区填满剩余空间：按相机方向旋转后是竖构图 -->
+          <div style="flex:1;min-height:0;background:#141414;margin:0 12px 8px;border-radius:8px;
+            display:flex;align-items:center;justify-content:center;position:relative;overflow:hidden">
+            <span style="font-size:10px;color:#3f3f3f">取景画面（跟随相机方向）</span>
+            <span style="position:absolute;left:8px;top:8px;font-size:8.5px;color:var(--ok)">● LIVE 9 fps</span>
+            <span style="position:absolute;right:8px;top:8px;font-size:8.5px;color:#ffffff99">100%</span>
+            <span style="position:absolute;right:8px;bottom:8px;font-size:8.5px;color:#ffffff99">⟳ 旋转</span>
+            <span style="position:absolute;left:8px;bottom:8px;font-size:8.5px;color:#ffffff99">⛶ 全屏</span>
+          </div>
+          <div class="row" style="justify-content:center;gap:16px;font-size:11px;margin:0 0 10px">
+            <span>F2.8</span><span style="color:var(--txt3)">·</span><span>1/500s</span>
+            <span style="color:var(--txt3)">·</span><span>ISO 2500</span>
+          </div>
+          <div style="padding:0 12px 6px">
+            <div class="card tight" style="margin:0">
+              <div class="row">
+                <span style="font-size:11.5px">拍后自动下载原图</span>
+                <div class="spacer"></div>
+                <div style="width:34px;height:19px;border-radius:10px;background:var(--ok);position:relative">
+                  <div style="position:absolute;right:2px;top:2px;width:15px;height:15px;border-radius:50%;background:#fff"></div>
+                </div>
+              </div>
+            </div>
+          </div>
+          <div class="row" style="gap:10px;padding:0 12px;align-items:center">
+            <div class="btn ghost" style="flex:1;margin:0">对焦</div>
+            <div style="width:60px;height:60px;border-radius:50%;background:var(--accent);
+              display:flex;align-items:center;justify-content:center;
+              font-size:11px;font-weight:700;color:#0A0A0A;flex:none">拍摄</div>
+            <div class="btn ghost" style="flex:1;margin:0;visibility:hidden">占位</div>
+          </div>
+          <div class="hint" style="text-align:center;margin-top:8px">
+            照片写入相机存储卡 · 可在手机页下载
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="notes">
+    <ol>
+      <li><b>取景区填满剩余空间（对应"浪费屏幕"）</b>：实测取景画面只占 265dp 高，而可用区有 559dp——画面被 <code>Center</code> 上下各撑出 147dp 空白。根因是<b>横向出片 + 竖持手机</b>：3:2 的画面在竖屏里必然只能占满宽度、高度撑不起来。解法不是"把框做大"，而是让画面<b>按相机方向旋转</b>（见下方缺陷 A）——旋转成竖构图后正好填满整屏。</li>
+      <li><b>模式切换改分段控件</b>：现在是两个 RadioButton（无障碍读作"单选按钮"），语义和视觉都不像模式切换。改 SegmentedButton 后一眼看出是二选一。</li>
+      <li><b>取景画面支持全屏</b>：加一个沉浸按钮，隐藏全部控件只留快门，画面占满整屏。远景构图时有用。</li>
+      <li><b>参数异常值不显示</b>：<span class="bad">f/0.6 实测就是错的</span>。改为解析失败时显示 <code>--</code>，并且只在三个参数都有效时才合并成一行——宁可缺，不可错。</li>
+      <li><b>"拍后自动下载"改开关</b>：它现在是个按钮，状态只靠图标（<code>download_done</code> / <code>download_outlined</code>）和颜色区分，色弱用户看不出来，语义上也不是"动作"而是"设置"。改 Switch 行。</li>
+      <li><b>快门按钮加文字与语义</b>：现在是 78×78 的纯色圆，无文字、无 tooltip、无障碍读不出内容。加"拍摄"字样与 Semantics 标签。</li>
+      <li><b>显示实测帧率</b>：把真实 fps 标在取景画面上，既让用户知道当前状态，也让后续优化有据可依。</li>
+    </ol>
+  </div>
+
+  <h3>2.4 盲拍回看 —— 拍完的照片应该看得清</h3>
+  <p>盲拍模式拍完，回看的照片被写死成 <code>width: 260</code>（<code>remote_page.dart:279</code>），在 400dp 宽的屏幕上只占 65%，
+  而它上下的可用高度有近 500dp。<b>既看不到细节，也在做不了任何事</b>——不能放大、不能查看参数、不能直接保存到手机。</p>
+
+  <div class="compare">
+
+    <div class="col">
+      <div class="col-label now">现状</div>
+      <div class="phone sm">
+        <div class="statusbar"><span>13:52</span><span>▮▮▮ 100%</span></div>
+        <div class="appbar"><div class="back">‹</div><div class="t" style="text-align:center;font-size:13.5px">遥控拍摄</div><div style="width:28px"></div></div>
+        <div class="body">
+          <div style="flex:1;display:flex;align-items:center;justify-content:center">
+            <div style="width:182px;height:121px;background:#1d1d1d;border-radius:8px;
+              display:flex;align-items:center;justify-content:center">
+              <span style="font-size:9px;color:#3f3f3f">写死 260dp 宽</span>
+            </div>
+          </div>
+          <div style="text-align:center;font-size:10px;color:var(--txt3);padding-bottom:4px">已拍摄 3 张</div>
+          <div style="text-align:center;font-size:9px;color:#3a3a3a;padding-bottom:10px">
+            ↑↓ 各约 190dp 空白
+          </div>
+          <div style="padding:0 12px 12px">
+            <div class="row" style="background:#1b1b1b;border-radius:9px;padding:3px">
+              <div style="flex:1;text-align:center;font-size:11px;font-weight:600;
+                background:var(--accent);color:#0A0A0A;border-radius:7px;padding:5px">盲拍</div>
+              <div style="flex:1;text-align:center;font-size:11px;color:var(--txt2);padding:5px">实时取景</div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="col">
+      <div class="col-label next">优化后</div>
+      <div class="phone sm">
+        <div class="statusbar"><span>13:52</span><span>▮▮▮ 100%</span></div>
+        <div class="appbar"><div class="back">‹</div><div class="t" style="text-align:center;font-size:13.5px">遥控拍摄</div><div class="icon">⤓</div></div>
+        <div class="body">
+          <div style="flex:1;min-height:0;margin:0 12px 6px;border-radius:8px;background:#1d1d1d;
+            position:relative;display:flex;align-items:center;justify-content:center">
+            <span style="font-size:9px;color:#3f3f3f">照片填满可用区</span>
+            <span style="position:absolute;right:6px;bottom:6px;font-size:9px;color:#ffffff99">⛶ 点击全屏</span>
+            <span style="position:absolute;left:6px;top:6px;font-size:8.5px;color:#ffffff99">3 张</span>
+          </div>
+          <div style="padding:0 12px 6px">
+            <div class="card tight" style="margin:0">
+              <div class="row">
+                <div>
+                  <div class="kv" style="font-size:10.5px;color:var(--txt)">DSC_0482.JPG</div>
+                  <div class="hint">24.1MB · 6048×4024 · f/2.8 1/500s ISO 2500</div>
+                </div>
+                <div class="spacer"></div>
+                <span class="pill on" style="font-size:9px">存到手机</span>
+              </div>
+            </div>
+          </div>
+          <div style="padding:0 12px 12px">
+            <div class="row" style="background:#1b1b1b;border-radius:9px;padding:3px">
+              <div style="flex:1;text-align:center;font-size:11px;font-weight:600;
+                background:var(--accent);color:#0A0A0A;border-radius:7px;padding:5px">盲拍</div>
+              <div style="flex:1;text-align:center;font-size:11px;color:var(--txt2);padding:5px">实时取景</div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="notes">
+    <ol>
+      <li><b>去掉写死宽度</b>：改用 <code>Expanded</code> + <code>BoxFit.contain</code>，照片按可用空间等比铺满。竖构图照片还能用得更满。</li>
+      <li><b>点击全屏</b>：复用已有的 <code>ZoomableImage</code>（双指缩放组件，大图查看器在用的那一个），回看时能放大确认对焦。</li>
+      <li><b>补上照片信息条</b>：文件名、大小、像素、拍摄参数。现在只知道"已拍摄 N 张"，连拍的那张是什么都不知道。</li>
+      <li><b>加"存到手机"</b>：现在要退出遥控页、切到相机页、找到那张、再点下载。这里给个直达按钮，走已有的单文件下载。</li>
+      <li><b>注意</b>：回看的照片用的是 <code>viewBytes</code> 拉回的原图字节（<code>remote_page.dart:93</code>），而它同时承担"取走新照片以解锁下一次快门"的职责（见交接文档 §7.1）。改展示方式时<b>不要省掉这次读取</b>，否则遥控连拍会退回卡忙。</li>
+    </ol>
+  </div>
+
+  <h3>2.5 两处显示缺陷（不是布局问题，是 bug）</h3>
+
+  <div class="note-inline">
+    <p style="margin-top:0"><b>缺陷 A：取景画面转了 90°（相机横放时）</b></p>
+    <p><b>现象</b>：相机水平放置时，相机自己的 LCD 取景窗画面方向正确，App 里却是转了 90° 的。<br>
+    <b>根因</b>：相机在取景 JPEG 里写入 EXIF Orientation 标记来声明画面应有的方向，相机 LCD 会按这个标记旋转显示；
+    而 <code>remote_page.dart:252</code> 直接把字节丢给 <code>Image.memory</code>——<b>Flutter 的图片解码不处理 EXIF Orientation</b>（这是长期已知行为），于是画面按原始像素方向渲染，看上去就是转了 90°。</p>
+    <p><b>修复前必须先取证</b>：尼康取景帧里到底有没有 EXIF Orientation 标记，只能用真机日志确认。项目规范也是先探针后改动
+    （交接文档 §10）。<br>
+    <b>若帧内有标记</b> → 解析后自动旋转，相机转、画面跟着转；<br>
+    <b>若帧内没有</b> → 只能做手动旋转按钮（0°/90°/180°/270°），并记住选择。</p>
+    <p style="margin-bottom:0"><b>无论哪种情况都建议加手动旋转</b>：相机横挂在三脚架上做竖构图是很常见的用法，自动识别不一定每次都符合用户意图。</p>
+  </div>
+
+  <div class="note-inline" style="border-left-color:#E5A08A">
+    <p style="margin-top:0"><b>缺陷 B：色彩与相机取景窗不一致</b></p>
+    <p><b>现象</b>：App 里看到的颜色和相机 LCD 上的不一样（按经验多为发灰、发闷）。</p>
+    <p>三个可能原因，按可能性排序，<b>都需要用真机日志排除</b>：</p>
+    <ol style="margin:8px 0 0;padding-left:20px">
+      <li><b>色彩空间标记被忽略</b>：若相机色彩空间设为 Adobe RGB，JPEG 里带相应标记，而解码端按 sRGB 渲染，
+        结果就是整体发闷、饱和度偏低。<b>这是最可能的一条</b>，也和"相机 LCD 正确、App 不正确"的现象吻合。</li>
+      <li><b>相机 Picture Control 由 LCD 实时应用</b>：相机屏幕显示的是套用优化校准后的效果，而取景 JPEG 可能是未套用的基准画面。</li>
+      <li><b>屏幕本身差异</b>：相机 LCD 与手机屏的色温、色域、亮度都不同，同一个文件在两块屏上本来就不会完全一致。</li>
+    </ol>
+    <p style="margin-bottom:0">取证方式：写一个只读取景帧头部的探针，输出 <b>EXIF 色彩空间标记</b>（<code>0xA001</code>：1=sRGB / 0xFFFF=未校准）、
+    <b>互操作标记</b>（<code>R98</code>=sRGB / <code>R03</code>=Adobe RGB）、<b>是否带 ICC 段</b>、<b>SOF 尺寸</b>与 <b>Orientation</b>，
+    一次把缺陷 A 和 B 的证据都拿到。这也正好复用手动旋转所需的那次解析。</p>
+  </div>
+
+  <h4>取景帧率：能优化，但要认清上限在哪</h4>
+  <p>实测 5–10fps。逐项拆开看，<b>带宽不是瓶颈</b>：每帧 40–73KB，10fps 约 730KB/s（≈5.8Mbps），远低于 2.4G 热点实际可用带宽。
+  真正的上限是相机在智能设备 Wi-Fi 模式下的取景产出速率。我们这一侧能消掉的是三处浪费：</p>
+  <table>
+    <tr><th>现状</th><th>问题</th><th>改法</th></tr>
+    <tr>
+      <td><code>Timer.periodic(60ms)</code> 驱动取帧（<code>remote_page.dart:126</code>）</td>
+      <td>固定节拍 + <code>_fetchingFrame</code> 直接丢弃重入：相机 150ms 才回一帧时，中间两次定时器触发纯属空转，也让实际节奏被 60ms 网格量化</td>
+      <td>改成<b>自调度循环</b>：一帧拉完立刻发下一帧请求，零空转，拿到相机的真实上限</td>
+    </tr>
+    <tr>
+      <td>每帧 <code>setState</code> 整页重建，<code>Image.memory</code> 按原始尺寸解码</td>
+      <td>1620×1080 的 JPEG 每帧都要完整解码一次；且重建范围覆盖了模式切换、参数行、开关等与画面无关的部分</td>
+      <td>图像<code>cacheWidth</code> 按显示尺寸解码（Skia 支持 JPEG 缩放解码，成本大幅下降）；画面单独用 <code>ValueNotifier</code> + <code>ValueListenableBuilder</code> 隔离重建</td>
+    </tr>
+    <tr>
+      <td>取景通道固定 <code>0x9203</code></td>
+      <td>探针已发现 <code>0x9403</code> 在取景中也可能返回帧数据，且 <code>0x9203</code> 的 1500ms 超时与"取景热身需 30s"严重不匹配，前几帧必然超时并破坏流框架</td>
+      <td>先按交接文档 §7.2 探针取证，确认是否存在更快的取景通道；把首帧超时与稳态超时分开设置</td>
+    </tr>
+  </table>
+  <p>另外建议把<b>实际帧率显示在画面上</b>——既让用户判断当前状态，也让上面每一项改动都有可量化的验证依据。</p>
+
+  <!-- ================= 设置页 ================= -->
+  <h3>2.6 设置页 —— 给用户看的和给开发者用的分层</h3>
+  <div class="compare">
+
+    <div class="col">
+      <div class="col-label now">现状</div>
+      <div class="phone sm">
+        <div class="statusbar"><span>13:52</span><span>▮▮▮ 100%</span></div>
+        <div class="appbar"><div class="back">‹</div><div class="t" style="text-align:center;font-size:13.5px">设置</div><div style="width:28px"></div></div>
+        <div class="body">
+          <div style="font-size:11px;color:var(--txt3);padding:8px 16px 6px">存储与下载</div>
+          <div class="card">
+            <div class="kv">保存位置<br><span style="font-size:10px">系统相册 · Pictures/NikonSync</span></div>
+            <div class="hint" style="margin:6px 0 4px">下载画质（仅 JPEG 生效，RAW/视频始终原图）</div>
+            <div class="row" style="background:#232323;border-radius:9px;padding:3px">
+              <div style="flex:1;text-align:center;font-size:10.5px;background:var(--accent);
+                color:#0A0A0A;border-radius:7px;padding:4px">原图</div>
+              <div style="flex:1;text-align:center;font-size:10.5px;color:var(--txt2);padding:4px">8M</div>
+              <div style="flex:1;text-align:center;font-size:10.5px;color:var(--txt2);padding:4px">2M</div>
+            </div>
+            <div class="row" style="margin-top:6px">
+              <span class="kv">下载后删除相机原片</span><div class="spacer"></div>
+              <div style="width:32px;height:18px;border-radius:9px;background:#3a3a3a"></div>
+            </div>
+          </div>
+          <div style="font-size:11px;color:var(--txt3);padding:6px 16px">协议验证面板</div>
+          <!-- 占掉 459dp -->
+          <div class="card" style="flex:1;display:flex;flex-direction:column;gap:5px">
+            <div class="row"><span class="kv" style="font-weight:600">网络</span><div class="spacer"></div>
+              <span class="hint">SSID: (未知)</span></div>
+            <div class="hint">IP: 192.168.31.173　网关: 0.0.0.0</div>
+            <div class="row" style="gap:5px;margin-top:3px">
+              <span class="pill" style="font-size:9px">刷新</span>
+              <span class="pill" style="font-size:9px">打开 Wi-Fi 设置</span>
+              <span class="pill" style="font-size:9px">扫描相机</span>
+            </div>
+            <div style="height:1px;background:#242424;margin:4px 0"></div>
+            <div class="row"><span class="kv" style="font-weight:600">连接</span><div class="spacer"></div></div>
+            <div class="row" style="gap:5px">
+              <span class="pill" style="font-size:9px;flex:1">192.168.1.1</span>
+              <span class="pill" style="font-size:9px;flex:1">Nikon WMU</span>
+            </div>
+            <div class="row" style="gap:5px;margin-top:2px">
+              <span class="pill on" style="font-size:9px">连接</span>
+            </div>
+            <div style="height:1px;background:#242424;margin:4px 0"></div>
+            <div class="row"><span class="kv" style="font-weight:600">协议验证</span><div class="spacer"></div></div>
+            <div class="row" style="gap:5px;flex-wrap:wrap">
+              <span class="pill on" style="font-size:9px">① 快速枚举</span>
+              <span class="pill" style="font-size:9px">② 缩略图</span>
+              <span class="pill" style="font-size:9px">③ 下载落盘</span>
+              <span class="pill" style="font-size:9px">全量枚举</span>
+              <span class="pill" style="font-size:9px">电量</span>
+              <span class="pill" style="font-size:9px">能力清单</span>
+              <span class="pill" style="font-size:9px;background:#3a1c1c">试验:取景4</span>
+              <span class="pill" style="font-size:9px;background:#3a1c1c">试验:LV对焦</span>
+            </div>
+            <div style="height:1px;background:#242424;margin:4px 0"></div>
+            <div class="row"><span class="kv" style="font-weight:600">日志（42）</span><div class="spacer"></div>
+              <span class="hint">复制</span><span class="hint">清空</span></div>
+            <div style="flex:1;background:#151515;border-radius:5px;padding:5px;
+              font-family:ui-monospace,monospace;font-size:8px;color:#7a7a7a;overflow:hidden">
+              <div>13:48:02 ▶ 刷新网络信息</div>
+              <div>13:48:02 网络: onWifi=true ssid=…</div>
+              <div>13:48:11 ▶ 连接相机 192.168.1.1</div>
+              <div>13:48:12 命令握手成功：连接号=…</div>
+              <div>13:48:12 相机事件：DevicePropChanged…</div>
+              <div>13:48:13 下载完成：DSC_0481.JPG…</div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="col">
+      <div class="col-label next">优化后</div>
+      <div class="phone sm">
+        <div class="statusbar"><span>13:52</span><span>▮▮▮ 100%</span></div>
+        <div class="appbar"><div class="back">‹</div><div class="t" style="text-align:center;font-size:13.5px">设置</div><div style="width:28px"></div></div>
+        <div class="body">
+          <div style="font-size:11px;color:var(--txt3);padding:8px 16px 6px">存储与下载</div>
+          <div class="card">
+            <div class="row">
+              <div class="kv">保存位置<br><span style="font-size:10px">系统相册 · Pictures/NikonSync</span></div>
+              <div class="spacer"></div>
+              <span class="pill" style="font-size:9.5px">查看</span>
+            </div>
+            <div class="hint" style="margin:8px 0 4px">下载画质（仅 JPEG 生效）</div>
+            <div class="row" style="background:#232323;border-radius:9px;padding:3px">
+              <div style="flex:1;text-align:center;font-size:10.5px;background:var(--accent);
+                color:#0A0A0A;border-radius:7px;padding:4px">原图</div>
+              <div style="flex:1;text-align:center;font-size:10.5px;color:var(--txt2);padding:4px">8M</div>
+              <div style="flex:1;text-align:center;font-size:10.5px;color:var(--txt2);padding:4px">2M</div>
+            </div>
+          </div>
+          <div class="card">
+            <div class="row">
+              <div class="kv">下载后删除相机原片<br>
+                <span class="hint" style="color:#E5A08A">开启后无法恢复，请确认已完整保存</span></div>
+              <div class="spacer"></div>
+              <div style="width:34px;height:19px;border-radius:10px;background:#3a3a3a;position:relative">
+                <div style="position:absolute;left:2px;top:2px;width:15px;height:15px;border-radius:50%;background:#8a8a8a"></div>
+              </div>
+            </div>
+          </div>
+
+          <div style="font-size:11px;color:var(--txt3);padding:6px 16px">关于</div>
+          <div class="card">
+            <div class="row"><span class="kv">版本</span><div class="spacer"></div>
+              <span class="hint">1.0.0 (2003)</span></div>
+            <div class="row" style="margin-top:6px"><span class="kv">已验证机型</span><div class="spacer"></div>
+              <span class="hint">Nikon Z50 II · 固件 1.02</span></div>
+            <div class="hint" style="margin-top:7px">
+              非官方开源作品，与尼康公司无关。无线传输存在丢包可能，请勿作为重要数据的唯一存储。
+            </div>
+          </div>
+
+          <!-- 死区用来放折叠的开发者选项 -->
+          <div style="font-size:11px;color:var(--txt3);padding:6px 16px">高级</div>
+          <div class="card tight">
+            <div class="row">
+              <span class="kv">开发者选项</span>
+              <div class="spacer"></div>
+              <span class="hint">协议日志 / 探针 ⌄</span>
+            </div>
+            <div class="hint" style="margin-top:5px">
+              默认收起。协议调试与厂商探针在此展开，普通使用无需关心。
+            </div>
+          </div>
+          <div style="flex:1"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="notes">
+    <ol>
+      <li><b>协议验证面板折叠进"高级"</b>：它现在占掉设置页整个下半屏（实测 430→890dp，459dp），包含 15 个按钮、日志窗、探针入口。对用户只会造成困惑，对开发者又不够用。改为默认收起的折叠项，<b>长按标题可直达</b>。</li>
+      <li><b>新增"关于"</b>：版本号、已验证机型、免责声明。现在设置页里翻不到任何版本信息，用户报问题也没法说明用的是哪一版。</li>
+      <li><b>删除原片的警告前置</b>：现在开启时才弹确认框，关掉后界面就只剩一行"谨慎开启"的小字。把不可恢复的提示常驻在开关下方。</li>
+      <li><b>保存位置加"查看"</b>：选过自定义目录后，相册 App 里看不到（这个限制现在只用括号小字说明），给一个直接跳转目次的入口。</li>
+    </ol>
+  </div>
+
+  <h2>3 · 设计规范</h2>
+  <p>现状的问题之一是"所有东西都是 11–13px 灰字"，缺少层级。下面这套是上面方案使用的规格。</p>
+
+  <h4>色板</h4>
+  <div class="swatches">
+    <div class="sw"><div class="box" style="background:#0A0A0A"></div><div class="n">页面底色</div><div class="v">#0A0A0A</div></div>
+    <div class="sw"><div class="box" style="background:#161616"></div><div class="n">卡片</div><div class="v">#161616</div></div>
+    <div class="sw"><div class="box" style="background:#FFE100"></div><div class="n">强调 / 主操作</div><div class="v">#FFE100</div></div>
+    <div class="sw"><div class="box" style="background:#4CD964"></div><div class="n">已完成</div><div class="v">#4CD964</div></div>
+    <div class="sw"><div class="box" style="background:#E53935"></div><div class="n">危险 / 破坏性</div><div class="v">#E53935</div></div>
+    <div class="sw"><div class="box" style="background:#A8A8A8"></div><div class="n">正文（改）</div><div class="v">#A8A8A8</div></div>
+    <div class="sw"><div class="box" style="background:#6E6E6E"></div><div class="n">辅助文字（改）</div><div class="v">#6E6E6E</div></div>
+  </div>
+  <p>正文与辅助色比现状亮一档。现在大量小字用 <code>white38</code>／<code>white24</code>／alpha 0.5，在纯黑上实测对比度约 2.5–3:1，
+  <b>低于 WCAG AA 要求的 4.5:1</b>；上面两个值都在 4.5:1 以上。</p>
+
+  <h4>字号层级</h4>
+  <div class="scale-row"><span class="lbl">页面标题</span><span style="font-size:17px;font-weight:600">照片 · 1499</span></div>
+  <div class="scale-row"><span class="lbl">区块标题</span><span style="font-size:15px;font-weight:600">存储与下载</span></div>
+  <div class="scale-row"><span class="lbl">正文</span><span style="font-size:13.5px">Nikon Z50 II · 上次连接 2 小时前</span></div>
+  <div class="scale-row"><span class="lbl">辅助</span><span style="font-size:11.5px;color:#6E6E6E">已下载 1268 · 卡内共 1499</span></div>
+  <p>现状把 11–12.5px 当作正文用（筛选条、状态条、信息栏全是这个尺寸），四级里最少要用到 13.5px 才不至于吃力。</p>
+
+  <h4>组件规格</h4>
+  <table>
+    <tr><th>组件</th><th>规格</th></tr>
+    <tr><td>主按钮</td><td>高 48dp，胶囊形，黄底黑字</td></tr>
+    <tr><td>次按钮</td><td>高 48dp，胶囊形，描边 1dp <code>#4A4A4A</code></td></tr>
+    <tr><td>小按钮（卡内）</td><td>高 28–34dp，胶囊形，仅用于卡片内联动作</td></tr>
+    <tr><td>卡片</td><td><code>#161616</code>，圆角 10dp，内边距 12dp，卡片间距 9dp</td></tr>
+    <tr><td>缩略图网格</td><td>3 列，比例 <b>3:2</b>，间隙 2dp</td></tr>
+    <tr><td>状态 Chip</td><td>高 24dp，圆角 11dp，选中黄底黑字</td></tr>
+    <tr><td>开关</td><td>34 × 19dp，开启态 <code>#4CD964</code></td></tr>
+    <tr><td>快门按钮</td><td>直径 60–72dp 圆形，含文字与语义标签</td></tr>
+  </table>
+
+  <h2>4 · 落地优先级</h2>
+  <table>
+    <tr><th>#</th><th>改动</th><th>用户价值</th><th>工作量</th><th>依赖</th></tr>
+    <tr><td>1</td><td><b>相册页任务条 + 一键下载未下载</b></td><td>高——直接解决"哪些还没传"</td><td>小（后端去重已具备）</td><td>无</td></tr>
+    <tr><td>2</td><td><b>遥控页参数异常值不显示</b></td><td>高——修掉 f/0.6 这类错误显示</td><td>极小</td><td>无</td></tr>
+    <tr><td>3</td><td><b>缩略图 1:1 → 3:2</b></td><td>中高——构图不被切坏，每屏更多张</td><td>小</td><td>无</td></tr>
+    <tr><td>4</td><td><b>勾选圆点常显 + 未下载高亮</b></td><td>中高——选择入口可发现</td><td>小</td><td>无</td></tr>
+    <tr><td>5</td><td><b>设置页：折叠开发者选项 + 关于</b></td><td>中——普通用户不再困惑</td><td>小</td><td>无</td></tr>
+    <tr><td>6</td><td><b>连接页三步向导 + 最近连接</b></td><td>中高——填死区、降低首次门槛</td><td>中</td><td>需要记录上次连接的相机</td></tr>
+    <tr><td>7</td><td><b>遥控页重排 + 模式分段控件</b></td><td>中——主次归位</td><td>中</td><td>无</td></tr>
+    <tr><td>8</td><td><b>正文/辅助色提亮到 AA 对比度</b></td><td>中——强光下可读性</td><td>小</td><td>建议同时定下浅色主题</td></tr>
+    <tr><td>9</td><td><b>筛选摘要行 + 未下载快捷筛</b></td><td>中——状态可见</td><td>小</td><td>依赖 #1</td></tr>
+    <tr><td>10</td><td><b>连接过程分阶段提示</b></td><td>中——减少"卡死"误判</td><td>中</td><td>需要原生侧上报阶段</td></tr>
+    <tr><td>11</td><td><b>取景画面按相机方向旋转（缺陷 A）</b></td><td>高——画面方向错误，且修好后竖向取景能填满整屏，连带解决"浪费屏幕"</td><td>小（解析+旋转）</td><td><b>需先探针确认帧内是否有 EXIF Orientation</b></td></tr>
+    <tr><td>12</td><td><b>盲拍回看去掉写死宽度 + 全屏 + 信息条</b></td><td>中高——拍完看不清、也做不了事</td><td>小</td><td>无（注意保留取走原图那一步，见 §2.4）</td></tr>
+    <tr><td>13</td><td><b>取景帧率优化（自调度循环 + 缩放解码 + 隔离重建）</b></td><td>中——消掉本侧空转与重复解码，并把帧率显示出来</td><td>中</td><td>无</td></tr>
+    <tr><td>14</td><td><b>取景色彩一致性（缺陷 B）</b></td><td>中——画面发闷</td><td>待定</td><td><b>需先探针取色彩空间/ICC 证据</b>，结论可能落在相机侧设置</td></tr>
+    <tr><td>15</td><td><b>取景全屏模式 + 手动旋转按钮</b></td><td>中——远景构图、横挂竖构图</td><td>小</td><td>依赖 #11</td></tr>
+  </table>
+
+  <div class="note-inline">
+    <b>建议先做 1–5：</b>五项都是小改动、互不依赖，且每一项都直接对着一个实测问题。
+    其中第 1 项同时补上了技术方案里承诺过、但至今没实现的"全量增量下载"——后端早已具备能力
+    （<code>records.contains</code> 去重 + 批量下载队列），缺的只是一个入口。
+  </div>
+
+  <h4>本次未纳入的项</h4>
+  <p>以下问题同样真实存在，但属于功能缺口而非界面优化，建议单独立项：<b>文件名/日期搜索</b>（1500+ 文件目前只能靠 4 个类型 chip 筛选）、
+  <b>下拉刷新</b>、<b>视频时长与播放页</b>（视频现在只有文字角标、格子不标视频、无播放器）、
+  <b>无障碍语义</b>（全项目 0 个 <code>Semantics</code>，快门按钮与缩略图 TalkBack 完全读不出）、
+  <b>应用图标</b>（当前是 Flutter 默认图标）、<b>国际化</b>（232 处硬编码中文，且 <code>MaterialApp</code> 未配
+  <code>localizationsDelegates</code>，导致系统控件文案回退英文、与正文中英混排）。</p>
+
+  <h2>5 · 实施状态（2026-09-14）</h2>
+  <p>下表按本稿的编号记录落地情况。<b>已实施</b>的部分均通过了静态分析与构建，
+  但手势类改动未做真机交互验证（测试机拦截 adb 输入注入）。</p>
+
+  <table>
+    <tr><th>项</th><th>状态</th><th>说明</th></tr>
+    <tr><td>§2.4 盲拍回看去掉写死宽度 + 全屏 + 信息条 + 存到手机</td><td class="good">已实施</td><td>信息条含文件名/大小/像素/拍摄参数；全屏复用 <code>ZoomableImage</code></td></tr>
+    <tr><td>§2.3 取景区填满可用区</td><td class="good">已实施</td><td>改为 <code>Stack(fit: StackFit.expand)</code> + <code>BoxFit.contain</code></td></tr>
+    <tr><td>§2.5 帧率三处浪费</td><td class="good">已实施</td><td>自调度循环替代固定定时器；按显示尺寸解码；画面用 <code>ValueNotifier</code> 隔离重建；画面角落显示实测 fps</td></tr>
+    <tr><td>f/0.6 参数越界显示</td><td class="good">已实施</td><td>光圈/快门/ISO 全部加合理性区间，越界显示 <code>--</code></td></tr>
+    <tr><td>§2.5 缺陷 A 旋转</td><td class="bad">部分实施</td><td>已实现 EXIF Orientation 自动旋转（取景与回看各自独立）+ 手动旋转按钮 + 全屏。新增 <code>lib/util/jpeg_exif.dart</code>，配 10 条单元测试覆盖大小端/缺标签/截断/长度损坏。
+      <b>能否自动生效取决于取景帧是否带方向标记，需真机日志确认</b></td></tr>
+    <tr><td>§2.5 缺陷 B 色彩</td><td class="bad">待取证</td><td>已内置诊断：进实时取景会打印一帧的尺寸/方向/色彩空间/interop/ICC。<b>拿到日志后再定修法</b>，结论可能落在相机侧设置</td></tr>
+    <tr><td>§2.3 模式切换、自动下载改开关、快门加文字、全屏</td><td class="good">已实施</td><td>——</td></tr>
+    <tr><td>§2.1 / §2.2 / §2.6 各屏布局方案</td><td>待实施</td><td>相册页任务条、连接页向导、设置页分层均未动</td></tr>
+  </table>
+
+  <div class="note-inline">
+    <b>怎么取证：</b>诊断已接在正常使用路径上，不需要进调试面板点探针——打开实时取景就会在日志里留下两行：<br>
+    <code>取景帧诊断：73KB 1600×1064 orientation=6 colorSpace=sRGB interop=R03 ICC=无</code><br>
+    <code>回看照片诊断：…</code><br>
+    若画面方向仍不对：<code>orientation=无</code> 说明帧里没带方向标记，自动旋转不可能生效；
+    <code>orientation=6/8</code> 但画面仍不对则说明解析或旋转方向有问题。
+    色彩方面 <code>interop=R03</code> 或 <code>colorSpace</code> 非 sRGB，基本可以断定是色彩空间标记被忽略。
+  </div>
+
+  <footer>
+    尼康速传（NikonSync）· UI 优化设计稿 · 基于 400 × 890 dp 真机实测与全量源码审查生成<br>
+    文中所有坐标与尺寸均来自真机无障碍树抓取，非估算值。设计稿为静态示意，交互细节以落地实现为准。
+  </footer>
+</div>
+</body>
+</html>
