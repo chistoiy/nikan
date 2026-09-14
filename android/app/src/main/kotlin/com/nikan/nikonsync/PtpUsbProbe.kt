@@ -40,6 +40,7 @@ internal object PtpUsbProbe {
     private const val CT_COMMAND = 1
     private const val CT_DATA = 2
     private const val CT_RESPONSE = 3
+    private const val CT_EVENT = 4
 
     private const val HEADER_BYTES = 12
     private const val BULK_TIMEOUT_MS = 5_000
@@ -61,12 +62,16 @@ internal object PtpUsbProbe {
     private var epOut: UsbEndpoint? = null
     private var txnId = 0L
 
+    /** 本次运行的日志出口（run() 开头设置）。供深层读写函数使用，避免层层透传。 */
+    private var probeLog: (String) -> Unit = {}
+
     /**
      * U0 入口：跑完"探测 → 会话 → 操作集 → 测速"全流程，返回可读结论。
      * 需要用户在弹出的系统对话框里点一次"允许"。
      */
     fun run(ctx: Context, log: (String) -> Unit): List<String> {
         val out = ArrayList<String>()
+        probeLog = log
         try {
             openDevice(ctx, log, out) ?: return out
             val conn = conn ?: return out
@@ -185,6 +190,22 @@ internal object PtpUsbProbe {
         }
         val ein = findBulk(ptp, UsbConstants.USB_DIR_IN)
         val eout = findBulk(ptp, UsbConstants.USB_DIR_OUT)
+        // 把全部端点打出来：若存在中断端点，事件（容器类型 4）可能走它而非 Bulk IN，
+        // 这决定要不要单独起一条事件读取通道
+        for (i in 0 until ptp.endpointCount) {
+            val ep = ptp.getEndpoint(i)
+            out += "    端点$i：地址=0x%02X 类型=%s 方向=%s 最大包=%d".format(
+                ep.address,
+                when (ep.type) {
+                    UsbConstants.USB_ENDPOINT_XFER_BULK -> "Bulk"
+                    UsbConstants.USB_ENDPOINT_XFER_INT -> "Interrupt"
+                    UsbConstants.USB_ENDPOINT_XFER_ISOC -> "Iso"
+                    else -> "Control"
+                },
+                if (ep.direction == UsbConstants.USB_DIR_IN) "IN" else "OUT",
+                ep.maxPacketSize,
+            )
+        }
         if (ein == null || eout == null) {
             out += "未找到 Bulk 端点（in=${ein != null} out=${eout != null}）"
             runCatching { c.releaseInterface(ptp) }
@@ -323,7 +344,10 @@ internal object PtpUsbProbe {
         val (code, _) = command(c, ein, eout, Ptp.OP_OPEN_SESSION, longArrayOf(1), log)
         out += "OpenSession → ${Ptp.respName(code)}"
         log("USB OpenSession → ${Ptp.respName(code)}")
-        if (code == Ptp.RESP_OK) return true
+        if (code == Ptp.RESP_OK) {
+            Thread.sleep(300) // 会话刚建立时相机可能还在初始化，留一点余量
+            return true
+        }
 
         if (code == Ptp.RESP_SESSION_ALREADY_OPEN) {
             out += "相机上已有残留会话（多为系统 MTP 服务建立），先关闭再重开"
@@ -423,6 +447,7 @@ internal object PtpUsbProbe {
         params: LongArray,
         log: (String) -> Unit,
     ): Pair<Int, ByteArray> {
+        var data: ByteArray = ByteArray(0)
         val txn = nextTxn()
         val buf = ByteArray(HEADER_BYTES + params.size * 4)
         PtpWire.putU32(buf, 0, buf.size.toLong())
@@ -437,11 +462,19 @@ internal object PtpUsbProbe {
             when (h.type) {
                 CT_RESPONSE -> {
                     val payload = readPayload(c, ein, h.payloadLen)
-                    return h.code to payload
+                    // data-IN 操作的数据在响应**之前**到达，载荷即数据集本身
+                    return h.code to (if (data.isNotEmpty()) data else payload)
                 }
-                // 该操作不应有数据阶段；真有就丢掉，避免把流留在半路
+                // data-IN 操作（如 GetDeviceInfo）会先发 Data 容器再发 Response。
+                // 原先这里把 Data 直接跳过、只返回响应的空载荷——那是实打实的 bug，
+                // 会让 DeviceInfo 永远解析不出来。
                 CT_DATA -> {
-                    log("USB 意外数据阶段（${h.payloadLen}B），已跳过")
+                    data = readPayload(c, ein, h.payloadLen)
+                    log("USB 数据阶段 ${data.size}B")
+                }
+                // 事件可能插在响应之前：不能当未知类型抛错，丢掉继续等响应
+                CT_EVENT -> {
+                    log("USB 收到事件容器 ${h.payloadLen}B，已忽略")
                     skip(c, ein, h.payloadLen.toLong())
                 }
                 else -> throw IOException("USB 收到未知容器类型 ${h.type}")
@@ -492,8 +525,19 @@ internal object PtpUsbProbe {
     private fun readFully(c: UsbDeviceConnection, ein: UsbEndpoint, buf: ByteArray, want: Int) {
         var off = 0
         while (off < want) {
-            val n = c.bulkTransfer(ein, buf, off, want - off, BULK_TIMEOUT_MS)
-            if (n <= 0) throw IOException("USB 读取失败（已收 $off/$want，超时或断开）")
+            var n = runCatching { c.bulkTransfer(ein, buf, off, want - off, BULK_TIMEOUT_MS) }
+                .getOrDefault(-1)
+            if (n <= 0) {
+                // bulkTransfer 在"端点被 STALL"和"超时"两种情况下都返回 -1，
+                // 无法直接区分。端点 STALL 是可恢复的（清一下就好），
+                // 所以先清除再重试一次，避免把可恢复的 halt 误判成链路故障。
+                probeLog("USB 读取受阻（已收 $off/$want，返回 $n），清除 IN 端点 STALL 后重试")
+                clearHalt(c, ein, probeLog)
+                Thread.sleep(150)
+                n = runCatching { c.bulkTransfer(ein, buf, off, want - off, BULK_TIMEOUT_MS) }
+                    .getOrDefault(-1)
+            }
+            if (n <= 0) throw IOException("USB 读取失败（已收 $off/$want，清除 STALL 后仍返回 $n）")
             off += n
         }
     }
