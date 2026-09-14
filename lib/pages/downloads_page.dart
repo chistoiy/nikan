@@ -23,6 +23,9 @@ class _DownloadsPageState extends State<DownloadsPage> {
   static const int _cols = 3;
   static const double _gap = 2;
 
+  /// 与相机相册页保持一致：相机出片是 3:2，正方形会切坏构图
+  static const double _cellAspect = 3 / 2;
+
   final ScrollController _scrollCtrl = ScrollController();
   final Map<String, GlobalKey> _cellKeys = {};
   final Map<String, Uint8List?> _thumbs = {};
@@ -204,7 +207,7 @@ class _DownloadsPageState extends State<DownloadsPage> {
                                 crossAxisCount: _cols,
                                 crossAxisSpacing: _gap,
                                 mainAxisSpacing: _gap,
-                                childAspectRatio: 1,
+                                childAspectRatio: _cellAspect,
                               ),
                               delegate: SliverChildBuilderDelegate(
                                 (context, i) => _cell(section.value[i], sectionBase[si] + i),

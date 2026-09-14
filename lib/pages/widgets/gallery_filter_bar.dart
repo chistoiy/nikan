@@ -2,7 +2,7 @@ import 'package:flutter/material.dart';
 
 import 'app_widgets.dart';
 
-/// 相册页顶部筛选条：文件类型 chips + 文件夹入口。
+/// 相册页顶部筛选条：文件类型 chips + 未下载快捷筛 + 文件夹入口。
 class GalleryFilterBar extends StatelessWidget {
   const GalleryFilterBar({
     super.key,
@@ -10,12 +10,20 @@ class GalleryFilterBar extends StatelessWidget {
     required this.folder,
     required this.onKind,
     required this.onFolderTap,
+    required this.undownloadedOnly,
+    required this.undownloadedCount,
+    required this.onToggleUndownloaded,
   });
 
   final String kind; // all / jpeg / raw / video
   final String folder;
   final ValueChanged<String> onKind;
   final VoidCallback onFolderTap;
+
+  /// 只看未下载
+  final bool undownloadedOnly;
+  final int undownloadedCount;
+  final VoidCallback onToggleUndownloaded;
 
   @override
   Widget build(BuildContext context) {
@@ -48,6 +56,26 @@ class GalleryFilterBar extends StatelessWidget {
             chip('JPEG', 'jpeg'),
             chip('RAW', 'raw'),
             chip('视频', 'video'),
+            // 未下载快捷筛：待下载清零后仍保留（否则筛空了就没法关掉它）
+            if (undownloadedCount > 0 || undownloadedOnly)
+              Padding(
+                padding: const EdgeInsets.only(right: 8),
+                child: FilterChip(
+                  label: Text('未下载 $undownloadedCount'),
+                  selected: undownloadedOnly,
+                  selectedColor: kAccent,
+                  labelStyle: TextStyle(
+                    fontSize: 12.5,
+                    color: undownloadedOnly ? Colors.black : kAccent,
+                  ),
+                  checkmarkColor: Colors.black,
+                  showCheckmark: false,
+                  visualDensity: VisualDensity.compact,
+                  side: BorderSide(color: undownloadedOnly ? kAccent : kAccent.withValues(alpha: 0.5)),
+                  backgroundColor: const Color(0xFF161616),
+                  onSelected: (_) => onToggleUndownloaded(),
+                ),
+              ),
             const SizedBox(width: 4),
             ActionChip(
               label: Text(

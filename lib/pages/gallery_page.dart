@@ -30,8 +30,15 @@ class _GalleryPageState extends State<GalleryPage> {
   static const int _cols = 3;
   static const double _gap = 2;
 
+  /// 单元格宽高比。相机出片是 3:2，正方形会把横构图切坏，
+  /// 而且同样的屏幕高度下 3:2 能多显示约一半行数。
+  static const double _cellAspect = 3 / 2;
+
   String _kind = 'all'; // all / jpeg / raw / video
   String _folder = '全部';
+
+  /// 只看未下载（与 _kind 是正交维度，因此单独一个开关）
+  bool _undownloadedOnly = false;
   final GlobalKey _gridKey = GlobalKey();
   final ScrollController _gridCtrl = ScrollController();
   List<CameraFile>? _filteredCache;
@@ -78,6 +85,7 @@ class _GalleryPageState extends State<GalleryPage> {
 
   List<CameraFile> _computeFiltered() {
     var list = List<CameraFile>.of(model.files);
+    if (_undownloadedOnly) list = list.where((f) => !model.isDownloaded(f)).toList();
     if (_kind != 'all') list = list.where((f) => f.kind == _kind).toList();
     if (_folder != '全部') list = list.where((f) => f.folder == _folder).toList();
     int cmp(CameraFile a, CameraFile b) {
@@ -108,9 +116,10 @@ class _GalleryPageState extends State<GalleryPage> {
 
   /// 改筛选条件：丢弃筛选缓存，并把选择集收敛到新列表上。
   /// 不收敛的话"已选 N"会包含看不见的条目，"取消全选"也按不干净。
-  void _setFilter({String? kind, String? folder}) => setState(() {
+  void _setFilter({String? kind, String? folder, bool? undownloaded}) => setState(() {
         if (kind != null) _kind = kind;
         if (folder != null) _folder = folder;
+        if (undownloaded != null) _undownloadedOnly = undownloaded;
         _filteredCache = null;
         _sel.prune(_filtered.map((f) => f.handle).toSet());
       });
@@ -147,14 +156,17 @@ class _GalleryPageState extends State<GalleryPage> {
 
   /// 数据空间单元格索引：屏幕局部坐标 + 列表滚动偏移（否则滚动后选错行）
   int? _indexOf(Offset local, double width) {
-    final cell = (width - _gap * (_cols - 1)) / _cols;
-    if (cell <= 0) return null;
+    final cellW = (width - _gap * (_cols - 1)) / _cols;
+    if (cellW <= 0) return null;
     final files = _filtered;
     if (files.isEmpty) return null;
+    // 行高由单元格宽高比决定：改动 childAspectRatio 时这里必须同步，
+    // 否则滑动选择会按错误的行距换算、选到别的行
+    final cellH = cellW / _cellAspect;
     final scroll = _gridCtrl.hasClients ? _gridCtrl.offset : 0.0;
-    var row = ((scroll + local.dy) / (cell + _gap)).floor();
+    var row = ((scroll + local.dy) / (cellH + _gap)).floor();
     if (row < 0) row = 0;
-    final col = (local.dx / (cell + _gap)).floor().clamp(0, _cols - 1);
+    final col = (local.dx / (cellW + _gap)).floor().clamp(0, _cols - 1);
     var idx = row * _cols + col;
     if (idx >= files.length) idx = files.length - 1;
     return idx;
@@ -187,6 +199,82 @@ class _GalleryPageState extends State<GalleryPage> {
     _sel.exitSelect();
   }
 
+  /// 一键下载全部未下载。
+  ///
+  /// 这是技术方案里承诺过、但一直没实现的"全量增量下载"的入口——
+  /// 去重（records.contains）与批量下载队列早就具备，缺的只是入口。
+  Future<void> _downloadAllPending(int pending) async {
+    final picks = model.files.where((f) => !model.isDownloaded(f)).toList();
+    if (picks.isEmpty) return;
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: const Color(0xFF1E1E1E),
+        title: Text('下载 $pending 张未下载的照片？', style: const TextStyle(fontSize: 16)),
+        content: const Text(
+          '按当前画质设置逐张下载，已下载过的会自动跳过。\n'
+          '尚未读取详情的文件会先补读再下载，数量多时需要一些时间。',
+          style: TextStyle(fontSize: 13, height: 1.5),
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('取消')),
+          FilledButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('开始下载')),
+        ],
+      ),
+    );
+    if (ok != true) return;
+    final result = await model.download(picks);
+    if (!mounted) return;
+    if (result.isNotEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(result)));
+    }
+  }
+
+  /// 待下载任务条：把"还差多少"和"一键传完"放在第一眼位置。
+  Widget _taskBar(int pending, int downloaded) {
+    return Container(
+      color: const Color(0xFF1F1F14),
+      padding: const EdgeInsets.fromLTRB(14, 9, 8, 9),
+      child: Row(
+        children: [
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  '还有 $pending 张未下载',
+                  style: const TextStyle(
+                      fontSize: 12.5, fontWeight: FontWeight.w600, color: kAccent),
+                ),
+                const SizedBox(height: 2),
+                Text(
+                  '已下载 $downloaded · 卡内 ${model.files.length}',
+                  style: TextStyle(fontSize: 11, color: Colors.white.withValues(alpha: 0.55)),
+                ),
+              ],
+            ),
+          ),
+          if (model.downloading)
+            Padding(
+              padding: const EdgeInsets.only(right: 8),
+              child: Text('${model.dlDone}/${model.dlTotal}',
+                  style: const TextStyle(fontSize: 12, color: Colors.white54)),
+            )
+          else
+            FilledButton(
+              style: FilledButton.styleFrom(
+                minimumSize: const Size(0, 32),
+                padding: const EdgeInsets.symmetric(horizontal: 14),
+                textStyle: const TextStyle(fontSize: 12.5, fontWeight: FontWeight.w600),
+              ),
+              onPressed: () => _downloadAllPending(pending),
+              child: const Text('一键下载'),
+            ),
+        ],
+      ),
+    );
+  }
+
   // ------------------------------------------------------------ 装配
 
   @override
@@ -207,15 +295,22 @@ class _GalleryPageState extends State<GalleryPage> {
           );
         }
         final files = _filtered;
+        // 待下载数量：未读到详情的文件按"未下载"计，随索引进度收敛
+        final pending = model.files.where((f) => !model.isDownloaded(f)).length;
+        final downloaded = model.files.length - pending;
         return Scaffold(
           appBar: _sel.selectMode ? _selectionAppBar() : _normalAppBar(),
           body: Column(
             children: [
+              if (model.files.isNotEmpty && pending > 0) _taskBar(pending, downloaded),
               GalleryFilterBar(
                 kind: _kind,
                 folder: _folder,
                 onKind: (v) => _setFilter(kind: v),
                 onFolderTap: _showOptions,
+                undownloadedOnly: _undownloadedOnly,
+                undownloadedCount: pending,
+                onToggleUndownloaded: () => _setFilter(undownloaded: !_undownloadedOnly),
               ),
               if (model.hasNewPhotos)
                 NewPhotosBanner(onRefresh: () {
@@ -308,7 +403,7 @@ class _GalleryPageState extends State<GalleryPage> {
           crossAxisCount: _cols,
           crossAxisSpacing: _gap,
           mainAxisSpacing: _gap,
-          childAspectRatio: 1,
+          childAspectRatio: _cellAspect,
         ),
         itemCount: files.length,
         itemBuilder: (context, i) => _cell(files[i], i, files),
