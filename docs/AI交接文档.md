@@ -211,10 +211,28 @@ Wi-Fi 智能直连（免配对）、快速枚举（1499 文件 256ms）、文件
 - `RecordStore` 改为 `ChangeNotifier`，`AppModel` 转发其通知。此前删除记录不触发任何通知，本机查看器删完返回手机页仍显示旧条目（要等下一次引擎通知才刷新）。
 - 相册页改筛选条件时把选择集收敛到新列表上，避免"已选 N"包含看不见的条目。
 
-### 仍未做
+### 已完成（2026-09-14）
 
-- **`CameraEngine.kt` 拆分（1431 行）**。探针段（约 330 行）占了近四分之一，但它与外层共享私有可变状态（`client`、`liveViewOn`，以及 `attempt_marker` 等辅助函数）。
-不能像页面那样靠参数注入切干净——移出去需要把 4~6 个闭包穿过每个探针，属于换一种耦合，且只能在无真机的情况下靠编译验证。建议单独一次专门做，方案是：把这些共享成员放宽为 `internal`，探针搬到同包的新文件里直接引用 `CameraEngine.xxx`，门面方法保留一行转发。
+`CameraEngine.kt` 拆分为 **1164 行 + `CameraProbes.kt` 443 行**。探针段（9 个探针 +
+`jpegDims` + `attempt_marker`，共 11 个函数）整体移出，`CameraEngine` 只留 9 行门面转发，
+`NikonsyncPlugin` 的调用点无需改动。
+
+**放宽为 `internal` 的成员**（共 4 个）：`client`、`need()`、`indexOfSoi()`、
+`liveViewOn` 的 setter（原为 `private set`）。
+
+**两个坑，第二次做时别再踩：**
+
+1. **不能按行号范围一把切**。探针之间夹着三块**非探针**代码，一刀切会把事件排水机制一起搬走：
+   - `drainCheckEvents` / `parseCheckEvents`（厂商事件队列排水，保活与拍摄路径在用）
+   - `ptpValue` / `propDescCurrent` / `isManualFocus` / `afDriveBlocking` / `afDrive` / `shotParams`（对焦辅助与参数读取）
+   正确边界是 `probeLvAf`(929–949) 与探针块(1068–1473) 两段，中间 951–1067 全部留在原地。
+2. **`liveViewOn` 的 getter 公开但 setter 是 `private set`**。探针会写它（收尾时置 false），
+   只放宽 getter 不够——编译器会明确报"it is private in CameraEngine"，照它改即可。
+
+教训：这类搬迁靠"grep 函数名 + 猜行号"很容易错（我第一次就把范围划成了 928–996，
+恰好吞掉整个排水机制）。**可靠做法是先把区间内所有 `fun` 定义列出来逐个判断归属**，
+再动手；编译器能兜住引用错误，但兜不住"多搬了不该搬的东西"。
+
 
 ---
 
