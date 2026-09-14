@@ -24,6 +24,7 @@ object NikonsyncPlugin {
     private val mainHandler = Handler(Looper.getMainLooper())
     private var executor: ExecutorService? = null
     private var activity: Activity? = null
+    private var appContext: Context? = null
     private var engineRef: FlutterEngine? = null
     private var pendingFolderResult: MethodChannel.Result? = null
 
@@ -35,6 +36,7 @@ object NikonsyncPlugin {
     fun register(messenger: BinaryMessenger, context: Context, engine: FlutterEngine, activity: Activity?) {
         CameraEngine.init(context)
         this.activity = activity
+        this.appContext = context.applicationContext
         this.engineRef = engine
         executor = Executors.newCachedThreadPool()
         MethodChannel(messenger, "nikonsync/engine").setMethodCallHandler { call, result ->
@@ -92,6 +94,17 @@ object NikonsyncPlugin {
         when (call.method) {
             // 轻量方法直接在主线程执行
             "wifiInfo" -> result.success(CameraEngine.wifiInfo())
+            // 应用版本：读实际安装的包信息（AGP 8 起 BuildConfig 默认不生成，
+            // 且这样拿到的是真正生效的版本，不会与 pubspec 失同步）
+            "appVersion" -> {
+                val ctx = appContext
+                result.success(
+                    runCatching {
+                        val info = ctx!!.packageManager.getPackageInfo(ctx.packageName, 0)
+                        "${info.versionName} (${info.longVersionCode})"
+                    }.getOrNull(),
+                )
+            }
             "openWifiSettings" -> {
                 runCatching { CameraEngine.openWifiSettings() }
                 result.success(true)

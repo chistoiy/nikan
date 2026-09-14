@@ -19,6 +19,10 @@ class NikonEngine {
 
   static Future<Map<String, dynamic>> wifiInfo() => _map('wifiInfo');
 
+  /// 应用版本（原生侧读 BuildConfig，与 pubspec 不会失同步）
+  static Future<String?> appVersion() async =>
+      await _m.invokeMethod('appVersion') as String?;
+
   static Future<void> openWifiSettings() => _m.invokeMethod('openWifiSettings');
 
   static Future<List<String>> scan() async {
