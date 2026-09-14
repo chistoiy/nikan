@@ -46,13 +46,14 @@ internal object PtpUsbProbe {
     private const val BULK_TIMEOUT_MS = 5_000
     private const val STREAM_CHUNK = 1 shl 20 // 1MiB
 
-    /** 单次容器载荷上限：防止对端长度字段异常导致巨量分配（与 PtpWire 同一考虑） */
+    /** 单次分配上限：readPayload 会 new 等长数组，异常长度字段在这里把守；
+     *  容器头校验不做此限制（大文件的数据容器本来就超），流式下载不经过 readPayload。 */
     private const val MAX_PAYLOAD = 64 shl 20
 
     // PTP 操作码一律复用 Ptp.kt 的常量（U0 只用到这几个）。
     // 响应码同样复用，避免两份定义漂移。
 
-    private class UsbHeader(val type: Int, val code: Int, val txn: Long, val payloadLen: Int)
+    private class UsbHeader(val type: Int, val code: Int, val txn: Long, val payloadLen: Long)
 
     /** 找到的第一个 PTP 设备（一次实验内复用） */
     private var device: UsbDevice? = null
@@ -61,6 +62,14 @@ internal object PtpUsbProbe {
     private var epIn: UsbEndpoint? = null
     private var epOut: UsbEndpoint? = null
     private var txnId = 0L
+
+    /**
+     * 上一次整包读"多读出"的字节（跨容器边界部分）。
+     * USB 是包式协议，一次 bulkTransfer 收到的是整个 USB 包，可能包含
+     * 下一笔容器的开头；这些字节不能丢，必须按序供给后续读取。
+     * drainInput（清端点残留）时一并清空，否则新事务会从陈余料开始解析。
+     */
+    private var inLeftover: ByteArray = ByteArray(0)
 
     /** 本次运行的日志出口（run() 开头设置）。供深层读写函数使用，避免层层透传。 */
     private var probeLog: (String) -> Unit = {}
@@ -83,11 +92,19 @@ internal object PtpUsbProbe {
         val vid = device?.vendorId
         val pid = device?.productId
         closeQuietly(log)
-        val dev = mgr.deviceList.values.firstOrNull {
-            (vid == null || it.vendorId == vid) && (pid == null || it.productId == pid)
+        // 相机断开到重新挂上有约 3.4 秒的离线窗（§7.2），设备不在总线时轮询等待，
+        // 而不是立刻放弃——离线窗里放弃等于每次断开都终结整轮探测
+        var dev: UsbDevice? = null
+        for (i in 1..20) { // 20 × 500ms = 10s
+            dev = mgr.deviceList.values.firstOrNull {
+                (vid == null || it.vendorId == vid) && (pid == null || it.productId == pid)
+            }
+            if (dev != null) break
+            if (i == 1) log("USB 设备不在总线上，等待其重新出现（最多 10s）…")
+            Thread.sleep(500)
         }
         if (dev == null) {
-            log("USB 重枚举恢复失败：按 VID/PID 找不到设备（可能已拔出）")
+            log("USB 重枚举恢复失败：等了 10s 仍未见到设备（可能已拔出）")
             return false
         }
         val ptp = pickStillImageInterface(dev)
@@ -96,8 +113,12 @@ internal object PtpUsbProbe {
             return false
         }
         if (!mgr.hasPermission(dev)) {
-            log("USB 重枚举恢复失败：新地址需要重新授权（系统对话框不会自动弹）")
-            return false
+            // 重枚举后权限按设备实例失效——主动请求（用户在弹窗点允许即可继续）
+            log("USB 新设备实例需要授权，请在系统弹窗中点「允许」…")
+            if (!ensurePermission(ctx, mgr, dev, log, mutableListOf())) {
+                log("USB 重枚举恢复失败：未获授权")
+                return false
+            }
         }
         val c = mgr.openDevice(dev) ?: return false
         if (!c.claimInterface(ptp, true)) {
@@ -131,8 +152,9 @@ internal object PtpUsbProbe {
         val first = runCatching { command(conn!!, epIn!!, epOut!!, op, params, probeLog) }
         if (first.isSuccess) return first.getOrThrow()
         val err = first.exceptionOrNull()
-        out += "$what 传输失败：${err?.message}"
-        probeLog("USB $what 传输失败：${err?.message}，尝试重枚举恢复")
+        val why = err?.message ?: err?.javaClass?.simpleName ?: "未知错误"
+        out += "$what 传输失败：$why"
+        probeLog("USB $what 传输失败：$why，尝试重枚举恢复")
         if (!reopenAfterEnumeration(probeLog)) {
             throw (err as? IOException ?: IOException("USB $what 失败"))
         }
@@ -185,7 +207,7 @@ internal object PtpUsbProbe {
             log("USB 设备信息：${di.model} 操作 ${di.operationsSupported.size} 个")
 
             // ---- 3) 找最大的对象并计时下载（吞吐是 U0 的唯一关键指标）----
-            val biggest = findBiggestObject(conn, epIn, epOut, di, log)
+            val biggest = findBiggestObject(out, log)
             if (biggest == null) {
                 out += "未找到可测速的对象（存储卡为空？）"
                 return out
@@ -482,6 +504,7 @@ internal object PtpUsbProbe {
         ein: UsbEndpoint,
         log: (String) -> Unit,
     ) {
+        inLeftover = ByteArray(0) // 端点都清了，内存余料也必须作废
         val buf = ByteArray(16 shl 10)
         var total = 0
         var rounds = 0
@@ -620,46 +643,79 @@ internal object PtpUsbProbe {
                 code, hexOf(h),
             ),
         )
-        if (len < HEADER_BYTES || len > MAX_PAYLOAD) {
+        if (len < HEADER_BYTES) {
             throw IOException("USB 容器长度非法：$len")
         }
-        return UsbHeader(type, code, txn, (len - HEADER_BYTES).toInt())
+        // ⚠️ 这里不能对 len 设上限：大文件（实测 174MB 的视频）的数据容器头
+        // len 本来就是文件大小+12，超 64MB 是合法的。分配上限在 readPayload
+        // （真正要 new ByteArray 的地方）把守，流式下载不经过它。
+        return UsbHeader(type, code, txn, len - HEADER_BYTES)
     }
 
     /** 容器头十六进制。Kotlin 的 Byte 是有符号的，必须先掩码再格式化，否则 0xFF 会打成负数。 */
     private fun hexOf(b: ByteArray): String =
         b.joinToString(" ") { "%02X".format(it.toInt() and 0xFF) }
 
-    private fun readPayload(c: UsbDeviceConnection, ein: UsbEndpoint, len: Int): ByteArray {
+    private fun readPayload(c: UsbDeviceConnection, ein: UsbEndpoint, len: Long): ByteArray {
         if (len <= 0) return ByteArray(0)
-        val b = ByteArray(len)
-        readFully(c, ein, b, len)
+        if (len > MAX_PAYLOAD) {
+            throw IOException("载荷 ${len}B 超过单次分配上限 ${MAX_PAYLOAD / 1048576}MB（大文件应走流式下载）")
+        }
+        val b = ByteArray(len.toInt())
+        readFully(c, ein, b, len.toInt())
         return b
     }
 
     /**
-     * Bulk 读，循环补齐；无数据时**以较长间隔**重读。
+     * Bulk 读 n 字节，循环补齐；无数据时**以较长间隔**重读。
      *
-     * 两条来自真机日志对比的教训：
+     * 三条来自真机日志对比 + 对照 libgphoto2/libmtp 源码的教训：
      *
-     * 1. **绝不能对 IN 端点做 clearHalt**。CLEAR_FEATURE(ENDPOINT_HALT) 会复位端点并
+     * 1. **单次 bulkTransfer 的缓冲必须 ≥ 端点 maxPacket**（本轮源码研读新发现，
+     *    §7.3"GetDeviceInfo 被拒"的真因）。USB 是包式协议：相机数据相位按
+     *    512B 高速整包发送，旧实现用 12 字节缓冲读容器头，整包装不下 →
+     *    EOVERFLOW，包被主机丢弃、设备收不到 ACK 会**永远重发同一包**——
+     *    表现为"已收 0/12 永远读不到"。参考实现（libgphoto2 usb.c、
+     *    libmtp libusb1-glue.c）首包一律按 maxPacket 整包读。
+     *
+     * 2. **绝不能对 IN 端点做 clearHalt**。CLEAR_FEATURE(ENDPOINT_HALT) 会复位端点并
      *    丢弃设备正在发送的数据——实测那样做会让相机回 0x2007 IncompleteTransfer，
-     *    等于"清一次丢一次"，永远救不回来。
+     *    等于"清一次丢一次"，永远救不回来。（libgphoto2 也只在能区分出
+     *    STALL/IO 错误时才清一次，Android 的 bulkTransfer 无法区分错误类型。）
      *
-     * 2. **重读间隔不能短**。Android 的 bulkTransfer 底层是 USBDEVFS_BULK ioctl，
+     * 3. **重读间隔不能短**。Android 的 bulkTransfer 底层是 USBDEVFS_BULK ioctl，
      *    在上一笔传输尚未完成时立刻再发，很可能中止那个进行中的 URB。
      *    实测对比：间隔 150ms 时 +153ms 就收到了响应；改成 20ms 密集重试后，
      *    2 秒内一个字节都收不到——密集重试反而把设备正要送出的数据打断了。
      *    因此用 200ms 间隔、最多 15 次（约 3 秒）。
+     *
+     * 一次收到的字节可能跨过当前容器边界（载荷尾包与响应包背靠背到达），
+     * 多出部分存入 [inLeftover] 按序供后续读取，绝不丢弃。
      */
     private fun readFully(c: UsbDeviceConnection, ein: UsbEndpoint, buf: ByteArray, want: Int) {
         var off = 0
+        // 先吃上次整包读多出来的余料
+        if (inLeftover.isNotEmpty()) {
+            val take = minOf(inLeftover.size, want)
+            System.arraycopy(inLeftover, 0, buf, 0, take)
+            inLeftover = if (take == inLeftover.size) ByteArray(0) else inLeftover.copyOfRange(take, inLeftover.size)
+            off = take
+        }
+        val maxPkt = maxOf(ein.maxPacketSize, HEADER_BYTES)
         var attempt = 0
         while (off < want) {
-            val n = runCatching { c.bulkTransfer(ein, buf, off, want - off, BULK_TIMEOUT_MS) }
+            // 单次 URB 尺寸取整到 maxPacket 整数倍：剩余空间小于一个整包时
+            // 整包装不下会 EOVERFLOW（§7.3 同源问题），多读的字节进余料不丢
+            val raw = minOf(want - off, STREAM_CHUNK)
+            val size = if (raw >= maxPkt) raw / maxPkt * maxPkt else maxPkt
+            val tmp = ByteArray(size)
+            val n = runCatching { c.bulkTransfer(ein, tmp, 0, size, BULK_TIMEOUT_MS) }
                 .getOrDefault(-1)
             if (n > 0) {
-                off += n
+                val take = minOf(n, want - off)
+                System.arraycopy(tmp, 0, buf, off, take)
+                off += take
+                if (n > take) inLeftover = tmp.copyOfRange(take, n)
                 attempt = 0
                 continue
             }
@@ -683,48 +739,92 @@ internal object PtpUsbProbe {
         }
     }
 
+    /** 中断后的部分速度估算（拿到的字节虽然不全，也足够回答"快不快"） */
+    private fun partialMbps(total: Long, t0: Long): Double {
+        val ms = (System.currentTimeMillis() - t0).coerceAtLeast(1)
+        return (total / 1048576.0) / (ms / 1000.0)
+    }
+
     // ------------------------------------------------------------ 测速
 
-    /** 从枚举结果里挑最大的 JPEG/NEF 用于测速 */
+    /**
+     * 枚举存储卡，挑最大的照片文件用于测速。
+     *
+     * 两个实测教训（2026-09-15）：
+     * 1. **照片不在根目录**。GetObjectHandles(parent=0xFFFFFFFF) 只返回根对象，
+     *    尼康卡的根下通常只有 DCIM 文件夹（关联对象，size=0）——第一版只扫根目录，
+     *    于是永远"未找到可测速的对象"。必须顺着关联对象递归往下找。
+     * 2. **枚举命令偶发"0/12 永远无数据"**（实测 4 轮里第 1 轮撞上，后 3 轮正常），
+     *    一律走 commandRecovering（带重枚举恢复）而不是裸 command，
+     *    且失败原因必须写进 out——runCatching 吞掉异常时，卡片上只会显示
+     *    "存储卡为空"这种误导性结论。
+     */
     private fun findBiggestObject(
-        c: UsbDeviceConnection,
-        ein: UsbEndpoint,
-        eout: UsbEndpoint,
-        di: DeviceInfo,
+        out: MutableList<String>,
         log: (String) -> Unit,
     ): Pair<Long, Long>? {
         val storageIds = runCatching {
-            val (code, p) = command(c, ein, eout, Ptp.OP_GET_STORAGE_IDS, LongArray(0), log)
-            if (code != Ptp.RESP_OK) return@runCatching LongArray(0)
+            val (code, p) = commandRecovering(Ptp.OP_GET_STORAGE_IDS, LongArray(0), "GetStorageIDs", out)
+            if (code != Ptp.RESP_OK) {
+                out += "GetStorageIDs 响应：${Ptp.respName(code)}"
+                return@runCatching LongArray(0)
+            }
             val r = ByteReader(p)
             val n = r.u32().toInt()
             LongArray(n) { r.u32() }
-        }.getOrDefault(LongArray(0))
+        }.onFailure { out += "GetStorageIDs 异常：${it.message}" }
+            .getOrDefault(LongArray(0))
         if (storageIds.isEmpty()) return null
 
+        val FMT_ASSOCIATION = 0x3001
         var best: Pair<Long, Long>? = null
-        for (sid in storageIds) {
-            // GetObjectHandles(storage, formatCode=0(全部), parent=0xFFFFFFFF)
+        var bestName = ""
+        var infoCalls = 0
+
+        fun walk(sid: Long, parent: Long, depth: Int) {
+            if (depth > 3 || infoCalls > 80) return
             val handles = runCatching {
-                val (code, p) = command(c, ein, eout, Ptp.OP_GET_OBJECT_HANDLES, longArrayOf(sid, 0, 0xFFFFFFFFL), log)
-                if (code != Ptp.RESP_OK) return@runCatching LongArray(0)
+                val (code, p) = commandRecovering(
+                    Ptp.OP_GET_OBJECT_HANDLES,
+                    longArrayOf(sid, 0, parent),
+                    "GetObjectHandles(parent=0x${parent.toString(16)})",
+                    out,
+                )
+                if (code != Ptp.RESP_OK) {
+                    out += "GetObjectHandles(parent=0x${parent.toString(16)}) 响应：${Ptp.respName(code)}"
+                    return@runCatching LongArray(0)
+                }
                 val r = ByteReader(p)
                 val n = r.u32().toInt()
                 if (n < 0 || n > 100_000) return@runCatching LongArray(0)
                 LongArray(n) { r.u32() }
-            }.getOrDefault(LongArray(0))
-            log("USB 存储 $sid：${handles.size} 个对象")
-            // 只抽查前若干个，取最大的——U0 不需要枚举完整
-            for (h in handles.take(40)) {
+            }.onFailure { out += "GetObjectHandles 异常：${it.message}" }
+                .getOrDefault(LongArray(0))
+            if (depth == 0) out += "存储 $sid：根下 ${handles.size} 个对象"
+
+            for (h in handles) {
                 val info = runCatching {
-                    val (code, p) = command(c, ein, eout, Ptp.OP_GET_OBJECT_INFO, longArrayOf(h), log)
-                    if (code != Ptp.RESP_OK) return@runCatching null
+                    infoCalls++
+                    val (code, p) = commandRecovering(Ptp.OP_GET_OBJECT_INFO, longArrayOf(h), "GetObjectInfo", out)
+                    if (code != Ptp.RESP_OK) {
+                        out += "GetObjectInfo(0x${h.toString(16)}) 响应：${Ptp.respName(code)}"
+                        return@runCatching null
+                    }
                     PtpDatasets.parseObjectInfo(p)
-                }.getOrNull() ?: continue
-                val size = info.compressedSize
-                if (size > (best?.second ?: 0L)) best = h to size
+                }.onFailure { out += "ObjectInfo(0x${h.toString(16)}) 解析失败：${it.message}" }
+                    .getOrNull() ?: continue
+                if (info.format == FMT_ASSOCIATION) {
+                    walk(sid, h, depth + 1) // 目录：进去找照片
+                    continue
+                }
+                if (info.compressedSize > (best?.second ?: 0L)) {
+                    best = h to info.compressedSize
+                    bestName = info.filename
+                }
             }
         }
+        for (sid in storageIds) walk(sid, 0xFFFFFFFFL, 0)
+        if (best != null) out += "最大文件：$bestName（%.1fMB）".format(best!!.second / 1048576.0)
         return best
     }
 
@@ -737,52 +837,82 @@ internal object PtpUsbProbe {
         declaredSize: Long,
         log: (String) -> Unit,
     ): Double {
-        val txn = nextTxn()
-        val cmd = ByteArray(HEADER_BYTES + 4)
-        PtpWire.putU32(cmd, 0, cmd.size.toLong())
-        PtpWire.putU16(cmd, 4, CT_COMMAND)
-        PtpWire.putU16(cmd, 6, Ptp.OP_GET_OBJECT)
-        PtpWire.putU32(cmd, 8, txn)
-        PtpWire.putU32(cmd, HEADER_BYTES, handle)
-        sendContainer(c, eout, cmd, "GetObject 命令", log)
-
         var total = 0L
         var firstBytes: ByteArray? = null
-        val buf = ByteArray(STREAM_CHUNK)
-        val t0 = System.currentTimeMillis()
-        while (true) {
-            val h = readHeader(c, ein)
-            if (h.type == CT_RESPONSE) {
-                if (h.code != Ptp.RESP_OK) {
-                    log("USB GetObject 响应：${Ptp.respName(h.code)}")
-                    return 0.0
-                }
+        // 读块别太大：AOSP 自带 MtpDevice 源码注明"USB reads greater than 16K don't
+        // work"（USB连接方案.md §8.1）。64KB 是吞吐与稳妥的折中，大块能否用留待 U3 实测。
+        val buf = ByteArray(64 shl 10)
+        // 发送可恢复：设备可能恰好在重枚举离线窗里，等它重新挂上再发（换新事务号）
+        var sent = false
+        var lastErr: IOException? = null
+        for (attempt in 1..3) {
+            val txn = nextTxn()
+            val cmd = ByteArray(HEADER_BYTES + 4)
+            PtpWire.putU32(cmd, 0, cmd.size.toLong())
+            PtpWire.putU16(cmd, 4, CT_COMMAND)
+            PtpWire.putU16(cmd, 6, Ptp.OP_GET_OBJECT)
+            PtpWire.putU32(cmd, 8, txn)
+            PtpWire.putU32(cmd, HEADER_BYTES, handle)
+            try {
+                sendContainer(c, eout, cmd, "GetObject 命令", log)
+                sent = true
                 break
+            } catch (e: IOException) {
+                lastErr = e
+                log("USB GetObject 发送失败（第 $attempt 次）：${e.message}")
+                if (!reopenAfterEnumeration(log)) break
             }
-            if (h.type != CT_DATA) throw IOException("USB 非预期容器类型 ${h.type}")
-            var left = h.payloadLen.toLong()
-            while (left > 0) {
-                val want = minOf(buf.size.toLong(), left).toInt()
-                readFully(c, ein, buf, want)
-                if (firstBytes == null) firstBytes = buf.copyOf(minOf(16, want))
-                total += want
-                left -= want
+        }
+        if (!sent) throw (lastErr ?: IOException("GetObject 发送失败"))
+        val t0 = System.currentTimeMillis()
+        try {
+            while (true) {
+                val h = readHeader(c, ein)
+                if (h.type == CT_RESPONSE) {
+                    if (h.code != Ptp.RESP_OK) {
+                        log("USB GetObject 响应：${Ptp.respName(h.code)}")
+                        return 0.0
+                    }
+                    break
+                }
+                if (h.type != CT_DATA) throw IOException("USB 非预期容器类型 ${h.type}")
+                var left = h.payloadLen
+                while (left > 0) {
+                    val want = minOf(buf.size.toLong(), left).toInt()
+                    readFully(c, ein, buf, want)
+                    if (firstBytes == null) firstBytes = buf.copyOf(minOf(16, want))
+                    total += want
+                    left -= want
+                }
             }
+        } catch (e: IOException) {
+            // 中途断开：已收大块数据时按部分数据报告速度，别让整次测速白跑
+            if (total > 1 shl 20) {
+                log("USB 传输中断：${e.message}，按已收数据估算部分速度")
+                return partialMbps(total, t0)
+            }
+            throw e
         }
         val ms = (System.currentTimeMillis() - t0).coerceAtLeast(1)
         val mbps = (total / 1048576.0) / (ms / 1000.0)
-        // 校验确实是 JPEG（SOI 0xFFD8），防止"测得很快但数据是错的"
-        val soi = firstBytes != null && firstBytes.size >= 2 &&
-            firstBytes[0] == 0xFF.toByte() && firstBytes[1] == 0xD8.toByte()
+        // 校验数据是已知的图像/视频格式特征，防止"测得很快但数据是错的"
+        val fb = firstBytes
+        val jpeg = fb != null && fb.size >= 2 && fb[0] == 0xFF.toByte() && fb[1] == 0xD8.toByte()
+        val mp4 = fb != null && fb.size >= 8 && fb[4] == 0x66.toByte() && fb[5] == 0x74.toByte() &&
+            fb[6] == 0x79.toByte() && fb[7] == 0x70.toByte() // "ftyp"（MOV/MP4）
         log(
-            "USB 测速：$total 字节 / ${ms}ms = %.1f MB/s，头两字节%s JPEG".format(
-                mbps, if (soi) "是" else "不是",
+            "USB 测速：$total 字节 / ${ms}ms = %.1f MB/s，数据特征：%s".format(
+                mbps, when {
+                    jpeg -> "JPEG"
+                    mp4 -> "MOV/MP4"
+                    else -> "未知！"
+                },
             ),
         )
-        if (!soi) log("⚠️ 数据不像 JPEG，测速结果不可信")
+        if (!jpeg && !mp4) log("⚠️ 数据不像 JPEG/视频，测速结果不可信")
         if (declaredSize > 0 && total != declaredSize) {
             log("⚠️ 实际字节 $total 与 ObjectInfo 声明 $declaredSize 不一致")
         }
-        return if (soi) mbps else 0.0
+        return if (jpeg || mp4) mbps else 0.0
     }
 }

@@ -104,8 +104,10 @@ object PtpDatasets {
         d.u16() // associationType
         d.u32() // associationDesc
         d.u32() // sequenceNumber
-        val filename = d.str()
-        val captureDate = d.str()
+        // 相机对尾部可选字符串（修改日期/关键词）可能整段省略——数据集长度在
+        // 捕获日期处戛然而止也合法，读到就抛异常会误伤整个枚举流程
+        val filename = runCatching { d.str() }.getOrDefault("")
+        val captureDate = runCatching { d.str() }.getOrDefault("")
         return ObjectInfo(
             storageId, format, protection, compressedSize, thumbFormat, thumbSize,
             imageWidth, imageHeight, parent, filename, captureDate,

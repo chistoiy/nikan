@@ -460,3 +460,102 @@ Wi-Fi 智能直连（免配对）、快速枚举（1499 文件 256ms）、文件
 - 根因是"超时无法安全恢复"。理论上可以在超时后扫描 SOI/包长度做流重同步，
   但 TCP 上半包位置无法可靠推断，性价比低；现有做法（明确作废 + 重连）更稳妥。
 
+
+---
+
+## 17. USB U0：源码研读 + 读缓冲修复（2026-09-14，待复测）
+
+**成果：定位并修复了一个一直存在的自伤 bug——之前 GetDeviceInfo"被相机稳定拒绝"
+的结论是错的，真因是探针用 12 字节缓冲读 USB 容器头。**
+
+USB 是包式协议：数据相位第一个包是完整 512B 高速整包，12 字节的 URB 装不下 →
+EOVERFLOW 丢包且不给 ACK → 设备永远重发同一包。这统一解释了全部旧现象：
+12 字节响应（OpenSession/CloseSession）秒回、数据阶段颗粒无收、"瞬间 -1"、
+1.8s 后的 0x2007（相机放弃后回的错误响应）。详见 `docs/USB连接方案.md` §7.3/§8。
+
+本轮做的事：
+
+1. **克隆参考源码**（`docs/reference/`，gitignored）：libmtp 全量、libgphoto2 全量
+   （浅克隆大仓库会报 fetch-pack 错，重试可过；curl zip 在本机网络不通）。
+2. **研读事务层**：`libgphoto2/camlibs/ptp2/usb.c`、`libmtp/src/libusb1-glue.c`、
+   `gphoto2_port/libusb1/libusb1.c`。关键结论整理成 USB连接方案.md §8 的表：
+   首包按 maxPacket 整包读、超时 20s、ZLP 补零、错误分类后才允许清一次 halt、
+   Android 上单次读 ≤16KB（AOSP MtpDevice 注释）。
+3. **修复 `PtpUsbProbe.kt`**：`readFully` 改为"缓冲 ≥ maxPacket 整包读 + inLeftover
+   余料缓冲（跨容器背靠背到达的字节不丢）"，`drainInput` 同时清余料。
+   编译通过（`flutter build apk --debug`）。
+4. **记录构建环境坑**：本机 `FLUTTER_STORAGE_BASE_URL` 指向清华镜像，缺当前引擎的
+   `flutter_embedding_debug` jar（404，构建挂在 `:jni` 依赖解析）。构建时覆盖
+   `FLUTTER_STORAGE_BASE_URL=https://storage.flutter-io.cn` 即可。
+
+教训（值得记住的推理错误）：九轮真机排查都把矛头指向相机/系统，没有早一步对照
+业界实现逐行审自己的读写路径。"12 字节头在 TCP 上没问题"掩盖了"在 USB 上根本收不到数据"。
+**协议排障时，先逐行核对参考实现的读写原语，再怀疑对端。**
+
+下一步（按 USB连接方案.md §7.5 顺序）：① 相机复测 USB 探测看 GetDeviceInfo 能否
+收到完整 DeviceInfo；② 相机插电脑判别重枚举归属；③ 关相机「USB 供电」再测。
+
+### 17.1 复测结果（2026-09-15）：读缓冲修复验证通过，协议层全通
+
+修复版（versionCode 2027，pubspec 版本号因工作区曾回退到 +1 而提到 2027）装机复测：
+
+- OpenSession → SessionAlreadyOpen（沿用残留会话）
+- **GetDeviceInfo 完整收到并解析**：Nikon Corporation Z50_2 vV1.02、
+  操作集 126、事件集 26、0x92xx 段 12 个操作——§7.3 卡点正式消除
+- 探测全程未被打断，无重枚举痕迹——§7.2 的"相机等不到主机 ACK"推断得到支持，
+  但待长会话（整卡下载）继续观察
+- 唯一没跑成的是测速：**存储卡为空**。卡里放入照片（JPEG+NEF）再跑探测即可拿到
+  GetObject 吞吐数字，那是 U1 决策的最后一块证据
+
+（装机插曲：手机上原装 versionCode 2026 来自一次未提交的 pubspec 本地改动，
+工作区清理后回到 +1，直装报 INSTALL_FAILED_VERSION_DOWNGRADE；pubspec 提到
++2027 后正常。）
+
+
+### 17.2 第二天战报（2026-09-15 凌晨）：代码链路全通，只剩环境在杀连接
+
+四轮真机日志（logcat 全量，比卡片摘要多出命令级细节）把问题逐层剥完：
+
+1. **01:24** 读缓冲修复验证通过（§17.1）。
+2. **01:36** 发现"有照片却报卡空"的第二个 bug：GetObjectHandles 只列根目录，
+   根下只有 DCIM 文件夹（size=0），照片在子目录——`findBiggestObject` 改为
+   沿关联对象（format=0x3001）递归。又发现第三个 bug：174MB 视频的数据容器头
+   len=174MB+12 被 MAX_PAYLOAD(64MB) 误杀——上限应把守在分配点（readPayload）
+   而不是容器头校验。两处修复后：**GetObject 被相机接受、数据相位开始**。
+3. **01:52** 设备 12 秒后从总线**消失**（VID/PID 都找不到，不是换址）。
+4. **01:59** 恢复机制实战通过：等设备重现→重新授权→继续；其中一轮
+   **GetObject 接受、数据相位第一个包（12B 头+500B 数据）到手后相机静默 3s**。
+
+**结论：协议与代码层已 100% 打通（含 174MB 大文件数据相位），唯一卡点是
+连接在传输中被环境杀掉。** 三个待排除的环境因素，按成本排序：
+
+- MIUI 熄屏后 USB autosuspend（测试时保持屏幕常亮 + 给 App 关电池优化）
+- 相机「USB 供电」设置（尼康系已知该设置会致数据不稳）
+- com.android.mtp 主机栈干扰（无 root 挡不住，只能靠证据确认）
+
+本轮代码改动（`PtpUsbProbe.kt`/`PtpDatasets.kt`，均已编译+装机）：
+- findBiggestObject 递归目录 + 失败原因上卡片 + 走 commandRecovering
+- 容器头校验去掉 64MB 上限；readPayload 把守分配上限；payloadLen 改 Long
+- readFully 的 URB 尺寸取整到 maxPacket 整数倍（尾部溢出隐患）
+- reopenAfterEnumeration：轮询等待设备重现 10s + 主动请求授权
+- timedDownload：GetObject 发送失败自动重开重试 ×3；中断时已收 >1MB
+  则按部分数据报告速度
+- 附：pubspec 版本号提到 1.0.0+2027（此前 2026 是未提交的本地改动）
+
+
+### 17.3 结案（2026-09-15 凌晨）：U0 完成，实测 27.1 MB/s
+
+判别测试全部落地：相机插电脑稳定（相机/线排除）、屏幕常亮无影响（熄屏挂起排除）、
+上传优先/拍摄优先无差异（相机状态机排除）。随后一次探测跑通全链路：
+
+**GetObject 全量下载 174MB 的 DSC_3825.MOV，实测 27.1 MB/s，字节校验一致
+（JPEG/MP4 特征验证 + 与 ObjectInfo 声明长度一致）。** Wi-Fi 2.4 → 27.1 MB/s，11 倍。
+
+dumpsys usb 实锤空闲态重枚举循环仍在：host_manager `num_connects=661`，
+严格周期断 3.4s / 挂 3.65s；**活跃传输期间连接保持住**（7 秒下载未中断），
+循环定性为空闲态行为。恢复机制（等待重现 10s + 重新授权 + GetObject 重试）
+在此前的轮次里已实战验证可用。
+
+**U0 至此结案，方案进入 U1（传输层产品化）。** 详细结论已写入
+`docs/USB连接方案.md` §1/§6/§7.5。U1 设计要点：把"中断续传"当一等公民；
+并行验证带外供电 OTG 集线器能否根除空闲循环（大概率与 OTG 供电管理有关）。
