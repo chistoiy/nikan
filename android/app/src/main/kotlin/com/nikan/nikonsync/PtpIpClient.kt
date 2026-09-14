@@ -1,5 +1,6 @@
 package com.nikan.nikonsync
 
+import android.os.SystemClock
 import java.io.BufferedInputStream
 import java.io.BufferedOutputStream
 import java.io.ByteArrayOutputStream
@@ -33,6 +34,9 @@ class PtpIpClient(
         const val PARTIAL_CHUNK_BYTES = 4L shl 20
 
         private const val PROGRESS_STEP = 1L shl 20
+
+        /** DevicePropChanged 汇总输出间隔 */
+        private const val PROP_FLUSH_MS = 2_000L
     }
 
     class TransactResult(val responseCode: Int, val params: LongArray, val data: ByteArray)
@@ -454,6 +458,31 @@ class PtpIpClient(
         }
     }
 
+    // ---- DevicePropChanged 聚合 ----
+
+    private val propChanges = LinkedHashMap<Int, Int>()
+    private var propFlushAt = 0L
+    private val propLock = Any()
+
+    /** 记录一次属性变化，最多每 2 秒汇总输出一行。 */
+    private fun notePropChange(code: Int) {
+        synchronized(propLock) { propChanges[code] = (propChanges[code] ?: 0) + 1 }
+        val now = SystemClock.elapsedRealtime()
+        if (now - propFlushAt < PROP_FLUSH_MS) return
+        propFlushAt = now
+        flushPropChanges()
+    }
+
+    private fun flushPropChanges() {
+        val snapshot: LinkedHashMap<Int, Int>
+        synchronized(propLock) {
+            if (propChanges.isEmpty()) return
+            snapshot = LinkedHashMap(propChanges)
+            propChanges.clear()
+        }
+        log("属性变化：" + snapshot.entries.joinToString(" ") { "0x%04X×%d".format(it.key, it.value) })
+    }
+
     private fun startEventReader(ein: InputStream, eout: OutputStream) {
         Thread {
             try {
@@ -468,7 +497,14 @@ class PtpIpClient(
                                 params.add(PtpWire.getU32(pkt.payload, off))
                                 off += 4
                             }
-                            log("相机事件：${Ptp.evtName(code)} ${params.joinToString()}")
+                            // 属性变化事件按码聚合：相机每秒推 1~3 次且多个属性交替出现，
+                            // 逐条记日志会在两分钟内刷满 App 侧 300 条环形缓冲，
+                            // 把真正有用的协议日志挤掉。
+                            if (code == Ptp.EVT_DEVICE_PROP_CHANGED && params.isNotEmpty()) {
+                                notePropChange(params[0].toInt())
+                            } else {
+                                log("相机事件：${Ptp.evtName(code)} ${params.joinToString()}")
+                            }
                             eventHandler?.invoke(code, params.toLongArray())
                         }
                         Ptp.PKT_PROBE_REQUEST -> runCatching {

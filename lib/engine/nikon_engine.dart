@@ -137,6 +137,13 @@ class NikonEngine {
     return List<String>.from(r as List);
   }
 
+  /// 取景帧尺寸探针：候选帧通道逐个尝试，报告字节数与 JPEG 像素尺寸。
+  /// 用于判断是否存在比 0x9203（实测 640×424）更大的取景帧。
+  static Future<List<String>> probeLvFrames() async {
+    final r = await _m.invokeMethod('probeLvFrames');
+    return List<String>.from(r as List);
+  }
+
   /// 取景中候选操作响应码全量探针
   static Future<List<String>> probeLiveView3(int handle) async {
     final r = await _m.invokeMethod('probeLiveView3', {'handle': handle});

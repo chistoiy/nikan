@@ -875,20 +875,23 @@
     <tr><td>§2.3 取景区填满可用区</td><td class="good">已实施</td><td>改为 <code>Stack(fit: StackFit.expand)</code> + <code>BoxFit.contain</code></td></tr>
     <tr><td>§2.5 帧率三处浪费</td><td class="good">已实施</td><td>自调度循环替代固定定时器；按显示尺寸解码；画面用 <code>ValueNotifier</code> 隔离重建；画面角落显示实测 fps</td></tr>
     <tr><td>f/0.6 参数越界显示</td><td class="good">已实施</td><td>光圈/快门/ISO 全部加合理性区间，越界显示 <code>--</code></td></tr>
-    <tr><td>§2.5 缺陷 A 旋转</td><td class="bad">部分实施</td><td>已实现 EXIF Orientation 自动旋转（取景与回看各自独立）+ 手动旋转按钮 + 全屏。新增 <code>lib/util/jpeg_exif.dart</code>，配 10 条单元测试覆盖大小端/缺标签/截断/长度损坏。
-      <b>能否自动生效取决于取景帧是否带方向标记，需真机日志确认</b></td></tr>
-    <tr><td>§2.5 缺陷 B 色彩</td><td class="bad">待取证</td><td>已内置诊断：进实时取景会打印一帧的尺寸/方向/色彩空间/interop/ICC。<b>拿到日志后再定修法</b>，结论可能落在相机侧设置</td></tr>
+    <tr><td>§2.5 缺陷 A 旋转</td><td class="bad">手动旋转为解</td><td>已实现 EXIF Orientation 自动旋转 + 手动旋转按钮 + 全屏。新增 <code>lib/util/jpeg_exif.dart</code>，配 10 条单元测试覆盖大小端/缺标签/截断/长度损坏。
+      <b>真机取证结论：该机型取景帧"不带任何 EXIF 元信息"（见下方），自动识别不可能生效，手动旋转才是正解。</b>用户实测手动旋转有效</td></tr>
+    <tr><td>§2.5 缺陷 B 色彩</td><td class="bad">原假设被推翻</td><td>取证结果：帧内 <code>orientation/colorSpace/interop/ICC</code> 全为「无」，<b>不是色彩空间标记被忽略</b>。真正原因是取景流规格——640×424 / 33KB，放大近 2 倍显示且压缩损失大，而相机 LCD 显示的是套用优化校准后的渲染。新增「取景帧尺寸」探针用于定论是否存在更大的帧通道</td></tr>
+    <tr><td>§2.5 帧率</td><td class="good">已实施并验证</td><td>三处浪费改完后<b>实测 16–24 fps</b>（此前 5–10）。取景启动到首帧往返仅 21ms，说明上限确实不在带宽</td></tr>
     <tr><td>§2.3 模式切换、自动下载改开关、快门加文字、全屏</td><td class="good">已实施</td><td>——</td></tr>
     <tr><td>§2.1 / §2.2 / §2.6 各屏布局方案</td><td>待实施</td><td>相册页任务条、连接页向导、设置页分层均未动</td></tr>
   </table>
 
   <div class="note-inline">
-    <b>怎么取证：</b>诊断已接在正常使用路径上，不需要进调试面板点探针——打开实时取景就会在日志里留下两行：<br>
-    <code>取景帧诊断：73KB 1600×1064 orientation=6 colorSpace=sRGB interop=R03 ICC=无</code><br>
-    <code>回看照片诊断：…</code><br>
-    若画面方向仍不对：<code>orientation=无</code> 说明帧里没带方向标记，自动旋转不可能生效；
-    <code>orientation=6/8</code> 但画面仍不对则说明解析或旋转方向有问题。
-    色彩方面 <code>interop=R03</code> 或 <code>colorSpace</code> 非 sRGB，基本可以断定是色彩空间标记被忽略。
+    <b>真机取证结果（已回填）：</b>打开实时取景后日志给出
+    <code>取景帧诊断：33KB 640×424 orientation=无 colorSpace=无 interop=无 ICC=无</code>。<br>
+    → 帧里<b>不带任何 EXIF 元信息</b>，所以自动旋转在这台机器上不可能生效，手动旋转才是解（用户实测有效）。<br>
+    → 「色彩空间标记被忽略」的假设<b>被推翻</b>：没有色彩信息可供忽略。色彩差异来自取景流规格本身
+    （640×424、33KB，放大近 2 倍显示），以及相机 LCD 显示的是套用优化校准后的渲染。<br>
+    → 新增「试验:取景帧尺寸」探针，逐个尝试候选帧通道并报告 JPEG 像素尺寸，
+    用来定论是否存在更大的取景帧。若全部为 640×424，即为相机侧硬上限。<br>
+    → 帧率实测已达 <b>16–24 fps</b>（此前 5–10）。
   </div>
 
   <footer>

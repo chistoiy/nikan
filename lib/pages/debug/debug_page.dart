@@ -95,6 +95,11 @@ class _DebugPanelState extends State<DebugPanel> {
       run: (_) => NikonEngine.probeLiveView(),
     ),
     _Probe(
+      label: '试验:取景帧尺寸',
+      detail: '取景帧尺寸探针（候选帧通道逐个试，报告 JPEG 像素尺寸）',
+      run: (_) => NikonEngine.probeLvFrames(),
+    ),
+    _Probe(
       label: '试验:取景2',
       detail: '实时取景链路探针2（0x9206→拉帧→0x9201）',
       run: (_) => NikonEngine.probeLiveView2(),

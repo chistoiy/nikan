@@ -1110,6 +1110,64 @@ object CameraEngine {
     }
 
     /**
+     * 取景帧尺寸探针：在取景状态下逐个尝试候选帧通道，报告字节数与 JPEG 像素尺寸。
+     *
+     * 目的：实测 0x9203 只给 640×424 / 33KB，放大到手机屏后既糊又发闷。
+     * 本探针用来定论"是否存在更大的取景帧通道"——若全部返回 640×424，
+     * 说明这是相机在智能设备 Wi-Fi 模式下的硬上限，不必再追。
+     *
+     * 候选码只含本项目已验证过的只读取帧操作，不含 0x100E / 0x9400 / 0x9405
+     * 等拍摄类操作（交接文档 §7 记载 0x920A 等会真拍照）。
+     */
+    fun probeLvFrames(): List<String> {
+        val c = need()
+        val out = ArrayList<String>()
+        runCatching { c.transactShort(Ptp.OP_NIKON_LV_START, LongArray(0), 3000) }
+        liveViewOn = true
+        Thread.sleep(1200) // 等取景热身：首帧可能为空
+        for (op in intArrayOf(0x9203, 0x9403, 0x9202, 0x9204, 0x9205, 0x9209)) {
+            val line = runCatching { c.transactShort(op, LongArray(0), 2000) }.fold(
+                onSuccess = { r -> "0x%04X → OK %dB %s".format(op, r.data.size, jpegDims(r.data)) },
+                onFailure = { e ->
+                    val code = (e as? PtpException)?.code ?: -1
+                    "0x%04X → %s".format(op, Ptp.respName(code))
+                },
+            )
+            out += line
+            log("取景帧探针 $line")
+        }
+        runCatching { c.transactShort(Ptp.OP_NIKON_LV_END, LongArray(0), 2000) }
+        liveViewOn = false
+        return out
+    }
+
+    /** 从 JPEG 字节里找 SOF 段读出像素尺寸，返回 "宽×高" 或失败原因。 */
+    private fun jpegDims(d: ByteArray): String {
+        val soi = indexOfSoi(d)
+        if (soi < 0) return "非JPEG"
+        var i = soi + 2
+        while (i + 4 <= d.size) {
+            if (d[i] != 0xFF.toByte()) return "段结构异常"
+            val marker = d[i + 1].toInt() and 0xFF
+            if (marker == 0xDA) return "尺寸未知"
+            if (marker == 0xD8 || marker in 0xD0..0xD7) {
+                i += 2
+                continue
+            }
+            val len = ((d[i + 2].toInt() and 0xFF) shl 8) or (d[i + 3].toInt() and 0xFF)
+            if (len < 2) return "长度异常"
+            val isSof = marker in 0xC0..0xCF && marker != 0xC4 && marker != 0xC8 && marker != 0xCC
+            if (isSof && i + 8 < d.size) {
+                val h = ((d[i + 5].toInt() and 0xFF) shl 8) or (d[i + 6].toInt() and 0xFF)
+                val w = ((d[i + 7].toInt() and 0xFF) shl 8) or (d[i + 8].toInt() and 0xFF)
+                return "${w}×$h"
+            }
+            i += 2 + len
+        }
+        return "尺寸未知"
+    }
+
+    /**
      * 实时取景链路探针 v3（短超时，总时长 ≤30s，不会卡死）：
      * 0x9206 疑似 StartLiveView（响应可能迟到，3s 内未回也继续）；
      * 随后 12 秒内轮询帧候选 0x9403~0x9406/0x9202/0x9203；

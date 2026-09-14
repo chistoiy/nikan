@@ -198,6 +198,7 @@ object NikonsyncPlugin {
                             CameraEngine.probeResize((args["handle"] as Number).toLong())
                         }
                         "probeLiveView" -> CameraEngine.probeLiveView()
+                        "probeLvFrames" -> CameraEngine.probeLvFrames()
                         "probeLiveView2" -> CameraEngine.probeLiveView2()
                         "probeLiveView5" -> {
                             val args = call.arguments as? Map<*, *>
