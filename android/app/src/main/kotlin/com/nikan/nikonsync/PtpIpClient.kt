@@ -9,6 +9,7 @@ import java.io.InputStream
 import java.io.OutputStream
 import java.net.InetSocketAddress
 import java.net.Socket
+import java.net.SocketTimeoutException
 import java.util.concurrent.atomic.AtomicInteger
 import javax.net.SocketFactory
 
@@ -50,6 +51,9 @@ class PtpIpClient(
     @Volatile private var closing = false
     @Volatile private var linkDeadNotified = false
 
+    /** 事务超时后命令流已错位且无法安全恢复，此连接作废（需重新连接）。 */
+    @Volatile private var streamDesynced = false
+
     var deviceInfo: DeviceInfo? = null
         private set
     var cameraName: String = ""
@@ -80,6 +84,7 @@ class PtpIpClient(
             check(cmd == null) { "客户端已连接" }
             closing = false
             linkDeadNotified = false
+            streamDesynced = false
             log("连接 $host:$PORT …")
             try {
                 connectLocked(host, friendlyName)
@@ -372,7 +377,10 @@ class PtpIpClient(
 
     /**
      * 短超时事务：用于探针等"相机可能不应答"的场景。
-     * ⚠️ 超时若发生在分包中间会破坏流框架，调用方需容忍随后可能的重连。
+     *
+     * ⚠️ 超时即意味着命令流里可能残留半个包，之后每个事务都会解析错位。
+     * 命令流无法安全恢复，因此**一次超时就会把该连接标记为作废**并触发断线回调，
+     * 需要重新连接。调用方要接受"这次调用之后连接可能已失效"。
      */
     fun transactShort(op: Int, params: LongArray = LongArray(0), timeoutMs: Int = 3000): TransactResult =
         synchronized(txnLock) {
@@ -409,6 +417,9 @@ class PtpIpClient(
         params: LongArray,
         onChunk: ((ByteArray, Long, Long) -> Unit)?,
     ): TransactResult {
+        // 一次超时就会让流里残留半个包，之后每个事务都解析错位。
+        // 继续用只会拿到静默错误的结果（比断开更危险），因此直接拒绝后续请求。
+        if (streamDesynced) throw IOException("上次事务超时后命令流已失同步，需重新连接相机")
         val cin = cmdIn ?: throw IOException("未连接相机")
         val cout = cmdOut ?: throw IOException("未连接相机")
         val txn = txnCounter.incrementAndGet() and 0x7FFFFFFF
@@ -422,7 +433,18 @@ class PtpIpClient(
         var total = -1L
         var received = 0L
         while (true) {
-            val pkt = PtpWire.readPacket(cin)
+            val pkt = try {
+                PtpWire.readPacket(cin)
+            } catch (e: SocketTimeoutException) {
+                // 关键：超时后无法知道流里还剩多少字节，无法安全恢复。
+                // 此前只是把异常抛给上层，连接表面还"活着"，于是：
+                // 取景帧请求超时（1500ms）→ 流错位 → 保活探针排在后面
+                // 读到 30 秒超时 → 判定断线 → 相机侧也放弃主机、关闭热点。
+                streamDesynced = true
+                log("命令通道读超时（操作 0x%04X）：流已失同步，连接作废".format(op))
+                notifyLinkDead("命令通道读超时，流已失同步")
+                throw IOException("事务超时（操作 0x%04X），命令流已失同步".format(op), e)
+            }
             when (pkt.type) {
                 Ptp.PKT_START_DATA -> total = PtpWire.getU64(pkt.payload, 4)
                 Ptp.PKT_DATA, Ptp.PKT_END_DATA -> if (pkt.payload.size >= 4) {

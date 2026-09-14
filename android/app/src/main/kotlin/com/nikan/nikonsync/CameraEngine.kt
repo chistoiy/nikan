@@ -749,7 +749,10 @@ object CameraEngine {
     /** 拉取一帧实时取景 JPEG（0x9203；未启动时返回 NotLiveView 错误）。 */
     fun liveViewFrame(): ByteArray {
         val c = need()
-        val data = c.transactShort(Ptp.OP_NIKON_LV_FRAME, LongArray(0), 1500).data
+        // 超时放宽到 3 秒：一次超时会让命令流永久错位、连接作废（见 PtpIpClient），
+        // 不能因为取景热身期单帧慢就误杀整条连接。
+        // 上层的取帧循环另有最小间隔，避免把相机逼到超时。
+        val data = c.transactShort(Ptp.OP_NIKON_LV_FRAME, LongArray(0), 3000).data
         liveViewOn = true
         // 帧数据若带头部，从 JPEG SOI 标记截断
         val soi = indexOfSoi(data)
@@ -1122,22 +1125,43 @@ object CameraEngine {
     fun probeLvFrames(): List<String> {
         val c = need()
         val out = ArrayList<String>()
-        runCatching { c.transactShort(Ptp.OP_NIKON_LV_START, LongArray(0), 3000) }
-        liveViewOn = true
-        Thread.sleep(1200) // 等取景热身：首帧可能为空
-        for (op in intArrayOf(0x9203, 0x9403, 0x9202, 0x9204, 0x9205, 0x9209)) {
-            val line = runCatching { c.transactShort(op, LongArray(0), 2000) }.fold(
-                onSuccess = { r -> "0x%04X → OK %dB %s".format(op, r.data.size, jpegDims(r.data)) },
-                onFailure = { e ->
-                    val code = (e as? PtpException)?.code ?: -1
-                    "0x%04X → %s".format(op, Ptp.respName(code))
-                },
-            )
-            out += line
-            log("取景帧探针 $line")
+        var startedHere = false
+        try {
+            if (!liveViewOn) {
+                // 启动失败必须让用户看到，不能吞掉：
+                // 吞掉之后会在"未知状态"下继续发探针指令，把相机留在取景态
+                val start = runCatching { c.transactShort(Ptp.OP_NIKON_LV_START, LongArray(0), 4000) }
+                if (start.isFailure) {
+                    out += "启动取景失败：${start.exceptionOrNull()?.message}"
+                    return out
+                }
+                startedHere = true
+                Thread.sleep(1200) // 等取景热身，首帧可能为空
+            }
+            // 只探测有证据支持的只读取帧通道：0x9203 是生产路径在用的，
+            // 0x9403 是取景热身探针实测能出帧的。
+            // 0x9202/0x9204/0x9205/0x9209 语义未知（本项目审计已标注 0x9204 属"未知码"），
+            // 不放进这个探针——此前放进去过，用户实测用完后相机退出取景、屏幕熄灭并关闭热点断连。
+            for (op in intArrayOf(0x9203, 0x9403)) {
+                val line = runCatching { c.transactShort(op, LongArray(0), 2500) }.fold(
+                    onSuccess = { r -> "0x%04X → OK %dB %s".format(op, r.data.size, jpegDims(r.data)) },
+                    onFailure = { e ->
+                        val code = (e as? PtpException)?.code ?: -1
+                        "0x%04X → %s".format(op, Ptp.respName(code))
+                    },
+                )
+                out += line
+                log("取景帧探针 $line")
+            }
+        } finally {
+            // 无论上面发生什么都要关闭取景：绝不能把相机留在取景态
+            if (startedHere) {
+                runCatching { c.transactShort(Ptp.OP_NIKON_LV_END, LongArray(0), 3000) }
+                    .onFailure { log("结束取景失败：${it.message}") }
+                liveViewOn = false
+                log("取景帧尺寸探针结束，已关闭取景")
+            }
         }
-        runCatching { c.transactShort(Ptp.OP_NIKON_LV_END, LongArray(0), 2000) }
-        liveViewOn = false
         return out
     }
 

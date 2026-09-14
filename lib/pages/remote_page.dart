@@ -157,19 +157,31 @@ class _RemotePageState extends State<RemotePage> {
 
   void _stopFrameLoop() => _frameLoopOn = false;
 
-  /// 自调度取帧：一帧拉完立刻请求下一帧。
+  /// 两次取帧之间的最小间隔。
+  ///
+  /// 自调度循环本身没有空转，但请求速率会完全跟着响应走；若相机产出速率跟不上，
+  /// 请求就会排队直到超时——而**一次超时会让命令流永久错位**（见 PtpIpClient），
+  /// 之后保活探针读到 30 秒超时即判定断线，相机侧也随之关闭热点。
+  /// 保留这个下限，避免把相机逼到超时。
+  static const int _minFrameGapMs = 20;
+
+  /// 自调度取帧：一帧拉完立刻请求下一帧（受 [_minFrameGapMs] 约束）。
   ///
   /// 此前是 `Timer.periodic(60ms)` + `_fetchingFrame` 丢弃重入：相机 150ms 才回一帧时
-  /// 中间两次触发纯属空转，而且实际节奏被量化到 60ms 网格上。自调度既没有空转，
-  /// 也能拿到相机侧的真实上限。
+  /// 中间两次触发纯属空转，而且实际节奏被量化到 60ms 网格上。
   Future<void> _frameLoop() async {
     while (_frameLoopOn && mounted && _mode == _RemoteMode.liveView) {
+      // 连接失效立刻退出：否则 liveViewFrame 每次都立即抛异常，循环变成空转
+      if (model.connState != 'connected') {
+        AppLog.add('取景循环停止：连接已断开');
+        return;
+      }
       final sw = Stopwatch()..start();
       try {
         final f = await NikonEngine.liveViewFrame();
         if (!_frameLoopOn || !mounted) return;
+        _notLvCount = 0;
         if (f.length > 2) {
-          _notLvCount = 0;
           if (!_loggedFrameDiagnostics) {
             _loggedFrameDiagnostics = true;
             AppLog.add('取景帧诊断：${describeJpegFrame(f)}');
@@ -184,7 +196,10 @@ class _RemotePageState extends State<RemotePage> {
       } catch (_) {
         // 单帧失败不中断循环
       }
-      await Future<void>.delayed(const Duration(milliseconds: 2));
+      final spent = sw.elapsedMilliseconds;
+      await Future<void>.delayed(
+        Duration(milliseconds: spent < _minFrameGapMs ? _minFrameGapMs - spent : 0),
+      );
     }
   }
 
