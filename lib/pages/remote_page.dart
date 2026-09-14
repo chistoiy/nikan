@@ -109,8 +109,22 @@ class _RemotePageState extends State<RemotePage> {
         _onNewPhoto((map['handle'] as num).toInt());
       case 'devicePropChanged':
         _onPropChanged((map['code'] as num).toInt());
+      case 'capturePhase':
+        // 原生上报的拍摄阶段（对焦 → 快门）：对焦优先机型按下快门后要等合焦，
+        // 这段等待必须有解释，否则用户只看到一个转圈，以为卡死
+        _capturePhase = map['phase']?.toString() ?? '';
+        if (mounted) setState(() {});
     }
   }
+
+  String _capturePhase = '';
+
+  static String _phaseLabel(String phase) => switch (phase) {
+        'af' => '正在对焦…（对焦优先机型需合焦才会释放快门）',
+        'shutter' => '正在触发快门…',
+        'done' => '已触发快门',
+        _ => '正在拍摄…',
+      };
 
   /// 相机主动推送的属性变化 → 节流刷新参数显示。
   ///
@@ -329,7 +343,10 @@ class _RemotePageState extends State<RemotePage> {
       _loadParams();
     } catch (e) {
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('拍摄失败：$e')));
+        // 对焦优先的说明含相机菜单路径，需要更长的展示时间才看得完
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('拍摄失败：$e'), duration: const Duration(seconds: 8)),
+        );
       }
     } finally {
       if (mounted) setState(() => _shooting = false);
@@ -771,8 +788,13 @@ class _RemotePageState extends State<RemotePage> {
           ),
           const SizedBox(height: 4),
           Text(
-            _mode == _RemoteMode.liveView ? '实时取景 · 照片将拍摄到存储卡' : '盲拍模式 · 照片将拍摄到存储卡',
-            style: const TextStyle(fontSize: 11, color: Colors.white38),
+            _shooting && _capturePhase.isNotEmpty
+                ? _phaseLabel(_capturePhase)
+                : (_mode == _RemoteMode.liveView
+                    ? '实时取景 · 照片将拍摄到存储卡'
+                    : '盲拍模式 · 照片将拍摄到存储卡'),
+            textAlign: TextAlign.center,
+            style: TextStyle(fontSize: 11, color: _shooting ? yellow : Colors.white38),
           ),
         ],
       ),

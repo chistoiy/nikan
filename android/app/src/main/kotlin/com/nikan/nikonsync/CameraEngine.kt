@@ -754,6 +754,32 @@ object CameraEngine {
     /** InitiateCapture 实际可用的参数形态（空参失败后尝试 全存储+默认格式）。 */
     @Volatile private var captureParams: LongArray? = null
 
+    /** 驱动 AF 后留给镜头合焦的时间。发完 0x90C3 只代表指令被接受，不代表已合焦。 */
+    private const val AF_SETTLE_MS = 1_200L
+
+    /**
+     * "相机忙"之后的退避间隔。
+     * 不能短：对焦优先机型在 AF 搜索期间会一直返回 DeviceBusy，
+     * 而**反复按快门会打断并重启 AF**——原来每 500ms 重试一次，
+     * 结果是永远等不到合焦，连试 25 秒后报一句与真实原因无关的"相机忙碌"。
+     */
+    private const val BUSY_RETRY_MS = 1_500L
+
+    /** 快门忙等总预算。原为 25s，太长且没有信息量；8s 足够覆盖一次正常的 AF 合焦。 */
+    private const val CAPTURE_BUDGET_MS = 8_000L
+
+    /** 对焦优先导致拒拍的说明与处理办法（相机侧可关，所以要把菜单路径写清楚）。 */
+    private const val FOCUS_PRIORITY_HINT =
+        "原因通常是相机开启了「未对焦时禁止拍摄」（对焦优先）：对焦没锁定，相机就不会释放快门。\n" +
+            "处理办法（任选其一）：\n" +
+            "· 把相机对准有明暗/线条对比的目标再拍——对着纯色墙面或无纹理物体，AF 永远对不上\n" +
+            "· 先点遥控页的「对焦」按钮，等画面合焦后再按拍摄\n" +
+            "· 相机端改为释放优先：自定义设定菜单 → a1 AF-C 优先选择 / a2 AF-S 优先选择 → 选「释放」\n" +
+            "· 或把镜头切到手动对焦（MF），相机就不再检查对焦"
+
+    /** 向遥控页上报拍摄阶段，让等待过程有解释（对焦 / 快门）。 */
+    private fun emitPhase(phase: String) = emit(mapOf("type" to "capturePhase", "phase" to phase))
+
     /** 实际生效的取景帧操作码（0x9202 / 0x9203 自动探测）。 */
     fun liveViewStart(): Map<String, Any?> {
         val c = need()
@@ -800,7 +826,14 @@ object CameraEngine {
     fun capture(): Map<String, Any?> {
         val c = need()
         drainCheckEvents()
-        var attempt = 0
+        // 对焦优先机型：先驱动一次 AF 并**等它稳定**，再按快门。
+        // 否则相机会在 AF 搜索期间返回 DeviceBusy，而重试又会打断 AF，形成死循环。
+        if (isManualFocus() != true && afDriveBlocking(c)) {
+            emitPhase("af")
+            Thread.sleep(AF_SETTLE_MS)
+        }
+        emitPhase("shutter")
+        var busyCount = 0
         var recovered = false
         val t0 = SystemClock.elapsedRealtime()
         while (true) {
@@ -809,26 +842,24 @@ object CameraEngine {
                 captureParams = captureParams ?: LongArray(0)
                 break
             } catch (e: PtpException) {
-                // 未对焦（相机设置"未对焦时禁止拍摄"）：明确提示并结束本次拍摄
+                // 未对焦：相机已明确告知对焦没锁上，直接给结论，不再重试
                 if (e.code == 0xA004) {
                     log("快门被拒：未完成对焦（0xA004）")
-                    throw IOException(
-                        "未完成对焦，快门已锁定（相机开启了「未对焦时禁止拍摄」）。" +
-                            "请半按相机快门完成对焦后再试",
-                    )
+                    throw IOException("未完成对焦，快门未释放。\n$FOCUS_PRIORITY_HINT")
                 }
-                if (e.code == Ptp.RESP_DEVICE_BUSY || e.code == 0x2002 || e.code == 0xA004) {
-                    attempt++
+                val busy = e.code == Ptp.RESP_DEVICE_BUSY || e.code == 0x2002
+                if (busy) {
+                    busyCount++
                     val elapsed = SystemClock.elapsedRealtime() - t0
-                    if (elapsed > 25_000) {
+                    if (elapsed > CAPTURE_BUDGET_MS) {
                         throw IOException(
-                            "相机持续忙碌，无法拍摄（已重试 $attempt 次 / ${elapsed / 1000}s）。" +
-                                "请查看相机屏幕是否有待处理提示",
+                            "快门在 ${elapsed / 1000}s 内始终未被释放（相机一直处于忙碌/未对焦）。\n" +
+                                FOCUS_PRIORITY_HINT,
                         )
                     }
-                    log("相机忙（${Ptp.respName(e.code)}），重试 $attempt（已 ${elapsed / 1000}s）")
-                    // 第 6 次起探测 SDRAM 待取图像：上一张未取走会导致快门持续被拒
-                    if (attempt >= 6) {
+                    log("相机忙（${Ptp.respName(e.code)}）第 $busyCount 次，已 ${elapsed / 1000}s")
+                    // SDRAM 待取图像假说：上一张未取走会让快门持续被拒
+                    if (busyCount == 2) {
                         val info = runCatching {
                             c.transact(Ptp.OP_GET_OBJECT_INFO, longArrayOf(0xFFFF0001L)).data
                         }.getOrNull()
@@ -838,14 +869,14 @@ object CameraEngine {
                         }
                     }
                     // 疑似误入实时取景状态：尝试退出恢复拍摄
-                    if (attempt == 8 && !recovered) {
+                    if (busyCount == 3 && !recovered) {
                         recovered = true
                         val ok = runCatching { c.transactShort(Ptp.OP_NIKON_LV_END, LongArray(0), 2000) }.isSuccess
-                        log(if (ok) "已尝试退出实时取景（0x9201 成功），恢复拍摄" else "0x9201 无效，跳过恢复")
+                        log(if (ok) "已尝试退出实时取景，恢复拍摄" else "退出取景无效，跳过恢复")
                     }
                     drainCheckEvents()
                     runCatching { c.transact(Ptp.OP_NIKON_DEVICE_READY) }
-                    Thread.sleep(500)
+                    Thread.sleep(BUSY_RETRY_MS)
                     continue
                 }
                 if (captureParams == null && e.code in intArrayOf(0x2005, 0x2006, 0x2007)) {
@@ -856,6 +887,7 @@ object CameraEngine {
                 throw e
             }
         }
+        emitPhase("done")
         log("遥控快门已触发")
         // 拍后异步排水：相机事件队列里通常有待处理的新照片事件
         Thread {
@@ -876,30 +908,34 @@ object CameraEngine {
     fun lvCapture(): Map<String, Any?> {
         val c = need()
         if (!liveViewOn) throw IOException("实时取景未开启")
+        // 与盲拍同一策略：先驱动一次 AF 并等它稳定，再按快门。
+        // 取景中驱动 AF 后立刻按快门，会撞上相机正在对焦的忙碌窗口。
+        if (isManualFocus() != true && afDriveBlocking(c)) {
+            emitPhase("af")
+            Thread.sleep(AF_SETTLE_MS)
+        }
+        emitPhase("shutter")
         var attempt = 0
         val t0 = SystemClock.elapsedRealtime()
         while (true) {
             try {
                 c.transact(Ptp.OP_INITIATE_CAPTURE, captureParams ?: LongArray(0))
                 captureParams = captureParams ?: LongArray(0)
+                emitPhase("done")
                 log("取景中快门已触发（0x100E）")
                 return mapOf("ok" to true)
             } catch (e: PtpException) {
                 if (e.code == 0xA004) {
-                    throw IOException(
-                        "相机对焦未锁定（对焦优先）。请半按相机快门对焦后再试，" +
-                            "或在相机菜单关闭「未对焦时禁止拍摄」",
-                    )
+                    throw IOException("相机对焦未锁定，快门未释放。\n$FOCUS_PRIORITY_HINT")
                 }
                 val busy = e.code == Ptp.RESP_DEVICE_BUSY || e.code == 0x2002
                 val paramErr = captureParams == null && e.code in intArrayOf(0x2005, 0x2006, 0x2007)
                 attempt++
                 val elapsed = SystemClock.elapsedRealtime() - t0
                 if (!busy && !paramErr) throw e
-                if (elapsed > 20_000) {
+                if (elapsed > CAPTURE_BUDGET_MS) {
                     throw IOException(
-                        "相机持续忙碌（${elapsed / 1000}s）。请半按相机快门对焦后再试，" +
-                            "或检查相机屏幕是否有待处理提示",
+                        "快门在 ${elapsed / 1000}s 内始终未被释放。\n$FOCUS_PRIORITY_HINT",
                     )
                 }
                 when (attempt) {
@@ -910,7 +946,7 @@ object CameraEngine {
                             Ptp.respName((r.exceptionOrNull() as? PtpException)?.code ?: -1))
                     }
                     2 -> {
-                        // AF 驱动（0x90C3，取景中可能被拒）
+                        // 再驱动一次 AF（0x90C3，取景中可能被拒）
                         runCatching { c.transact(0x90C3.toInt()) }
                     }
                     3 -> {
@@ -920,7 +956,8 @@ object CameraEngine {
                         }
                     }
                 }
-                Thread.sleep(400)
+                // 长间隔：与盲拍同理，短间隔重试会打断相机的对焦搜索
+                Thread.sleep(BUSY_RETRY_MS)
             }
         }
     }
@@ -1066,6 +1103,7 @@ object CameraEngine {
     fun probeLiveView5(handle: Long): List<String> = CameraProbes.probeLiveView5(handle)
 
     fun probeLvAf(handle: Long): List<String> = CameraProbes.probeLvAf(handle)
+
     // ------------------------------------------------------------ 已下载媒体管理
 
     /** 本地媒体缩略图（优先 ContentResolver.loadThumbnail，失败则整图解码缩小）。 */
