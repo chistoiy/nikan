@@ -36,6 +36,9 @@ object CameraEngine {
     private const val TAG = "NikonSync"
     const val DEFAULT_FRIENDLY_NAME = "Nikon Wireless Mobile Utility"
 
+    /** 拆除旧会话后、发起新握手前留给相机释放会话的时间 */
+    private const val SESSION_SETTLE_MS = 1500L
+
     private var appContext: Context? = null
     private var client: PtpIpClient? = null
     private val mainHandler = Handler(Looper.getMainLooper())
@@ -249,7 +252,21 @@ object CameraEngine {
     // ------------------------------------------------------------ 连接
 
     fun connect(ip: String, friendlyName: String): Map<String, Any?> {
+        // 已连同一台相机时直接返回：PTP/IP 一台相机只允许一个会话，立刻拆掉再握手
+        // 会让相机来不及释放旧会话，进而进入"连接失败"状态并关闭热点。
+        // 用户实测：主页连上后到调试面板再点一次连接，相机就断线了。
+        val cur = client
+        if (cur != null && deviceInfo != null && cameraIp == ip) {
+            log("已连接到 $ip，跳过重复握手")
+            return describeCamera(cur)
+        }
+        val hadSession = cur != null
         disconnectQuiet()
+        if (hadSession) {
+            // 换相机/强制重连：等相机释放上一个会话再发起新的握手
+            log("等待相机释放上一个会话（${SESSION_SETTLE_MS}ms）")
+            Thread.sleep(SESSION_SETTLE_MS)
+        }
         log("开始握手（friendlyName=\"$friendlyName\"）")
         val c = PtpIpClient(socketFactory(), ::log)
         try {
@@ -287,8 +304,13 @@ object CameraEngine {
         if (client !== c) throw IOException("握手完成后连接立即失效，请重试")
         startKeepAlive()
         KeepAliveService.start(appContext!!)
-        val di = c.deviceInfo ?: throw IOException("握手完成但未取得设备信息，请重试")
         emit(mapOf("type" to "status", "state" to "connected", "ip" to ip))
+        return describeCamera(c)
+    }
+
+    /** 相机信息（连接结果与"已连接"快路径共用）。 */
+    private fun describeCamera(c: PtpIpClient): Map<String, Any?> {
+        val di = c.deviceInfo ?: throw IOException("未取得设备信息，请重试")
         return mapOf(
             "manufacturer" to di.manufacturer,
             "model" to di.model,

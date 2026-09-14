@@ -146,10 +146,16 @@ class AppModel extends ChangeNotifier {
     }
   }
 
+  /// 是否由本模型自己发起连接。
+  /// 用于区分"主动连接"（返回后由这里初始化）与"其他入口连接成功"
+  /// （调试面板直连原生，只能靠 connected 事件初始化），避免重复枚举。
+  bool _connectingSelf = false;
+
   Future<void> connect(String ip) async {
     connState = 'connecting';
     connError = null;
     notifyListeners();
+    _connectingSelf = true;
     try {
       cameraInfo = await NikonEngine.connect(ip, 'Nikon Wireless Mobile Utility');
       await _afterConnected();
@@ -158,6 +164,8 @@ class AppModel extends ChangeNotifier {
       connError = e.toString();
       notifyListeners();
       rethrow;
+    } finally {
+      _connectingSelf = false;
     }
   }
 
@@ -166,6 +174,7 @@ class AppModel extends ChangeNotifier {
     connState = 'connecting';
     connError = null;
     notifyListeners();
+    _connectingSelf = true;
     try {
       cameraInfo = await NikonEngine.connectSmart();
       await _afterConnected();
@@ -174,6 +183,8 @@ class AppModel extends ChangeNotifier {
       connError = e.toString();
       notifyListeners();
       rethrow;
+    } finally {
+      _connectingSelf = false;
     }
   }
 
@@ -341,10 +352,16 @@ class AppModel extends ChangeNotifier {
         AppLog.add(map['line']?.toString() ?? '');
       case 'status':
         final state = map['state'];
-        if (state == 'disconnected' && connState != 'disconnected') {
-          connState = 'disconnected';
-          _indexRunning = false;
-          notifyListeners();
+        if (state == 'disconnected') {
+          if (connState != 'disconnected') {
+            connState = 'disconnected';
+            _indexRunning = false;
+            notifyListeners();
+          }
+        } else if (state == 'connected' && !_connectingSelf && connState != 'connected') {
+          // 相机连上了，但连接不是本模型发起的（调试面板直连原生）：
+          // 只能靠事件补齐状态与文件列表，否则相机已连上、相册页却显示"连接已断开"。
+          unawaited(_afterConnected());
         }
       case 'progress':
         if (downloading) {
