@@ -74,14 +74,7 @@ internal object PtpUsbProbe {
             val epOut = epOut ?: return out
 
             // ---- 1) OpenSession（USB 下无需握手、无需伪装 GUID）----
-            val open = command(conn, epIn, epOut, Ptp.OP_OPEN_SESSION, longArrayOf(1), log)
-            out += "OpenSession → ${Ptp.respName(open.first)}"
-            log("USB OpenSession → ${Ptp.respName(open.first)}")
-            // 会话已存在（重连场景）继续跑
-            if (open.first != Ptp.RESP_OK && open.first != Ptp.RESP_SESSION_ALREADY_OPEN) {
-                out += "会话打开失败，后续步骤跳过"
-                return out
-            }
+            if (!openSession(conn, epIn, epOut, log, out)) return out
 
             // ---- 2) GetDeviceInfo：顺带对比操作集大小 ----
             val (code, payload) = command(conn, epIn, epOut, Ptp.OP_GET_DEVICE_INFO, LongArray(0), log)
@@ -205,6 +198,9 @@ internal object PtpUsbProbe {
         out += "接口已占用，Bulk 端点就绪（in 0x%02X / out 0x%02X）".format(
             ein.address, eout.address,
         )
+        // 设备插入时系统 MTP 服务往往已经嗅探过它，IN 端点里可能留有响应包；
+        // 先清干净，否则后续每次读都可能先读到陈数据
+        drainInput(c, ein, log)
         return Unit
     }
 
@@ -309,6 +305,66 @@ internal object PtpUsbProbe {
         log("USB 资源已释放")
     }
 
+    /**
+     * 打开会话。
+     *
+     * 实测遇到过相机直接回 `SessionAlreadyOpen`，而紧接着的 GetDeviceInfo **完全收不到响应**——
+     * 说明相机上有个残留会话（很可能是 Android 的 MTP 服务在设备插入时嗅探建立的），
+     * 它挡住了不属于它的后续操作。因此这里不把 SessionAlreadyOpen 当"可以用"，
+     * 而是主动 CloseSession 后重开。
+     */
+    private fun openSession(
+        c: UsbDeviceConnection,
+        ein: UsbEndpoint,
+        eout: UsbEndpoint,
+        log: (String) -> Unit,
+        out: MutableList<String>,
+    ): Boolean {
+        val (code, _) = command(c, ein, eout, Ptp.OP_OPEN_SESSION, longArrayOf(1), log)
+        out += "OpenSession → ${Ptp.respName(code)}"
+        log("USB OpenSession → ${Ptp.respName(code)}")
+        if (code == Ptp.RESP_OK) return true
+
+        if (code == Ptp.RESP_SESSION_ALREADY_OPEN) {
+            out += "相机上已有残留会话（多为系统 MTP 服务建立），先关闭再重开"
+            val (closeCode, _) = runCatching {
+                command(c, ein, eout, Ptp.OP_CLOSE_SESSION, LongArray(0), log)
+            }.getOrElse { Ptp.RESP_OK to ByteArray(0) }
+            log("USB CloseSession → ${Ptp.respName(closeCode)}")
+            out += "CloseSession → ${Ptp.respName(closeCode)}"
+            Thread.sleep(400) // 给相机释放会话的时间
+            drainInput(c, ein, log)
+            val (again, _) = command(c, ein, eout, Ptp.OP_OPEN_SESSION, longArrayOf(1), log)
+            out += "重新 OpenSession → ${Ptp.respName(again)}"
+            log("USB 重新 OpenSession → ${Ptp.respName(again)}")
+            if (again == Ptp.RESP_OK) return true
+        }
+        out += "会话打开失败，后续步骤跳过"
+        return false
+    }
+
+    /**
+     * 清掉 IN 端点里可能残留的数据。
+     * 设备插入时 Android 的 MTP 服务会去嗅探，可能留下响应包；不清掉的话
+     * 后续每次读都可能先读到这些陈数据，表现为"响应错配"或超时。
+     */
+    private fun drainInput(
+        c: UsbDeviceConnection,
+        ein: UsbEndpoint,
+        log: (String) -> Unit,
+    ) {
+        val buf = ByteArray(16 shl 10)
+        var total = 0
+        var rounds = 0
+        while (rounds < 30) {
+            val n = runCatching { c.bulkTransfer(ein, buf, buf.size, 300) }.getOrDefault(-1)
+            if (n <= 0) break
+            total += n
+            rounds++
+        }
+        if (total > 0) log("USB 清掉 IN 端点残留数据 $total 字节（$rounds 次）")
+    }
+
     // ------------------------------------------------------------ 事务
 
     private fun nextTxn(): Long = (++txnId) and 0x7FFFFFFFL
@@ -352,7 +408,26 @@ internal object PtpUsbProbe {
         }
     }
 
+    /**
+     * 读容器头，带重试。
+     * 系统 MTP 服务可能同时在读同一个 IN 端点、或插入时留下陈数据，
+     * 表现为单次读超时。重试一次比直接判失败更贴近实情，也便于从日志区分
+     * "偶发抢读"与"链路真死"。
+     */
     private fun readHeader(c: UsbDeviceConnection, ein: UsbEndpoint): UsbHeader {
+        var last: IOException? = null
+        for (attempt in 1..3) {
+            try {
+                return readHeaderOnce(c, ein)
+            } catch (e: IOException) {
+                last = e
+                if (attempt < 3) Thread.sleep(250)
+            }
+        }
+        throw last ?: IOException("USB 读取失败")
+    }
+
+    private fun readHeaderOnce(c: UsbDeviceConnection, ein: UsbEndpoint): UsbHeader {
         val h = ByteArray(HEADER_BYTES)
         readFully(c, ein, h, HEADER_BYTES)
         val len = PtpWire.getU32(h, 0)

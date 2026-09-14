@@ -421,7 +421,20 @@ class _DebugPanelState extends State<DebugPanel> {
               label: const Text('开始 USB 测速'),
             ),
             if (_usbResult != null) ...[
-              const SizedBox(height: 10),
+              const SizedBox(height: 8),
+              Row(
+                children: [
+                  const Text('探测结果', style: TextStyle(fontSize: 12, color: Colors.white54)),
+                  const Spacer(),
+                  // 结果必须能一键复制：用户要把它贴出来反馈，
+                  // 而这块内容不在日志面板里，没有复制入口就只能手打
+                  TextButton.icon(
+                    onPressed: _copyUsbResult,
+                    icon: const Icon(Icons.copy_all_outlined, size: 16),
+                    label: const Text('复制结果', style: TextStyle(fontSize: 12)),
+                  ),
+                ],
+              ),
               Container(
                 width: double.infinity,
                 padding: const EdgeInsets.all(10),
@@ -429,23 +442,35 @@ class _DebugPanelState extends State<DebugPanel> {
                   color: Colors.white.withValues(alpha: 0.05),
                   borderRadius: BorderRadius.circular(8),
                 ),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    for (final l in _usbResult!)
-                      Padding(
-                        padding: const EdgeInsets.symmetric(vertical: 1),
-                        child: Text(l,
-                            style: const TextStyle(
-                                fontFamily: 'monospace', fontSize: 11.5, height: 1.4)),
-                      ),
-                  ],
+                child: SelectionArea(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      for (final l in _usbResult!)
+                        Padding(
+                          padding: const EdgeInsets.symmetric(vertical: 1),
+                          child: Text(l,
+                              style: const TextStyle(
+                                  fontFamily: 'monospace', fontSize: 11.5, height: 1.4)),
+                        ),
+                    ],
+                  ),
                 ),
               ),
             ],
           ],
         ),
       );
+
+  Future<void> _copyUsbResult() async {
+    final lines = _usbResult;
+    if (lines == null) return;
+    await Clipboard.setData(ClipboardData(text: lines.join('\n')));
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(content: Text('USB 探测结果已复制'), duration: Duration(seconds: 1)),
+    );
+  }
 
   Widget _wifiCard(ColorScheme cs) {
     final onWifi = _wifi?['onWifi'] == true;
