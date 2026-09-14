@@ -370,6 +370,48 @@ internal object PtpUsbProbe {
     private fun nextTxn(): Long = (++txnId) and 0x7FFFFFFFL
 
     /**
+     * 发送一个容器，失败时清除端点 STALL 后重试一次。
+     *
+     * USB 设备对不接受的数据会把端点置于 STALL 状态，此后所有 `bulkTransfer` 都返回 -1，
+     * 且**不会自行恢复**——必须由主机发 CLEAR_FEATURE(ENDPOINT_HALT) 清除。
+     * 实测就在 CloseSession 之后的下一笔命令上撞到了（发送返回 -1/16）。
+     */
+    private fun sendContainer(
+        c: UsbDeviceConnection,
+        eout: UsbEndpoint,
+        buf: ByteArray,
+        what: String,
+        log: (String) -> Unit,
+    ) {
+        var sent = runCatching { c.bulkTransfer(eout, buf, buf.size, BULK_TIMEOUT_MS) }.getOrDefault(-1)
+        if (sent != buf.size) {
+            log("USB $what 发送失败（$sent/${buf.size}），清除端点 STALL 后重试")
+            clearHalt(c, eout, log)
+            Thread.sleep(200)
+            sent = runCatching { c.bulkTransfer(eout, buf, buf.size, BULK_TIMEOUT_MS) }.getOrDefault(-1)
+        }
+        if (sent != buf.size) {
+            throw IOException("$what 发送不完整（$sent/${buf.size}）——端点被 STALL 且清除后仍失败")
+        }
+    }
+
+    /** 清除端点 STALL：标准请求 CLEAR_FEATURE(ENDPOINT_HALT)。 */
+    private fun clearHalt(c: UsbDeviceConnection, ep: UsbEndpoint, log: (String) -> Unit) {
+        val r = runCatching {
+            c.controlTransfer(
+                0x02, // 主机→设备 / 标准 / 接收方为端点
+                0x01, // CLEAR_FEATURE
+                0x0000, // ENDPOINT_HALT
+                ep.address,
+                null,
+                0,
+                1_000,
+            )
+        }.getOrDefault(-1)
+        log("USB 清除端点 0x%02X 的 STALL → $r".format(ep.address))
+    }
+
+    /**
      * 只发命令 + 收响应（数据阶段必须为空）。
      * 返回 (响应码, 响应载荷)，载荷为去掉 12 字节容器头之后的参数区。
      */
@@ -388,8 +430,7 @@ internal object PtpUsbProbe {
         PtpWire.putU16(buf, 6, op)
         PtpWire.putU32(buf, 8, txn)
         params.forEachIndexed { i, v -> PtpWire.putU32(buf, HEADER_BYTES + i * 4, v) }
-        val sent = c.bulkTransfer(eout, buf, buf.size, BULK_TIMEOUT_MS)
-        if (sent != buf.size) throw IOException("命令发送不完整（$sent/${buf.size}）")
+        sendContainer(c, eout, buf, "命令 0x" + "%04X".format(op), log)
 
         while (true) {
             val h = readHeader(c, ein)
@@ -529,9 +570,7 @@ internal object PtpUsbProbe {
         PtpWire.putU16(cmd, 6, Ptp.OP_GET_OBJECT)
         PtpWire.putU32(cmd, 8, txn)
         PtpWire.putU32(cmd, HEADER_BYTES, handle)
-        if (c.bulkTransfer(eout, cmd, cmd.size, BULK_TIMEOUT_MS) != cmd.size) {
-            throw IOException("GetObject 命令发送不完整")
-        }
+        sendContainer(c, eout, cmd, "GetObject 命令", log)
 
         var total = 0L
         var firstBytes: ByteArray? = null
