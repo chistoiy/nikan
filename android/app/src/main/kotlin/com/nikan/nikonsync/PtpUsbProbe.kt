@@ -136,6 +136,19 @@ internal object PtpUsbProbe {
             return null
         }
         val devs = mgr.deviceList.values.toList()
+        // 一个设备都没有是最常见的情况，且**与应用无关**——必须给出分诊提示，
+        // 否则用户会以为是自己设置错或应用有 bug。
+        if (devs.isEmpty()) {
+            out += "USB 主机侧未发现任何设备。这一步与应用无关，请按顺序排查："
+            out += "①小米的 OTG 总开关：设置 → 更多设置 → OTG 连接。" +
+                "部分 MIUI 默认关闭，且「10 分钟无操作自动关闭」——关着的话主机侧什么都看不到"
+            out += "②相机不能在「连接至智能设备」模式：该模式下 USB 口通常只供电不暴露数据，" +
+                "需退回普通拍摄模式"
+            out += "③相机 USB 设置选「MTP/PTP」档位"
+            out += "④线材需为数据线；注意手机只有一个 USB-C 口时，插上 OTG 设备会占用该口，" +
+                "此时电脑端 adb 会断开——属正常现象，日志请在 App 的日志面板里复制"
+            return null
+        }
         out += "USB 设备数：${devs.size}"
         // 每个接口的 class/subclass/protocol 都打出来：尼康 USB 设置只有「MTP/PTP」
         // 一个合并档位（没有单独的 PTP 选项），接口形态未必是标准的 class6/sub1/proto1。
