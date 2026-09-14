@@ -137,21 +137,33 @@ internal object PtpUsbProbe {
         }
         val devs = mgr.deviceList.values.toList()
         out += "USB 设备数：${devs.size}"
+        // 每个接口的 class/subclass/protocol 都打出来：尼康 USB 设置只有「MTP/PTP」
+        // 一个合并档位（没有单独的 PTP 选项），接口形态未必是标准的 class6/sub1/proto1。
+        // 一次日志就能定论该按什么匹配——这决定方案是否成立。
         devs.forEach { d ->
             out += "· ${d.deviceName} vid=0x%04X pid=0x%04X 接口=${d.interfaceCount}".format(
                 d.vendorId, d.productId,
             )
+            for (i in 0 until d.interfaceCount) {
+                val it = d.getInterface(i)
+                out += "    接口$i：class=0x%02X sub=0x%02X proto=0x%02X 端点=${it.endpointCount}".format(
+                    it.interfaceClass, it.interfaceSubclass, it.interfaceProtocol,
+                )
+            }
         }
-        // 优先找 PTP 接口的设备；找不到就报明原因——这决定方案是否成立
-        val target = devs.firstOrNull { findPtpInterface(it) != null }
+        val target = devs.firstOrNull { pickStillImageInterface(it) != null }
         if (target == null) {
-            out += "未发现 PTP 接口设备。请确认：①相机 USB 模式已设为 PTP（不是 MTP）" +
+            out += "未发现 Still Image 类接口（class 6 / subclass 1）。请确认：" +
+                "①相机 USB 设置选了「MTP/PTP」这个档位" +
                 " ②相机已退出「连接至智能设备」 ③USB 线支持数据传输（不是纯充电线）"
             return null
         }
         device = target
-        val ptp = findPtpInterface(target) ?: return null
-        out += "找到 PTP 接口：${target.deviceName} 接口${ptp.id}"
+        val ptp = pickStillImageInterface(target) ?: return null
+        out += "选用接口：${target.deviceName} 接口${ptp.id}" +
+            "（class=0x%02X sub=0x%02X proto=0x%02X）".format(
+                ptp.interfaceClass, ptp.interfaceSubclass, ptp.interfaceProtocol,
+            )
 
         if (!ensurePermission(ctx, mgr, target, log, out)) return null
         val c = mgr.openDevice(target)
@@ -183,15 +195,23 @@ internal object PtpUsbProbe {
         return Unit
     }
 
-    private fun findPtpInterface(d: UsbDevice): UsbInterface? {
+    /**
+     * 选 Still Image 接口。
+     *
+     * 尼康 Z 机身的 USB 设置只有「MTP/PTP」一个合并档位，**没有单独的 PTP 选项**。
+     * MTP 是 PTP 的超集（USB 设备类上同为 Still Image），主机端自行决定说哪种协议，
+     * 因此同一档位下接口的 protocol 字段未必是 1。
+     * 所以：先按 class6/sub1/proto1 精确匹配，找不到再放宽到 class6/sub1 任意 protocol。
+     */
+    private fun pickStillImageInterface(d: UsbDevice): UsbInterface? {
+        var fallback: UsbInterface? = null
         for (i in 0 until d.interfaceCount) {
             val it = d.getInterface(i)
-            // PTP 静态接口：class 6 (Still Image) / subclass 1 / protocol 1
-            if (it.interfaceClass == 6 && it.interfaceSubclass == 1 && it.interfaceProtocol == 1) {
-                return it
-            }
+            if (it.interfaceClass != 6 || it.interfaceSubclass != 1) continue
+            if (it.interfaceProtocol == 1) return it
+            if (fallback == null) fallback = it
         }
-        return null
+        return fallback
     }
 
     private fun findBulk(it: UsbInterface, dir: Int): UsbEndpoint? {
