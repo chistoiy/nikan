@@ -100,13 +100,8 @@ class _DebugPanelState extends State<DebugPanel> {
       run: (_) => NikonEngine.probeLvFrames(),
     ),
     _Probe(
-      // 会自行占用 USB 接口并打开 PTP 会话：若当前是 Wi-Fi 已连接状态，
-      // 相机可能因"同时只允许一个会话"而断开 Wi-Fi——所以标签里直接写明白
-      label: 'USB:吞吐测速（会中断 Wi-Fi）',
-      detail: 'USB 连接模式 U0 实验（设备枚举 / 打开会话 / 操作集对比 / 实测 MB/s）',
-      run: (_) => NikonEngine.usbProbe(),
-    ),
-    _Probe(
+      // USB 测速不放这里：它是独立实验，有自己的卡片（_usbCard）。
+      // 埋在十几个按钮的最后一位等于没人找得到——上一轮就发生过。
       label: '试验:取景2',
       detail: '实时取景链路探针2（0x9206→拉帧→0x9201）',
       run: (_) => NikonEngine.probeLiveView2(),
@@ -369,6 +364,8 @@ class _DebugPanelState extends State<DebugPanel> {
         ]),
         _wifiCard(cs),
         const SizedBox(height: 12),
+        _usbCard(),
+        const SizedBox(height: 12),
         _connectCard(),
         const SizedBox(height: 12),
         _cameraCard(),
@@ -385,6 +382,70 @@ class _DebugPanelState extends State<DebugPanel> {
 
   TextStyle get _hint =>
       TextStyle(color: Colors.white.withValues(alpha: 0.55), fontSize: 12, height: 1.4);
+
+  /// USB 实验的结论：直接显示在卡片里，不必去日志面板翻找
+  List<String>? _usbResult;
+
+  Future<void> _runUsbProbe() async {
+    setState(() => _usbResult = const ['正在探测…若弹出系统授权对话框，请点「允许」']);
+    await _run('USB 连接模式：设备枚举 / 会话 / 操作集 / 测速', () async {
+      final lines = await NikonEngine.usbProbe();
+      if (mounted) setState(() => _usbResult = lines);
+    });
+  }
+
+  /// USB 连接模式实验卡片。
+  ///
+  /// 单独成卡而不是塞进上面的探针按钮网：它是独立实验、有前置条件、结果需要直接看到。
+  /// 会占用 USB 口并打开 PTP 会话——插着相机时手机这个口就被占住，电脑端 adb 会断开，属正常。
+  Widget _usbCard() => AppCard(
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text('USB 连接（实验）',
+                style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600)),
+            const SizedBox(height: 6),
+            Text(
+              '目的：测出 USB 模式下的真实传输速度（Wi-Fi 实测 2.4MB/s，'
+              'USB 理论上快一个数量级）。\n'
+              '开工前确认：①手机 OTG 已开（小米在 设置 → 更多设置 → OTG 连接）'
+              '②相机退出「连接至智能设备」③相机 USB 选「MTP/PTP」档④数据线（非纯充电线）。\n'
+              '注意：会占用 USB 口并开 PTP 会话，相机同时只允许一个会话，'
+              '插着相机时电脑 adb 会断开——属正常现象。',
+              style: _hint,
+            ),
+            const SizedBox(height: 10),
+            FilledButton.icon(
+              onPressed: _busy ? null : _runUsbProbe,
+              icon: const Icon(Icons.usb, size: 18),
+              label: const Text('开始 USB 测速'),
+            ),
+            if (_usbResult != null) ...[
+              const SizedBox(height: 10),
+              Container(
+                width: double.infinity,
+                padding: const EdgeInsets.all(10),
+                decoration: BoxDecoration(
+                  color: Colors.white.withValues(alpha: 0.05),
+                  borderRadius: BorderRadius.circular(8),
+                ),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    for (final l in _usbResult!)
+                      Padding(
+                        padding: const EdgeInsets.symmetric(vertical: 1),
+                        child: Text(l,
+                            style: const TextStyle(
+                                fontFamily: 'monospace', fontSize: 11.5, height: 1.4)),
+                      ),
+                  ],
+                ),
+              ),
+            ],
+          ],
+        ),
+      );
 
   Widget _wifiCard(ColorScheme cs) {
     final onWifi = _wifi?['onWifi'] == true;
