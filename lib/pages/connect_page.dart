@@ -229,6 +229,13 @@ class _ConnectPageState extends State<ConnectPage> {
         ),
         const SizedBox(height: 12),
         OutlinedButton(
+          onPressed: model.connState == 'connecting'
+              ? null
+              : () => model.connectUsb().catchError((e) => _snack('USB 连接失败：$e')),
+          child: const Text('USB 数据线连接（高速下载，实测 27 MB/s）'),
+        ),
+        const SizedBox(height: 12),
+        OutlinedButton(
           onPressed: () => model.openWifiSettings(),
           child: const Text('打开手机 Wi-Fi 设置'),
         ),

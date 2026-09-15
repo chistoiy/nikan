@@ -127,6 +127,12 @@ class _DebugPanelState extends State<DebugPanel> {
       run: NikonEngine.probeLvAf,
     ),
     _Probe(
+      label: '属性码Dump',
+      detail: '读取全部设备属性（确认档位/光圈/快门/ISO 属性码与可选集）',
+      needsFiles: false,
+      run: (_) => NikonEngine.probeProps(),
+    ),
+    _Probe(
       label: '试验:取景5',
       detail: '取景热身轮询（最长 45 秒，期间请观察相机屏幕）',
       needsFiles: true,

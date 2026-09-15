@@ -13,6 +13,13 @@ import java.net.SocketTimeoutException
 import java.util.concurrent.atomic.AtomicInteger
 import javax.net.SocketFactory
 
+/** 兼容旧引用：事务结果统一为 [PtpSession.TransactResult]。 */
+typealias TransactResult = PtpSession.TransactResult
+
+/** 兼容旧引用：下载模式统一为 [PtpSession.DlMode]。 */
+typealias DlMode = PtpSession.DlMode
+
+
 /**
  * PTP/IP 客户端：持有命令与事件两条 TCP 连接（端口 15740），
  * 串行化 PTP 事务，后台线程读取相机事件。
@@ -23,7 +30,7 @@ import javax.net.SocketFactory
 class PtpIpClient(
     private val socketFactory: SocketFactory?,
     private val log: (String) -> Unit,
-) {
+) : PtpSession {
     companion object {
         const val PORT = 15740
         const val DIAL_TIMEOUT_MS = 10_000
@@ -40,8 +47,6 @@ class PtpIpClient(
         private const val PROP_FLUSH_MS = 2_000L
     }
 
-    class TransactResult(val responseCode: Int, val params: LongArray, val data: ByteArray)
-
     private var cmd: Socket? = null
     private var evt: Socket? = null
     private var cmdIn: InputStream? = null
@@ -54,15 +59,15 @@ class PtpIpClient(
     /** 事务超时后命令流已错位且无法安全恢复，此连接作废（需重新连接）。 */
     @Volatile private var streamDesynced = false
 
-    var deviceInfo: DeviceInfo? = null
+    override var deviceInfo: DeviceInfo? = null
         private set
-    var cameraName: String = ""
+    override var cameraName: String = ""
         private set
 
-    @Volatile var eventHandler: ((Int, LongArray) -> Unit)? = null
-    @Volatile var disconnectHandler: ((String) -> Unit)? = null
+    @Volatile override var eventHandler: ((Int, LongArray) -> Unit)? = null
+    @Volatile override var disconnectHandler: ((String) -> Unit)? = null
 
-    val isConnected: Boolean get() = cmd != null && deviceInfo != null
+    override val isConnected: Boolean get() = cmd != null && deviceInfo != null
 
     // ---------------------------------------------------------------- 连接
 
@@ -79,7 +84,7 @@ class PtpIpClient(
      * 完整连接流程：命令连接握手 → 事件连接绑定 → 启动事件读取 →
      * OpenSession → GetDeviceInfo。任何一步失败都会清理并抛出 IOException。
      */
-    fun connect(host: String, friendlyName: String) {
+    override fun connect(host: String, friendlyName: String) {
         synchronized(txnLock) {
             check(cmd == null) { "客户端已连接" }
             closing = false
@@ -182,7 +187,7 @@ class PtpIpClient(
         deviceInfo = null
     }
 
-    fun close() {
+    override fun close() {
         val c: Socket?
         synchronized(txnLock) {
             c = cmd
@@ -208,9 +213,9 @@ class PtpIpClient(
     // ---------------------------------------------------------------- 事务
 
     /** 内存式事务：返回响应参数与完整数据。 */
-    fun transact(op: Int, params: LongArray = LongArray(0)): TransactResult {
+    override fun transact(op: Int, params: LongArray): TransactResult {
         val bos = ByteArrayOutputStream(1 shl 16)
-        val res = doTransact(op, params) { chunk, _, _ -> bos.write(chunk) }
+        val res = doTransact(op, params, { chunk, _, _ -> bos.write(chunk) })
         return TransactResult(res.responseCode, res.params, bos.toByteArray())
     }
 
@@ -220,24 +225,25 @@ class PtpIpClient(
         params: LongArray,
         out: OutputStream,
         onProgress: (received: Long, total: Long) -> Unit,
-    ): TransactResult = doTransact(op, params) { chunk, received, total ->
+    ): TransactResult = doTransact(op, params, { chunk, received, total ->
         out.write(chunk)
         out.flush()
         onProgress(received, total)
-    }
+    })
 
     /** 下载模式：运行时探测后锁定，失败可降级。 */
-    enum class DlMode { HISPEED, PARTIAL, FULL }
+    override fun transactWithDataOut(op: Int, params: LongArray, data: ByteArray): TransactResult =
+        doTransact(op, params, null, data)
 
     @Volatile private var dlMode: DlMode? = null
 
     /** 高速通道实际生效的操作码（0x9400~0x9406 之一）。 */
     @Volatile private var hiSpeedOp: Int = 0
 
-    val effectiveDlMode: DlMode get() = dlMode ?: DlMode.PARTIAL
+    override val effectiveDlMode: DlMode get() = dlMode ?: DlMode.PARTIAL
 
     /** 分块下载失败后强制降级为整文件下载。 */
-    fun degradeToFullDownload() {
+    override fun degradeToFullDownload() {
         if (dlMode != DlMode.FULL) log("下载模式已降级为整文件 GetObject")
         dlMode = DlMode.FULL
     }
@@ -291,7 +297,7 @@ class PtpIpClient(
      * 返回值必须由调用方与 GetObjectInfo 得到的 size 比对：分块模式下相机可能
      * 少传数据就结束，若按请求长度推进偏移就会静默丢数据，而文件被当成完整保存。
      */
-    fun getObjectToStream(
+    override fun getObjectToStream(
         handle: Long,
         size: Long,
         out: OutputStream,
@@ -318,10 +324,10 @@ class PtpIpClient(
      */
     private fun writeChunk(out: OutputStream, op: Int, handle: Long, offset: Long, want: Long): Long {
         var written = 0L
-        val res = doTransact(op, longArrayOf(handle, offset, want)) { chunk, _, _ ->
+        val res = doTransact(op, longArrayOf(handle, offset, want), { chunk, _, _ ->
             out.write(chunk)
             written += chunk.size
-        }
+        })
         out.flush()
         if (res.params.isNotEmpty()) {
             val declared = res.params[0]
@@ -341,7 +347,7 @@ class PtpIpClient(
         onProgress: (received: Long, total: Long) -> Unit,
     ): Long {
         var written = 0L
-        doTransact(op, params) { chunk, _, total ->
+        doTransact(op, params, { chunk, _, total ->
             out.write(chunk)
             written += chunk.size
             val span = if (total > 0) total else size
@@ -349,7 +355,7 @@ class PtpIpClient(
                 lastProgressNotified = written
                 onProgress(written, span)
             }
-        }
+        })
         out.flush()
         return written
     }
@@ -382,21 +388,21 @@ class PtpIpClient(
      * 命令流无法安全恢复，因此**一次超时就会把该连接标记为作废**并触发断线回调，
      * 需要重新连接。调用方要接受"这次调用之后连接可能已失效"。
      */
-    fun transactShort(op: Int, params: LongArray = LongArray(0), timeoutMs: Int = 3000): TransactResult =
+    override fun transactShort(op: Int, params: LongArray, timeoutMs: Int): TransactResult =
         synchronized(txnLock) {
             val c = cmd ?: throw IOException("未连接相机")
             val prev = c.soTimeout
             c.soTimeout = timeoutMs
             try {
                 val bos = ByteArrayOutputStream(1 shl 16)
-                val res = doTransactLocked(op, params) { chunk, _, _ -> bos.write(chunk) }
+                val res = doTransactLocked(op, params, { chunk, _, _ -> bos.write(chunk) })
                 TransactResult(res.responseCode, res.params, bos.toByteArray())
             } finally {
                 c.soTimeout = prev
             }
         }
 
-    fun getThumbnailBytes(handle: Long): ByteArray = try {
+    override fun getThumbnailBytes(handle: Long): ByteArray = try {
         transact(Ptp.OP_NIKON_GET_LARGE_THUMB, longArrayOf(handle)).data
     } catch (e: PtpException) {
         log("大缩略图不可用（${e.message}），回退 GetThumb")
@@ -407,8 +413,9 @@ class PtpIpClient(
         op: Int,
         params: LongArray,
         onChunk: ((ByteArray, Long, Long) -> Unit)?,
+        dataOut: ByteArray? = null,
     ): TransactResult = synchronized(txnLock) {
-        doTransactLocked(op, params, onChunk)
+        doTransactLocked(op, params, onChunk, dataOut)
     }
 
     /** 必须持有 txnLock（连接流程内为可重入调用）。 */
@@ -416,6 +423,7 @@ class PtpIpClient(
         op: Int,
         params: LongArray,
         onChunk: ((ByteArray, Long, Long) -> Unit)?,
+        dataOut: ByteArray? = null,
     ): TransactResult {
         // 一次超时就会让流里残留半个包，之后每个事务都解析错位。
         // 继续用只会拿到静默错误的结果（比断开更危险），因此直接拒绝后续请求。
@@ -424,11 +432,30 @@ class PtpIpClient(
         val cout = cmdOut ?: throw IOException("未连接相机")
         val txn = txnCounter.incrementAndGet() and 0x7FFFFFFF
         val req = ByteArray(10 + params.size * 4)
-        PtpWire.putU32(req, 0, 1) // data phase: 无 / 仅数据入
+        PtpWire.putU32(req, 0, if (dataOut != null) 2 else 1) // data phase: 无/数据入=1，数据出=2
         PtpWire.putU16(req, 4, op)
         PtpWire.putU32(req, 6, txn.toLong())
         params.forEachIndexed { i, v -> PtpWire.putU32(req, 10 + i * 4, v) }
         PtpWire.writePacket(cout, Ptp.PKT_OPERATION_REQUEST, req)
+        // 数据外发：StartData(total) → Data(offset+data)… → EndData(offset+尾块)。
+        // SetDevicePropDesc 这类小数据（≤5B）用一包 Data 全量 + 空 EndData 收尾。
+        if (dataOut != null) {
+            val start = ByteArray(8)
+            PtpWire.putU64(start, 0, dataOut.size.toLong())
+            PtpWire.writePacket(cout, Ptp.PKT_START_DATA, start)
+            var off = 0
+            while (off < dataOut.size) {
+                val n = minOf(4096, dataOut.size - off)
+                val pkt = ByteArray(4 + n)
+                PtpWire.putU32(pkt, 0, off.toLong())
+                dataOut.copyInto(pkt, 4, off, off + n)
+                PtpWire.writePacket(cout, Ptp.PKT_DATA, pkt)
+                off += n
+            }
+            val end = ByteArray(4)
+            PtpWire.putU32(end, 0, off.toLong())
+            PtpWire.writePacket(cout, Ptp.PKT_END_DATA, end)
+        }
 
         var total = -1L
         var received = 0L
@@ -472,7 +499,7 @@ class PtpIpClient(
     // ---------------------------------------------------------------- 事件
 
     /** 主动通知连接已死（保活探针等场景），每次连接只触发一次断线回调。 */
-    fun notifyLinkDead(reason: String) {
+    override fun notifyLinkDead(reason: String) {
         if (!linkDeadNotified && !closing) {
             linkDeadNotified = true
             log("连接失效：$reason")

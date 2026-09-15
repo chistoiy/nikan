@@ -169,6 +169,25 @@ class AppModel extends ChangeNotifier {
     }
   }
 
+  /// USB 连接：相机经数据线直连手机，走 PTP/USB 传输层（27.1 MB/s）
+  Future<void> connectUsb() async {
+    connState = 'connecting';
+    connError = null;
+    notifyListeners();
+    _connectingSelf = true;
+    try {
+      cameraInfo = await NikonEngine.connectUsb('Nikon Wireless Mobile Utility');
+      await _afterConnected();
+    } catch (e) {
+      connState = 'disconnected';
+      connError = e.toString();
+      notifyListeners();
+      rethrow;
+    } finally {
+      _connectingSelf = false;
+    }
+  }
+
   /// 主流程入口：无需先扫描，直接对网关（相机）握手
   Future<void> connectSmart() async {
     connState = 'connecting';

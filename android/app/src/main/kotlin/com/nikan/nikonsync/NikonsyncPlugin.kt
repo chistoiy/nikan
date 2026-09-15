@@ -144,6 +144,13 @@ object NikonsyncPlugin {
                                     ?: CameraEngine.DEFAULT_FRIENDLY_NAME,
                             )
                         }
+                        "connectUsb" -> {
+                            val args = call.arguments as Map<*, *>
+                            CameraEngine.connectUsb(
+                                (args["friendlyName"] as? String)
+                                    ?: CameraEngine.DEFAULT_FRIENDLY_NAME,
+                            )
+                        }
                         "disconnect" -> {
                             CameraEngine.disconnect()
                             true
@@ -202,6 +209,14 @@ object NikonsyncPlugin {
                         "lvCapture" -> CameraEngine.lvCapture()
                         "afDrive" -> CameraEngine.afDrive()
                         "shotParams" -> CameraEngine.shotParams()
+                        "setShotParam" -> {
+                            val args = call.arguments as Map<*, *>
+                            CameraEngine.setShotParam(
+                                args["name"] as String,
+                                (args["value"] as Number).toLong(),
+                            )
+                        }
+                        "probeProps" -> CameraEngine.probeProps()
                         "probeHiSpeed" -> {
                             val args = call.arguments as Map<*, *>
                             CameraEngine.probeHiSpeed((args["handle"] as Number).toLong())

@@ -28,6 +28,11 @@ object PtpWire {
         b[off + 1] = ((v shr 8) and 0xFF).toByte()
     }
 
+    fun putU64(b: ByteArray, off: Int, v: Long) {
+        putU32(b, off, v and 0xFFFFFFFFL)
+        putU32(b, off + 4, (v ushr 32) and 0xFFFFFFFFL)
+    }
+
     fun putU32(b: ByteArray, off: Int, v: Long) {
         b[off] = (v and 0xFF).toByte()
         b[off + 1] = ((v shr 8) and 0xFF).toByte()

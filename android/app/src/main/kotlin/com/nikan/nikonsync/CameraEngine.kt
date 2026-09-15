@@ -40,7 +40,7 @@ object CameraEngine {
     private const val SESSION_SETTLE_MS = 1500L
 
     private var appContext: Context? = null
-    internal var client: PtpIpClient? = null
+    internal var client: PtpSession? = null
     private val mainHandler = Handler(Looper.getMainLooper())
 
     @Volatile private var sink: EventChannel.EventSink? = null
@@ -268,7 +268,7 @@ object CameraEngine {
             Thread.sleep(SESSION_SETTLE_MS)
         }
         log("开始握手（friendlyName=\"$friendlyName\"）")
-        val c = PtpIpClient(socketFactory(), ::log)
+        val c: PtpSession = PtpIpClient(socketFactory(), ::log)
         try {
             c.connect(ip, friendlyName)
         } catch (e: Exception) {
@@ -316,8 +316,67 @@ object CameraEngine {
         return describeCamera(c)
     }
 
+    /**
+     * USB 连接：同一套上层逻辑（枚举/下载/遥控）直接跑在 PTP/USB 传输层上。
+     * 实测吞吐 27.1 MB/s（Wi-Fi 的 11 倍，见 docs/USB连接方案.md §1）。
+     * 会弹系统 USB 权限对话框，需要用户点一次「允许」。
+     */
+    fun connectUsb(friendlyName: String): Map<String, Any?> {
+        val cur = client
+        if (cur is PtpUsbClient && cur.isConnected) {
+            log("已连接 USB 相机，跳过重复连接")
+            return describeCamera(cur)
+        }
+        val hadSession = cur != null
+        disconnectQuiet()
+        if (hadSession) {
+            log("等待释放上一个会话（${SESSION_SETTLE_MS}ms）")
+            Thread.sleep(SESSION_SETTLE_MS)
+        }
+        log("开始 USB 连接")
+        val c = PtpUsbClient({ appContext!! }, ::log)
+        try {
+            c.connect("usb", friendlyName)
+        } catch (e: Exception) {
+            runCatching { c.close() }
+            throw e
+        }
+        client = c
+        deviceInfo = c.deviceInfo
+        cameraIp = "usb://${c.cameraName}"
+        c.eventHandler = { code, params ->
+            if (client === c) {
+                when {
+                    code == Ptp.EVT_OBJECT_ADDED && params.isNotEmpty() ->
+                        emit(mapOf("type" to "objectAdded", "handle" to params[0]))
+                    code == Ptp.EVT_DEVICE_PROP_CHANGED && params.isNotEmpty() ->
+                        emit(mapOf("type" to "devicePropChanged", "code" to params[0]))
+                }
+            }
+        }
+        c.disconnectHandler = { reason ->
+            if (client === c) {
+                stopKeepAlive()
+                liveViewOn = false
+                KeepAliveService.stop(appContext!!)
+                client = null
+                deviceInfo = null
+                cameraIp = null
+                emit(mapOf("type" to "status", "state" to "disconnected", "reason" to reason))
+            } else {
+                log("忽略非当前会话的断线通知：$reason")
+            }
+        }
+        if (client !== c) throw IOException("USB 连接完成后立即失效，请重试")
+        // USB 无 NAT/热点保活诉求，保活事务仅作存活探测（周期 GetDeviceInfo）
+        startKeepAlive()
+        KeepAliveService.start(appContext!!)
+        emit(mapOf("type" to "status", "state" to "connected", "ip" to "USB"))
+        return describeCamera(c)
+    }
+
     /** 相机信息（连接结果与"已连接"快路径共用）。 */
-    private fun describeCamera(c: PtpIpClient): Map<String, Any?> {
+    private fun describeCamera(c: PtpSession): Map<String, Any?> {
         val di = c.deviceInfo ?: throw IOException("未取得设备信息，请重试")
         return mapOf(
             "manufacturer" to di.manufacturer,
@@ -349,7 +408,7 @@ object CameraEngine {
         runCatching { c.close() }
     }
 
-    internal fun need(): PtpIpClient = client ?: throw IOException("尚未连接相机")
+    internal fun need(): PtpSession = client ?: throw IOException("尚未连接相机")
 
     /** 相机能力清单：操作码/事件码/属性码原始列表（名称映射在 Flutter 侧） */
     fun capabilities(): Map<String, Any?> {
@@ -371,11 +430,11 @@ object CameraEngine {
     /** 单次枚举的文件数上限，防御异常目录树。 */
     private const val MAX_ENUM_FILES = 5000
 
-    private fun readHandles(c: PtpIpClient, storageId: Long, parent: Long, format: Int = 0): List<Long> =
+    private fun readHandles(c: PtpSession, storageId: Long, parent: Long, format: Int = 0): List<Long> =
         c.transact(Ptp.OP_GET_OBJECT_HANDLES, longArrayOf(storageId, format.toLong(), parent))
             .data.let { ByteReader(it).u32Array() }.toList()
 
-    private fun getObjectInfo(c: PtpIpClient, handle: Long): ObjectInfo =
+    private fun getObjectInfo(c: PtpSession, handle: Long): ObjectInfo =
         PtpDatasets.parseObjectInfo(c.transact(Ptp.OP_GET_OBJECT_INFO, longArrayOf(handle)).data)
 
     private fun infoToMap(o: ObjectInfo): Map<String, Any?> = mapOf(
@@ -722,7 +781,7 @@ object CameraEngine {
                 attempt++
                 // 降级条件不能只看 PtpException：分块提前结束抛的是 IOException，
                 // 而那恰恰是最该退回整文件下载的情形。
-                if (attempt == 1 && c.effectiveDlMode != PtpIpClient.DlMode.FULL) {
+                if (attempt == 1 && c.effectiveDlMode != PtpSession.DlMode.FULL) {
                     log("下载失败（$fileName）：${e.message}；改用整文件下载重试")
                     c.degradeToFullDownload()
                     continue
@@ -1021,7 +1080,7 @@ object CameraEngine {
         else -> null
     }
 
-    private fun propDescCurrent(c: PtpIpClient, code: Long): Long? = runCatching {
+    private fun propDescCurrent(c: PtpSession, code: Long): Long? = runCatching {
         val d = c.transact(Ptp.OP_GET_DEVICE_PROP_DESC, longArrayOf(code)).data
         if (d.size < 8) return@runCatching null
         val r = ByteReader(d)
@@ -1044,7 +1103,7 @@ object CameraEngine {
      * AF 驱动（试验）：仅尝试 0x90C3。
      * ⚠️ 0x9206 疑似为本代机型的 StartLiveView，调用后快门会被持续拒绝，已移除。
      */
-    private fun afDriveBlocking(c: PtpIpClient): Boolean {
+    private fun afDriveBlocking(c: PtpSession): Boolean {
         if (afDriveOp == -1L) return false
         if (afDriveOp != 0L) {
             return runCatching { c.transact(afDriveOp.toInt()) }.isSuccess
@@ -1067,17 +1126,157 @@ object CameraEngine {
         return mapOf("ok" to ok)
     }
 
-    /** 当前拍摄参数（光圈/快门/ISO，只读展示）。经 DevicePropDesc 按数据类型解析。 */
+    // ------------------------------------------------------------ 拍摄参数（描述符 + 设置）
+
+    /**
+     * 两种传输层的设备属性码方言。
+     * USB 走标准 PTP；Wi-Fi 智能设备模式是尼康的裁剪方言（实测映射，见交接文档 §14）。
+     * Wi-Fi 的档位属性码未确认——probeProps 会把全部属性 Dump 出来，确认后填上。
+     */
+    private data class PropDialect(
+        val fNumber: Long, val exposureTime: Long, val iso: Long, val mode: Long?,
+    )
+
+    private val propDialect: PropDialect
+        get() = if (client is PtpUsbClient) {
+            // 标准 PTP：0x5006 FNumber、0x500C ExposureTime、0x5007 ExposureIndex(ISO)、
+            // 0x500D ExposureProgramMode（1=M 2=P(auto) 3=A 4=S）
+            PropDialect(0x5006, 0x500C, 0x5007, 0x500D)
+        } else {
+            PropDialect(0x500D, 0x500E, 0x500F, null)
+        }
+
+    /** 设备属性描述符：当前值 + 可选集/范围 + 是否可写。 */
+    data class PropDesc(
+        val code: Long,
+        val dtype: Int,
+        val writable: Boolean,
+        val value: Long,
+        val values: List<Long>,
+        val range: List<Long>?,
+    )
+
+    /** 完整解析 GetDevicePropDesc（含可选枚举/范围表）。 */
+    private fun propDescFull(c: PtpSession, code: Long): PropDesc? = runCatching {
+        val d = c.transact(Ptp.OP_GET_DEVICE_PROP_DESC, longArrayOf(code)).data
+        val r = ByteReader(d)
+        r.u16() // 属性码
+        val dtype = r.u16()
+        val getSet = r.u8()
+        ptpValue(r, dtype) // 出厂默认值（跳过）
+        val current = ptpValue(r, dtype) ?: return@runCatching null
+        var values = emptyList<Long>()
+        var range: List<Long>? = null
+        when (r.u8()) { // FormFlag：0=无，1=Range，2=Enumeration
+            1 -> {
+                val min = ptpValue(r, dtype)
+                val max = ptpValue(r, dtype)
+                val step = ptpValue(r, dtype)
+                if (min != null && max != null && step != null) range = listOf(min, max, step)
+            }
+            2 -> {
+                val n = r.u16()
+                values = (0 until n).mapNotNull { ptpValue(r, dtype) }
+            }
+        }
+        PropDesc(code, dtype, getSet != 0, current, values, range)
+    }.getOrNull()
+
+    private fun descMap(p: PropDesc?): Map<String, Any?>? = p?.let {
+        mapOf(
+            "code" to it.code,
+            "dtype" to it.dtype,
+            "writable" to it.writable,
+            "value" to it.value,
+            "values" to it.values,
+            "range" to it.range,
+        )
+    }
+
+    /**
+     * 当前拍摄参数（带描述符）：value 用于显示，values/range 供编辑器生成选项，
+     * writable 供置灰。经 DevicePropDesc 按数据类型解析。
+     */
     fun shotParams(): Map<String, Any?> {
         val c = need()
-
-        fun propDesc(code: Long): Long? = propDescCurrent(c, code)
+        val dl = propDialect
+        val mode = dl.mode?.let { propDescFull(c, it) }
         return mapOf(
-            "fNumber" to propDesc(0x500D),
-            "exposureTime" to propDesc(0x500E),
-            "iso" to propDesc(0x500F),
+            "fNumber" to descMap(propDescFull(c, dl.fNumber)),
+            "exposureTime" to descMap(propDescFull(c, dl.exposureTime)),
+            "iso" to descMap(propDescFull(c, dl.iso)),
+            "mode" to mode?.let {
+                mapOf(
+                    "code" to it.code,
+                    "value" to it.value,
+                    "values" to it.values,
+                    "writable" to it.writable,
+                )
+            },
             "battery" to battery(),
         )
+    }
+
+    /**
+     * 设置拍摄参数（SetDevicePropDesc，数据外发）。
+     * 相机侧规则（档位不允许改的参数）以 PtpException 原样上抛，由 UI 提示。
+     */
+    fun setShotParam(name: String, value: Long): Map<String, Any?> {
+        val c = need()
+        val dl = propDialect
+        val code = when (name) {
+            "fNumber" -> dl.fNumber
+            "exposureTime" -> dl.exposureTime
+            "iso" -> dl.iso
+            else -> throw IOException("未知参数：$name")
+        }
+        val d = propDescFull(c, code) ?: throw IOException("相机未提供该参数")
+        if (!d.writable) throw IOException("当前模式下该参数不可修改")
+        val payload = ByteArray(4 + when (d.dtype) {
+            0x0001, 0x0002 -> 1
+            0x0003, 0x0004 -> 2
+            else -> 4
+        })
+        var off = 0
+        PtpWire.putU16(payload, off, code.toInt()); off += 2
+        PtpWire.putU16(payload, off, d.dtype); off += 2
+        when (d.dtype) {
+            0x0001, 0x0002 -> payload[off] = value.toByte()
+            0x0003, 0x0004 -> PtpWire.putU16(payload, off, value.toInt())
+            else -> PtpWire.putU32(payload, off, value)
+        }
+        c.transactWithDataOut(Ptp.OP_SET_DEVICE_PROP_DESC, LongArray(0), payload)
+        // 立即回读，UI 拿到相机确认后的真值
+        val dl2 = propDialect
+        val fresh = when (name) {
+            "fNumber" -> descMap(propDescFull(c, dl2.fNumber))
+            "exposureTime" -> descMap(propDescFull(c, dl2.exposureTime))
+            else -> descMap(propDescFull(c, dl2.iso))
+        }
+        return mapOf("name" to name, "desc" to fresh)
+    }
+
+    /**
+     * 属性码 Dump（调试面板）：读常见标准码 + 尼康厂商段的 GetDevicePropDesc，
+     * 用于确认 Wi-Fi 方言的档位属性码（USB连接方案/交接文档均有记录）。
+     */
+    fun probeProps(): List<String> {
+        val c = need()
+        val out = ArrayList<String>()
+        val codes = (0x5001..0x5017L) + (0xD100..0xD11FL)
+        for (code in codes) {
+            val p = propDescFull(c, code) ?: continue
+            val form = when {
+                p.values.isNotEmpty() -> "枚举[${p.values.joinToString(",")}]"
+                p.range != null -> "范围[${p.range.joinToString(",")}]"
+                else -> "无表"
+            }
+            out += "0x%04X dtype=0x%04X %s 当前=%d %s".format(
+                code, p.dtype, if (p.writable) "可写" else "只读", p.value, form,
+            )
+        }
+        if (out.isEmpty()) out += "（没有读到任何设备属性）"
+        return out
     }
 
 

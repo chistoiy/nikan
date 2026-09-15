@@ -1,15 +1,24 @@
 # AI 开发交接文档（HANDOFF）
 
 > 本文档面向接手本项目的 AI/开发者。读完即可继续开发，无需重新摸索。
-> 最后更新：2026-09-13 · 版本状态：M2 功能全量完成，M2.x 修复迭代中
+> 最后更新：2026-09-15 · 版本状态：M2 稳定；USB（U1）与遥控页增强已开发完成，**待真机验证**
 
 ---
 
 ## 1. 一句话现状
 
-尼康 Z50 II 照片无线传输 App（Flutter UI + Kotlin PTP/IP 引擎，仅 Android），已完成：Wi-Fi 直连、快速枚举、按需缩略图浏览、范围滑动多选、三档画质下载、日期分组、大图查看（EXIF）、自定义保存位置、盲拍遥控、下载管理页。**进行中**：遥控拍摄偶发卡忙（已加多重缓解待验证）、实时取景被相机拒绝待逆向、高速下载通道待探针日志确认。
+尼康 Z50 II 照片传输 App（Flutter UI + Kotlin PTP 引擎，仅 Android）。Wi-Fi 主链路稳定。**USB 传输层（U1）已完成开发**：实测吞吐 27.1 MB/s（Wi-Fi 的 11 倍），`PtpSession` 接口抽取让 Wi-Fi/USB 双传输层共用全部上层逻辑。**遥控页增强已完成开发**：取景窗点击对焦、档位识别（M/A/S/P）、按档位联动参数编辑（不可改置灰）、参数实时刷新。**待真机验证**（清单见 §18.4）；Wi-Fi 方言的档位属性码待「属性码Dump」探针确认。
 
 ## 2. 核心链路（必须先理解）
+
+> **2026-09-15 起为双传输层架构**：`PtpSession` 接口（PtpSession.kt）抽象了上层全部依赖
+> （transact / transactShort / transactWithDataOut / getObjectToStream / getThumbnailBytes /
+> connect / close / notifyLinkDead / 两个回调）。`PtpIpClient`（Wi-Fi）与 `PtpUsbClient`（USB）
+> 各实现一份；`CameraEngine.client` 字段类型即 `PtpSession`，枚举/下载/遥控/保活完全共用。
+> 语义约定：**非 OK 响应码一律抛 `PtpException`**（上层按码处理，如 0xA004 未对焦）；
+> 传输故障抛 `IOException`（USB 侧内部先走重枚举恢复，恢复失败才判死）。
+
+### 2.1 Wi-Fi 主链路（原有内容，仍然有效）
 
 ```
 相机(Z50 II) ──Wi-Fi AP 热点──> 手机
@@ -70,6 +79,14 @@ adb install -r build/app/outputs/flutter-apk/app-release.apk
 | `docs/技术方案.md` | 总体方案（M0~M4 规划）|
 | `docs/reference/` | aero-shutter 参考源码 + WMU 功能审计文档（逆向线索库）|
 
+### 4.1 2026-09-15 新增文件
+
+- `PtpSession.kt`——传输层接口 + `TransactResult` + `DlMode`（含 data-OUT 事务）
+- `PtpUsbClient.kt`——PTP/USB 传输层：整包读 + 余料缓冲、事务串行、重枚举恢复
+  （等设备重现 10s + 重新授权）、GetObject 流式下载（64KB 块）、断点续传
+  （GetPartialObject）、中断端点事件线程
+- `PtpUsbProbe.kt`——U0 实验探针（调试面板入口），大量经验已迁移进 PtpUsbClient
+
 ## 5. 协议硬知识（全部踩坑验证过，勿再踩）
 
 1. **握手**：InitCommandRequest 用 WMU 固定 GUID `00 11 22 33 44 55 66 77 88 99 AA BB CC DD EE FF` + 友好名（UTF-16LE），事件连接用 InitCommandAck 返回的连接号绑定，必须先于 OpenSession。
@@ -90,9 +107,27 @@ adb install -r build/app/outputs/flutter-apk/app-release.apk
 
 Wi-Fi 智能直连（免配对）、快速枚举（1499 文件 256ms）、文件详情按需加载、缩略图网格+两级缓存、三档画质下载（原图/8M/2M，手机端缩放，仅 JPEG）、分块下载+降级链、SAF 自定义目录、MediaStore 落盘、下载去重、日期分组、滑动范围多选（锚点→当前，边缘自动滚动）、大图查看（翻页/缩放/EXIF）、手机页批量删除、能力清单 dump、盲拍遥控（首拍成功）、电量/保活/断线检测、全局错误捕获（堆栈进日志面板）。
 
+**USB（2026-09-15 实测）**：PTP/USB 全链路——GetDeviceInfo/枚举/GetObjectInfo 1-2ms 一笔；
+**GetObject 全量下载 174MB MOV 实测 27.1 MB/s，字节校验一致**（Wi-Fi 的 11 倍，30GB 卡约 19 分钟）。
+活跃传输期间连接保持住；恢复机制（等设备重现+重授权+重试）实战验证可用。
+
 ## 7. 未解决问题与排查方向（按优先级）
 
-### 7.1 遥控拍摄第二张起持续忙碌（核心阻塞）
+### 7.0 USB 空闲期重枚举循环（已缓解，根因待除）
+- 相机空闲时每 ~3.65s 从手机总线消失、~3.4s 后重挂（dumpsys `num_connects=661`，严格周期）。
+- **活跃传输期间连接保持住**（174MB/7s 中途未断），恢复机制可兜底非活跃期。
+- 判别已做：相机插电脑稳定（相机/线排除）、屏幕常亮无影响、上传优先/拍摄优先无差异
+  → 收敛到手机侧 OTG 供电或 MTP 主机栈。**决定性实验：带外供电 OTG 集线器（约 20-30 元）**。
+- 详见 docs/USB连接方案.md §7.2/§7.5。
+
+### 7.0b Wi-Fi 方言的档位属性码（遥控页置灰联动的前提）
+- Wi-Fi 智能设备模式的属性码是尼康裁剪方言（实测 0x500D=光圈、0x500E=快门、0x500F=ISO，
+  与标准 PTP 不同）。**档位（拨盘 P/A/S/M）对应的方言码未确认**。
+- 已实现「属性码Dump」探针（调试面板）：读 0x5001-0x5017 + 0xD100-0xD11F 全部属性
+  的类型/当前值/枚举表，跑一次即可确认。USB 传输层用标准 PTP 码（0x5006/0x500C/0x5007/0x500D），
+  理论直接可用。
+
+### 7.1 遥控拍摄第二张起持续忙碌
 - 现象：首拍成功（AF 驱动 0x90C3 可用、ObjectAdded 正常到达标准事件通道），**第二张起持续 DeviceBusy/GeneralError**，与拍摄模式无关。
 - 已排除：事件队列排水（0x90C1/0x90C0 被相机直接拒绝，无响应）、模式切换影响、AF 缺失（0x90C3 拍前对焦有效）。
 - **当前主假设（证据最强）**：相机要求主机把新照片"取走"（GetObject 全量读取）后才允许下一次快门——SnapBridge 每拍必拉的正是这个。已实现：拍后自动全量读取新照片（≤40MB，读走即解锁，同时用作高清预览）。待真机验证连拍是否恢复。
@@ -107,8 +142,8 @@ Wi-Fi 智能直连（免配对）、快速枚举（1499 文件 256ms）、文件
 - 已加全局错误捕获：`FlutterError.onError` / `ErrorWidget.builder` / `PlatformDispatcher.onError` → 堆栈写入 AppLog → 用户复制日志即可反馈堆栈。
 - 复现路径：设置页 → 长按日志选择复制。日志卡片已有明确"复制全部日志"按钮。
 
-### 7.4 待装机
-- 最新 APK **已构建未安装**（手机断开 USB）：`build/app/outputs/flutter-apk/app-debug.apk`。装机后才能验证：全局错误捕获、SDRAM 探测、事件排水解析、复制按钮。
+### 7.4 待装机验证
+- U1 + 遥控页增强已装机（versionCode 2027+，2026-09-15），**验证清单见 §18.4**。
 
 ## 8. UI 结构速查
 
@@ -133,16 +168,16 @@ Wi-Fi 智能直连（免配对）、快速枚举（1499 文件 256ms）、文件
 3. 改完构建安装 → 用户真机验证 → 让用户复制日志反馈（日志含完整协议过程）。
 4. 提交前跑 `flutter analyze`，保持 0 error/warning（info 级风格提示可容忍）。
 
-## 11. 待办队列
+## 11. 待办队列（2026-09-15 重排）
 
-- [ ] 安装最新 APK（已构建）并验证：全局错误捕获、SDRAM 探测、排水解析、复制按钮
-- [x] 对焦优先相机（未对焦禁止拍摄）处理：拍摄前 AF 阻塞驱动 + MF 检测（0x500A）+ 对焦/非对焦原因区分报错（2026-09-14，待真机验证）
-- [ ] 遥控拍摄第二张卡忙：已实现拍后全量读取解锁，待真机连拍验证
-- [ ] 遥控拍摄：0xA004 未对焦即时终止已实现，待验证
-- [ ] 实时取景：按 7.2 调测（用户已要求）
-- [ ] 高速下载：看连接后日志的探针结果决定接入
-- [ ] 相机端对焦优先设置的用户引导（"未对准焦不能拍照"时提示/AF 按钮已预留 tryAfDrive）
-- [ ] M3 候选：通知栏下载进度、自动同步（ObjectAdded 已具备）、Wi-Fi 自动回连（WifiNetworkSuggestion）
+- [ ] **U1 + 遥控页真机验证**（清单见 §18.4）：USB 连接/相册/下载/续传；Wi-Fi 遥控页 AF 点击、档位联动、参数编辑
+- [ ] **跑「属性码Dump」探针**（调试面板）→ 确认 Wi-Fi 方言档位码 → 填入 CameraEngine.PropDialect → Wi-Fi 下档位联动生效
+- [ ] 全部验证通过后提交（U1 + 遥控页 + 断点续传，当前未提交）
+- [ ] 遥控拍摄第二张卡忙：拍后全量读取解锁已实现，待连拍验证
+- [ ] 实时取景（Wi-Fi）按 7.2 调测；USB 实时取景（0x92xx 12 个操作 USB 下可用）U3 探索
+- [ ] 带外供电 OTG 集线器：验证空闲重枚举根因（§7.0）
+- [ ] U1 余项：下载进度通知栏（前台服务已就绪）、USB 下载断点信息持久化（跨次恢复）
+- [ ] M3 候选：自动同步（ObjectAdded 已具备）、Wi-Fi 自动回连、连接页三步向导（UI 设计稿 §2.2）、筛选摘要行（§2.1）
 
 ---
 
@@ -559,3 +594,70 @@ dumpsys usb 实锤空闲态重枚举循环仍在：host_manager `num_connects=66
 **U0 至此结案，方案进入 U1（传输层产品化）。** 详细结论已写入
 `docs/USB连接方案.md` §1/§6/§7.5。U1 设计要点：把"中断续传"当一等公民；
 并行验证带外供电 OTG 集线器能否根除空闲循环（大概率与 OTG 供电管理有关）。
+
+---
+
+## 18. U1 传输层产品化 + 遥控页增强（2026-09-15，已开发完成，待真机验证）
+
+### 18.1 U1：双传输层架构（已构建，USB 全流程待用户验证）
+
+- **`PtpSession` 接口**：CameraEngine 依赖面抽象。`client` 字段、`need()`、
+  `describeCamera`、`readHandles/getObjectInfo/propDescCurrent/afDriveBlocking` 全部改型。
+  `DlMode`/`TransactResult` 迁到接口层（PtpIpClient 内保留 typealias 兼容旧引用）。
+- **`PtpIpClient`（Wi-Fi）**：实现接口 + 新增 `transactWithDataOut`
+  （data-OUT 帧：OperationRequest(dataPhase=2) → StartData(total) → Data(offset+data)… → EndData(offset)）。
+  ⚠️ doTransact 增加第 4 参后，**所有调用点的尾随 lambda 必须写成显式实参**，
+  否则 lambda 会绑到 dataOut 上（已全部改掉，新代码注意）。
+- **`PtpUsbClient`（USB）**：U0 全部经验产品化（详见 USB连接方案.md §7/§8）——
+  整包读 + 余料、事务串行 + 单调事务号、恢复（等重现 10s + 重授权 + 重试一次）、
+  GetObject 流式下载（64KB 块 + 1MiB 步进进度）、**断点续传**（中断后重开 +
+  GetPartialObject 从断点续传，4GB 内有效，响应参数与实际写入量必须一致）、
+  中断端点事件线程（0x83 轮询 300ms，事件容器跨包拼接 + 余料）。
+- **语义对齐**：非 OK 响应抛 `PtpException`（不触发 USB 重枚举恢复——相机明确拒绝不是传输故障）；
+  传输 IOException 才走恢复。保活的 `notifyLinkDead` 提升到接口。
+- **入口**：`CameraEngine.connectUsb()`（cameraIp="usb://机型"）→ 插件 `connectUsb` →
+  连接页「USB 数据线连接（高速下载，实测 27 MB/s）」按钮。
+- **方言码表**：`CameraEngine.PropDialect`——USB 用标准 PTP
+  （fNumber=0x5006 / exposureTime=0x500C / iso=0x5007 / mode=0x500D），
+  Wi-Fi 用实测方言（0x500D/0x500E/0x500F，mode 待探针确认填入）。
+
+### 18.2 遥控页增强（同批构建）
+
+- **参数描述符**：`shotParams()` 升级——每参数返回
+  `{code, dtype, writable, value, values[](枚举表), range[min,max,step]}`，
+  完整解析 GetDevicePropDesc 的 FormFlag。**注意 Dart 侧取值改为 `desc['value']`**。
+- **参数设置**：`setShotParam(name, value)` → SetDevicePropDesc（data-OUT，按 dtype 编码），
+  设置后立即回读返回新描述符（UI 即时回显真值）；相机拒绝（档位限制）抛 PtpException 由 UI 提示。
+- **档位联动置灰**（Dart `_paramEditable`）：M=全部可改，A=仅光圈，S=仅快门，P/AUTO/未知=只读；
+  叠加属性的 writable 标志。规则只是引导，相机是最终裁判。
+- **UI**：参数行 = 档位 chip + 三个参数 chip（蓝框=可编辑、灰=只读）+ 电量；
+  点 chip 弹枚举列表或 ±步进器；**取景画面点击任意位置 = AF**（原"对焦"按钮保留）。
+- **调试面板新增「属性码Dump」探针**（probeProps）：0x5001-0x5017 + 0xD100-0xD11F
+  全量 GetDevicePropDesc dump——Wi-Fi 档位码确认后填入 PropDialect 即完成闭环。
+
+### 18.3 本轮踩坑记录（新代码注意）
+
+1. doTransact 尾随 lambda 绑定陷阱（见 18.1）。
+2. `r.u8()` 返回 Int，when 分支不能写 `1L`。
+3. putU16 的 value 是 Int、putU32 是 Long（CameraEngine setShotParam 编码时注意）。
+4. PtpWire 补了 `putU64`（PTP/IP StartData 的总长字段）。
+5. pubspec 版本 1.0.0+2027（此前 2026 是未提交的本地改动，工作区曾回退到 +1 导致
+   INSTALL_FAILED_VERSION_DOWNGRADE）。构建必须带
+   `FLUTTER_STORAGE_BASE_URL=https://storage.flutter-io.cn`（§3）。
+
+### 18.4 待真机验证清单（用户操作）
+
+**USB 流程**（相机 USB 连手机 → 连接页点「USB 数据线连接」→ 弹窗允许）：
+1. 连接成功、相册缩略图加载（走 USB 缩略图通道）；
+2. 下载照片/视频（大文件优先——中断续传只有在真被重枚举打断时才触发）；
+3. 若报"传输不完整"= 续传版未装（旧版行为），换装最新包再测。
+
+**Wi-Fi 遥控页**：
+4. 实时取景中**点击画面** → 相机 AF 动作；
+5. 转相机拨盘 P/A/S/M → 档位 chip 与置灰联动（⚠️ Wi-Fi 档位码未确认前，档位 chip 可能显示 "--"，
+   属预期）；USB 连接下档位识别应直接工作（标准码）；
+6. A 档改光圈 / M 档改 ISO → 生效且回显；P 档点参数 → 置灰不可点；
+7. 调试面板跑「**属性码Dump**」→ 把输出发回来 → 填入 PropDialect.mode 完成最后闭环。
+
+**全部通过后提交**（当前未提交内容：PtpSession/PtpUsbClient/两传输层 data-OUT/CameraEngine
+接入/遥控页 UI/断点续传/调试探针/本文档更新）。

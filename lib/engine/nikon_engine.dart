@@ -36,6 +36,10 @@ class NikonEngine {
   /// 智能连接：直接对网关（相机）握手 + 重试，失败才网段扫描兜底
   static Future<Map<String, dynamic>> connectSmart() => _map('connectSmart');
 
+  /// USB 连接（实测 27.1 MB/s，Wi-Fi 的 11 倍）。会弹系统 USB 权限对话框。
+  static Future<Map<String, dynamic>> connectUsb(String friendlyName) =>
+      _map('connectUsb', {'friendlyName': friendlyName});
+
   static Future<void> disconnect() => _m.invokeMethod('disconnect');
 
   static Future<Map<String, dynamic>> enumerate() => _map('enumerate');
@@ -109,6 +113,16 @@ class NikonEngine {
 
   /// 当前拍摄参数（光圈/快门/ISO/电量）
   static Future<Map<String, dynamic>> shotParams() => _map('shotParams');
+
+  /// 设置拍摄参数（光圈/快门/ISO，数据外发 SetDevicePropDesc）
+  static Future<Map<String, dynamic>> setShotParam(String name, int value) =>
+      _map('setShotParam', {'name': name, 'value': value});
+
+  /// 设备属性码 Dump（调试面板）：确认 Wi-Fi 方言的档位属性码
+  static Future<List<String>> probeProps() async {
+    final r = await _m.invokeMethod('probeProps');
+    return List<String>.from(r as List);
+  }
 
   // ---- 保存位置（SAF） ----
 

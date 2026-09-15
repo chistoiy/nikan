@@ -400,30 +400,176 @@ class _RemotePageState extends State<RemotePage> {
 
   // ------------------------------------------------------------ 参数文案
   //
+  // 参数来自 shotParams 的描述符（value/values/range/writable）。
   // 相机返回的原始值未必可信（实测出现过 f/0.6 这种物理上不存在的光圈），
   // 越界一律显示 --：宁可缺，不可错。
 
-  String _fNumberText() {
-    final v = (_params?['fNumber'] as num?)?.toDouble();
+  num? _descValue(String name) {
+    final d = _params?[name];
+    if (d is! Map) return null;
+    final v = d['value'];
+    return v is num ? v : null;
+  }
+
+  String _fNumberValueText(num? v) {
     if (v == null || v <= 0) return '--';
-    final f = v / 100; // PTP 标准：FNumber = f 值 × 100
+    final f = v.toDouble() / 100; // PTP 标准：FNumber = f 值 × 100
     if (f < 0.7 || f > 64) return '--';
     return 'f/${f == f.roundToDouble() ? f.toStringAsFixed(0) : f.toStringAsFixed(1)}';
   }
 
-  String _exposureText() {
-    final v = (_params?['exposureTime'] as num?)?.toDouble();
+  String _exposureValueText(num? v) {
     if (v == null || v <= 0) return '--';
-    final s = v / 10000; // PTP 标准：ExposureTime 单位为 1/10000 秒
+    final s = v.toDouble() / 10000; // PTP 标准：ExposureTime 单位为 1/10000 秒
     if (s <= 0 || s > 900) return '--';
     if (s >= 1) return '${s.toStringAsFixed(s >= 10 ? 0 : 1)}s';
-    return '1/${(10000 / v).round()}s';
+    return '1/${(10000 / v.toDouble()).round()}s';
   }
 
-  String _isoText() {
-    final v = (_params?['iso'] as num?)?.toInt();
-    if (v == null || v < 25 || v > 409600) return '--';
-    return 'ISO $v';
+  String _fNumberText() => _fNumberValueText(_descValue('fNumber'));
+
+  String _exposureText() => _exposureValueText(_descValue('exposureTime'));
+
+  String _isoValueText(num? v) {
+    final i = v?.toInt();
+    if (i == null || i < 25 || i > 409600) return '--';
+    return 'ISO $i';
+  }
+
+  String _isoText() => _isoValueText(_descValue('iso'));
+
+  // ------------------------------------------------------------ 档位与可编辑性
+  //
+  // ExposureProgramMode：1=M 2=P 3=A 4=S；其他值（如 AUTO 场景）原样显示数字。
+  // 置灰规则只是引导，相机仍是最终裁判——被拒时 setShotParam 会把 PtpException 提出来。
+
+  String? _modeName() {
+    final m = _params?['mode'];
+    if (m is! Map) return null;
+    final v = (m['value'] as num?)?.toInt();
+    return switch (v) { 1 => 'M', 2 => 'P', 3 => 'A', 4 => 'S', _ => v?.toString() };
+  }
+
+  bool _paramWritable(String name) {
+    final d = _params?[name];
+    return d is Map && d['writable'] == true;
+  }
+
+  bool _paramEditable(String name) {
+    if (!_paramWritable(name)) return false;
+    switch (_modeName()) {
+      case 'M':
+        return true; // M：光圈/快门/ISO 全部可改
+      case 'A':
+        return name == 'fNumber'; // A：只改光圈
+      case 'S':
+        return name == 'exposureTime'; // S：只改快门
+      default:
+        return false; // P / AUTO / 未知：只读
+    }
+  }
+
+  Future<void> _applyParam(String name, int value) async {
+    try {
+      final r = await NikonEngine.setShotParam(name, value);
+      if (!mounted) return;
+      final desc = r['desc'];
+      if (desc is Map) {
+        setState(() => _params = {...?_params, name: desc});
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('设置失败：$e')));
+      }
+    }
+    _loadParams(); // 设置可能联动其他参数，统一后台刷新
+  }
+
+  Future<void> _showParamEditor(String name) async {
+    final d = _params?[name];
+    if (d is! Map) return;
+    final current = (d['value'] as num?)?.toInt() ?? 0;
+    final values = ((d['values'] as List?) ?? const [])
+        .whereType<num>()
+        .map((e) => e.toInt())
+        .toList()
+      ..sort();
+    final range = (d['range'] as List?)?.whereType<num>().map((e) => e.toInt()).toList();
+    String fmt(int v) => switch (name) {
+      'fNumber' => _fNumberValueText(v),
+      'exposureTime' => _exposureValueText(v),
+      _ => _isoValueText(v),
+    };
+
+    int? picked;
+    if (values.isNotEmpty) {
+      picked = await showModalBottomSheet<int>(
+        context: context,
+        backgroundColor: const Color(0xFF1C1C1E),
+        builder: (ctx) => SafeArea(
+          child: ListView(
+            shrinkWrap: true,
+            children: [
+              for (final v in values)
+                ListTile(
+                  dense: true,
+                  title: Text(fmt(v), style: TextStyle(
+                    color: v == current ? const Color(0xFF3D7BFF) : Colors.white,
+                    fontWeight: v == current ? FontWeight.w700 : FontWeight.w400,
+                  )),
+                  trailing: v == current ? const Icon(Icons.check, size: 18, color: Color(0xFF3D7BFF)) : null,
+                  onTap: () => Navigator.pop(ctx, v),
+                ),
+            ],
+          ),
+        ),
+      );
+    } else if (range != null && range.length == 3) {
+      // 范围型（min/max/step）：步进编辑器
+      final min = range[0], max = range[1];
+      final step = (range[2] == 0 ? 1 : range[2]);
+      final r = await showModalBottomSheet<int>(
+        context: context,
+        backgroundColor: const Color(0xFF1C1C1E),
+        builder: (ctx) => StatefulBuilder(
+          builder: (ctx, setSheet) {
+            var v = current.clamp(min, max);
+            return SafeArea(
+              child: Padding(
+                padding: const EdgeInsets.all(20),
+                child: Row(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    IconButton(
+                      onPressed: v - step >= min ? () => setSheet(() => v -= step) : null,
+                      icon: const Icon(Icons.remove),
+                    ),
+                    Padding(
+                      padding: const EdgeInsets.symmetric(horizontal: 24),
+                      child: Text(fmt(v), style: const TextStyle(fontSize: 22, fontWeight: FontWeight.w700)),
+                    ),
+                    IconButton(
+                      onPressed: v + step <= max ? () => setSheet(() => v += step) : null,
+                      icon: const Icon(Icons.add),
+                    ),
+                    TextButton(
+                      onPressed: () => Navigator.pop(ctx, v),
+                      child: const Text('确定'),
+                    ),
+                  ],
+                ),
+              ),
+            );
+          },
+        ),
+      );
+      picked = r;
+    } else {
+      return; // 无表也无范围：相机没给编辑信息，放弃
+    }
+    if (picked != null && picked != current) {
+      await _applyParam(name, picked);
+    }
   }
 
   // ------------------------------------------------------------ 装配
@@ -502,7 +648,11 @@ class _RemotePageState extends State<RemotePage> {
         return Stack(
           fit: StackFit.expand,
           children: [
-            ColoredBox(color: Colors.black, child: _orientedImage(frame, _rotation, gapless: true)),
+            // 点画面任意位置 = 驱动相机 AF（取景窗对焦）
+            GestureDetector(
+              onTap: _focus,
+              child: ColoredBox(color: Colors.black, child: _orientedImage(frame, _rotation, gapless: true)),
+            ),
             Positioned(
               left: 10,
               top: 10,
@@ -718,12 +868,14 @@ class _RemotePageState extends State<RemotePage> {
             child: Row(
               mainAxisAlignment: MainAxisAlignment.center,
               children: [
-                _param(_fNumberText()),
-                const SizedBox(width: 18),
-                _param(_exposureText()),
-                const SizedBox(width: 18),
-                _param(_isoText()),
-                const SizedBox(width: 18),
+                _modeChip(),
+                const SizedBox(width: 12),
+                _paramChip('fNumber', _fNumberText()),
+                const SizedBox(width: 12),
+                _paramChip('exposureTime', _exposureText()),
+                const SizedBox(width: 12),
+                _paramChip('iso', _isoText()),
+                const SizedBox(width: 12),
                 _param(model.battery >= 0 ? '${model.battery}%' : '--'),
               ],
             ),
@@ -805,4 +957,43 @@ class _RemotePageState extends State<RemotePage> {
         text,
         style: const TextStyle(fontSize: 13.5, fontWeight: FontWeight.w600, color: Colors.white70),
       );
+
+  /// 可点击的参数 chip：按档位可编辑性点亮/置灰，点开编辑面板
+  Widget _paramChip(String name, String text) {
+    final editable = _paramEditable(name);
+    return GestureDetector(
+      onTap: editable ? () => _showParamEditor(name) : null,
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+        decoration: BoxDecoration(
+          borderRadius: BorderRadius.circular(8),
+          border: Border.all(color: editable ? const Color(0xFF3D7BFF) : Colors.white24),
+        ),
+        child: Text(
+          text,
+          style: TextStyle(
+            fontSize: 13.5,
+            fontWeight: FontWeight.w600,
+            color: editable ? Colors.white : Colors.white38,
+          ),
+        ),
+      ),
+    );
+  }
+
+  /// 档位 chip（M/A/S/P/数字），无数据时显示 --
+  Widget _modeChip() {
+    final m = _modeName();
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+      decoration: BoxDecoration(
+        borderRadius: BorderRadius.circular(8),
+        color: Colors.white10,
+      ),
+      child: Text(
+        m ?? '--',
+        style: const TextStyle(fontSize: 13.5, fontWeight: FontWeight.w700, color: Colors.white70),
+      ),
+    );
+  }
 }

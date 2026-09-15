@@ -33,6 +33,7 @@ object Ptp {
     const val OP_GET_THUMB = 0x100A
     const val OP_GET_DEVICE_PROP_DESC = 0x1014
     const val OP_GET_DEVICE_PROP_VALUE = 0x1015
+    const val OP_SET_DEVICE_PROP_DESC = 0x1016 // SetDevicePropDesc：数据外发（[属性码 u16][类型 u16][值]）
     // 标准 PTP 0x101B = GetPartialObject：参数 3 个（句柄、偏移 u32、最大长度 u32）。
     // 注意 0x1012 是 SetObjectProtection，绝不能当分块下载用！
     const val OP_GET_PARTIAL_OBJECT = 0x101B
