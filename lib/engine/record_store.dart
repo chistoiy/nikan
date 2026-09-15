@@ -1,6 +1,7 @@
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:flutter/foundation.dart';
 import 'package:path_provider/path_provider.dart';
 
 /// 一条下载记录。
@@ -43,7 +44,10 @@ class RecEntry {
 }
 
 /// 已下载记录（含本地 uri），用于去重、手机相册页展示与批量删除。
-class RecordStore {
+///
+/// 继承 ChangeNotifier：记录一旦变化就通知，否则删除后列表要等到下一次
+/// 引擎通知才刷新（历史上本机查看器删完返回，手机页仍显示旧条目）。
+class RecordStore extends ChangeNotifier {
   final Map<String, RecEntry> _entries = {};
   File? _file;
   bool _loaded = false;
@@ -66,11 +70,13 @@ class RecordStore {
 
   void add(RecEntry e) {
     _entries[e.key] = e;
+    notifyListeners();
     _scheduleSave();
   }
 
   void removeKey(String key) {
-    _entries.remove(key);
+    if (_entries.remove(key) == null) return;
+    notifyListeners();
     _scheduleSave();
   }
 
@@ -81,11 +87,14 @@ class RecordStore {
     _entries[key] = RecEntry(
       name: e.name, size: e.size, variant: e.variant, uri: uri, path: e.path, time: e.time,
     );
+    notifyListeners();
     _scheduleSave();
   }
 
   void clear() {
+    if (_entries.isEmpty) return;
     _entries.clear();
+    notifyListeners();
     _scheduleSave();
   }
 
@@ -125,6 +134,7 @@ class RecordStore {
     } catch (_) {
       _entries.clear();
     }
+    notifyListeners();
   }
 
   Future<void> _scheduleSave() async {

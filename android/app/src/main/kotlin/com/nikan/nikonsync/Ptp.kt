@@ -33,6 +33,7 @@ object Ptp {
     const val OP_GET_THUMB = 0x100A
     const val OP_GET_DEVICE_PROP_DESC = 0x1014
     const val OP_GET_DEVICE_PROP_VALUE = 0x1015
+    const val OP_SET_DEVICE_PROP_DESC = 0x1016 // SetDevicePropDesc：数据外发（[属性码 u16][类型 u16][值]）
     // 标准 PTP 0x101B = GetPartialObject：参数 3 个（句柄、偏移 u32、最大长度 u32）。
     // 注意 0x1012 是 SetObjectProtection，绝不能当分块下载用！
     const val OP_GET_PARTIAL_OBJECT = 0x101B
@@ -90,6 +91,15 @@ object Ptp {
 
     const val PROTOCOL_VERSION_10 = 0x00010000L
 
+    /**
+     * 响应码名称（按 ISO 15740）。
+     *
+     * ⚠️ 这张表此前是错的：把 0x2007 标成 "ParameterBad"、0x2008 标成 "ParameterBadType"、
+     * 0x2009 标成 "ValueNotSupported"、0x200A 标成 "AccessDenied" 等，都与标准不符。
+     * 错误的名称会把人往错误方向带——实测中就因为 "ParameterBad" 去查了参数问题，
+     * 而 0x2007 的真实含义是 IncompleteTransfer（数据阶段未按预期完成）。
+     * 排查时请以标准码为准。
+     */
     fun respName(code: Int): String = when (code) {
         0x2001 -> "OK"
         0x2002 -> "GeneralError"
@@ -97,14 +107,24 @@ object Ptp {
         0x2004 -> "InvalidTransactionID"
         0x2005 -> "OperationNotSupported"
         0x2006 -> "ParameterNotSupported"
-        0x2007 -> "ParameterBad"
-        0x2008 -> "ParameterBadType"
-        0x2009 -> "ValueNotSupported"
-        0x200A -> "AccessDenied"
-        0x200B -> "NoThumbnailPresent"
-        0x201D -> "InvalidObjectHandle"
+        0x2007 -> "IncompleteTransfer"
+        0x2008 -> "InvalidStorageId"
+        0x2009 -> "InvalidObjectHandle"
+        0x200A -> "DevicePropNotSupported"
+        0x200B -> "InvalidObjectFormatCode"
+        0x200C -> "StoreFull"
+        0x200D -> "ObjectWriteProtected"
+        0x200E -> "StoreReadOnly"
+        0x200F -> "AccessDenied"
+        0x2010 -> "NoThumbnailPresent"
+        0x2013 -> "StoreNotAvailable"
+        0x2019 -> "DeviceBusy"
+        0x201A -> "InvalidParentObject"
+        0x201B -> "InvalidDevicePropFormat"
+        0x201C -> "InvalidDevicePropValue"
+        0x201D -> "InvalidParameter"
         0x201E -> "SessionAlreadyOpen"
-        0x201F -> "StoreNotAvailable"
+        0x201F -> "TransactionCancelled"
         // 尼康厂商响应码（0xA004 实测=未对焦；0xA00B 实测=未在实时取景）
         0xA004 -> "OutOfFocus(未对焦)"
         0xA00B -> "NotLiveView(未在取景)"

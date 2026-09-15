@@ -19,6 +19,10 @@ class NikonEngine {
 
   static Future<Map<String, dynamic>> wifiInfo() => _map('wifiInfo');
 
+  /// 应用版本（原生侧读 BuildConfig，与 pubspec 不会失同步）
+  static Future<String?> appVersion() async =>
+      await _m.invokeMethod('appVersion') as String?;
+
   static Future<void> openWifiSettings() => _m.invokeMethod('openWifiSettings');
 
   static Future<List<String>> scan() async {
@@ -31,6 +35,10 @@ class NikonEngine {
 
   /// 智能连接：直接对网关（相机）握手 + 重试，失败才网段扫描兜底
   static Future<Map<String, dynamic>> connectSmart() => _map('connectSmart');
+
+  /// USB 连接（实测 27.1 MB/s，Wi-Fi 的 11 倍）。会弹系统 USB 权限对话框。
+  static Future<Map<String, dynamic>> connectUsb(String friendlyName) =>
+      _map('connectUsb', {'friendlyName': friendlyName});
 
   static Future<void> disconnect() => _m.invokeMethod('disconnect');
 
@@ -106,6 +114,16 @@ class NikonEngine {
   /// 当前拍摄参数（光圈/快门/ISO/电量）
   static Future<Map<String, dynamic>> shotParams() => _map('shotParams');
 
+  /// 设置拍摄参数（光圈/快门/ISO，数据外发 SetDevicePropDesc）
+  static Future<Map<String, dynamic>> setShotParam(String name, int value) =>
+      _map('setShotParam', {'name': name, 'value': value});
+
+  /// 设备属性码 Dump（调试面板）：确认 Wi-Fi 方言的档位属性码
+  static Future<List<String>> probeProps() async {
+    final r = await _m.invokeMethod('probeProps');
+    return List<String>.from(r as List);
+  }
+
   // ---- 保存位置（SAF） ----
 
   static Future<String?> getSaveFolder() async => await _m.invokeMethod('getSaveFolder') as String?;
@@ -134,6 +152,20 @@ class NikonEngine {
   /// 实时取景链路探针（0x9206 疑似 Start → 0x9403~06 拉帧 → 0x9201 疑似 End）
   static Future<List<String>> probeLiveView2() async {
     final r = await _m.invokeMethod('probeLiveView2');
+    return List<String>.from(r as List);
+  }
+
+  /// 取景帧尺寸探针：候选帧通道逐个尝试，报告字节数与 JPEG 像素尺寸。
+  /// 用于判断是否存在比 0x9203（实测 640×424）更大的取景帧。
+  static Future<List<String>> probeLvFrames() async {
+    final r = await _m.invokeMethod('probeLvFrames');
+    return List<String>.from(r as List);
+  }
+
+  /// USB 连接模式 U0 实验：枚举设备 → 打开会话 → 读操作集 → 实测吞吐。
+  /// 需要用户在系统弹窗里点一次授权，因此原生侧是长任务（最长等 60 秒）。
+  static Future<List<String>> usbProbe() async {
+    final r = await _m.invokeMethod('usbProbe');
     return List<String>.from(r as List);
   }
 

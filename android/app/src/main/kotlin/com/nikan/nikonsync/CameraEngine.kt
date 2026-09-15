@@ -36,8 +36,11 @@ object CameraEngine {
     private const val TAG = "NikonSync"
     const val DEFAULT_FRIENDLY_NAME = "Nikon Wireless Mobile Utility"
 
+    /** 拆除旧会话后、发起新握手前留给相机释放会话的时间 */
+    private const val SESSION_SETTLE_MS = 1500L
+
     private var appContext: Context? = null
-    private var client: PtpIpClient? = null
+    internal var client: PtpSession? = null
     private val mainHandler = Handler(Looper.getMainLooper())
 
     @Volatile private var sink: EventChannel.EventSink? = null
@@ -249,31 +252,132 @@ object CameraEngine {
     // ------------------------------------------------------------ 连接
 
     fun connect(ip: String, friendlyName: String): Map<String, Any?> {
+        // 已连同一台相机时直接返回：PTP/IP 一台相机只允许一个会话，立刻拆掉再握手
+        // 会让相机来不及释放旧会话，进而进入"连接失败"状态并关闭热点。
+        // 用户实测：主页连上后到调试面板再点一次连接，相机就断线了。
+        val cur = client
+        if (cur != null && deviceInfo != null && cameraIp == ip) {
+            log("已连接到 $ip，跳过重复握手")
+            return describeCamera(cur)
+        }
+        val hadSession = cur != null
         disconnectQuiet()
+        if (hadSession) {
+            // 换相机/强制重连：等相机释放上一个会话再发起新的握手
+            log("等待相机释放上一个会话（${SESSION_SETTLE_MS}ms）")
+            Thread.sleep(SESSION_SETTLE_MS)
+        }
         log("开始握手（friendlyName=\"$friendlyName\"）")
-        val c = PtpIpClient(socketFactory(), ::log)
-        c.connect(ip, friendlyName)
-        c.eventHandler = { code, params ->
-            if (code == Ptp.EVT_OBJECT_ADDED && params.isNotEmpty()) {
-                emit(mapOf("type" to "objectAdded", "handle" to params[0]))
-            }
+        val c: PtpSession = PtpIpClient(socketFactory(), ::log)
+        try {
+            c.connect(ip, friendlyName)
+        } catch (e: Exception) {
+            // 握手失败也要回收客户端，否则每次重试都会泄漏一条已建立的 TCP 连接
+            runCatching { c.close() }
+            throw e
         }
-        c.disconnectHandler = { reason ->
-            stopKeepAlive()
-            liveViewOn = false
-            KeepAliveService.stop(appContext!!)
-            client = null
-            deviceInfo = null
-            cameraIp = null
-            emit(mapOf("type" to "status", "state" to "disconnected", "reason" to reason))
-        }
+        // 先登记为当前会话再装回调：回调内用 client === c 判定归属，
+        // 若先装回调，握手刚结束就断线时会被误判成"旧会话"而漏报断线。
         client = c
         deviceInfo = c.deviceInfo
         cameraIp = ip
+        c.eventHandler = { code, params ->
+            if (client === c) {
+                when {
+                    code == Ptp.EVT_OBJECT_ADDED && params.isNotEmpty() ->
+                        emit(mapOf("type" to "objectAdded", "handle" to params[0]))
+                    // 相机在拨轮/曝光变化时会推 DevicePropChanged（实测推的正是
+                    // 0x5007 焦距、0x500D 光圈、0x500E 快门、0x500F ISO）。
+                    // 转给 Flutter 侧，遥控页据此实时刷新参数显示。
+                    code == Ptp.EVT_DEVICE_PROP_CHANGED && params.isNotEmpty() ->
+                        emit(mapOf("type" to "devicePropChanged", "code" to params[0]))
+                }
+            }
+        }
+        c.disconnectHandler = { reason ->
+            // 旧会话的死亡回调可能在新连接建立后才到达（旧事件线程/旧保活任务），
+            // 那种情况必须忽略，否则会把新连接的状态打回未连接。
+            if (client === c) {
+                stopKeepAlive()
+                liveViewOn = false
+                KeepAliveService.stop(appContext!!)
+                client = null
+                deviceInfo = null
+                cameraIp = null
+                emit(mapOf("type" to "status", "state" to "disconnected", "reason" to reason))
+            } else {
+                log("忽略非当前会话的断线通知：$reason")
+            }
+        }
+        if (client !== c) throw IOException("握手完成后连接立即失效，请重试")
         startKeepAlive()
         KeepAliveService.start(appContext!!)
-        val di = c.deviceInfo!!
         emit(mapOf("type" to "status", "state" to "connected", "ip" to ip))
+        return describeCamera(c)
+    }
+
+    /**
+     * USB 连接：同一套上层逻辑（枚举/下载/遥控）直接跑在 PTP/USB 传输层上。
+     * 实测吞吐 27.1 MB/s（Wi-Fi 的 11 倍，见 docs/USB连接方案.md §1）。
+     * 会弹系统 USB 权限对话框，需要用户点一次「允许」。
+     */
+    fun connectUsb(friendlyName: String): Map<String, Any?> {
+        val cur = client
+        if (cur is PtpUsbClient && cur.isConnected) {
+            log("已连接 USB 相机，跳过重复连接")
+            return describeCamera(cur)
+        }
+        val hadSession = cur != null
+        disconnectQuiet()
+        if (hadSession) {
+            log("等待释放上一个会话（${SESSION_SETTLE_MS}ms）")
+            Thread.sleep(SESSION_SETTLE_MS)
+        }
+        log("开始 USB 连接")
+        val c = PtpUsbClient({ appContext!! }, ::log)
+        try {
+            c.connect("usb", friendlyName)
+        } catch (e: Exception) {
+            runCatching { c.close() }
+            throw e
+        }
+        client = c
+        deviceInfo = c.deviceInfo
+        cameraIp = "usb://${c.cameraName}"
+        c.eventHandler = { code, params ->
+            if (client === c) {
+                when {
+                    code == Ptp.EVT_OBJECT_ADDED && params.isNotEmpty() ->
+                        emit(mapOf("type" to "objectAdded", "handle" to params[0]))
+                    code == Ptp.EVT_DEVICE_PROP_CHANGED && params.isNotEmpty() ->
+                        emit(mapOf("type" to "devicePropChanged", "code" to params[0]))
+                }
+            }
+        }
+        c.disconnectHandler = { reason ->
+            if (client === c) {
+                stopKeepAlive()
+                liveViewOn = false
+                KeepAliveService.stop(appContext!!)
+                client = null
+                deviceInfo = null
+                cameraIp = null
+                emit(mapOf("type" to "status", "state" to "disconnected", "reason" to reason))
+            } else {
+                log("忽略非当前会话的断线通知：$reason")
+            }
+        }
+        if (client !== c) throw IOException("USB 连接完成后立即失效，请重试")
+        // USB 无 NAT/热点保活诉求，保活事务仅作存活探测（周期 GetDeviceInfo）
+        startKeepAlive()
+        KeepAliveService.start(appContext!!)
+        emit(mapOf("type" to "status", "state" to "connected", "ip" to "USB"))
+        return describeCamera(c)
+    }
+
+    /** 相机信息（连接结果与"已连接"快路径共用）。 */
+    private fun describeCamera(c: PtpSession): Map<String, Any?> {
+        val di = c.deviceInfo ?: throw IOException("未取得设备信息，请重试")
         return mapOf(
             "manufacturer" to di.manufacturer,
             "model" to di.model,
@@ -304,7 +408,7 @@ object CameraEngine {
         runCatching { c.close() }
     }
 
-    private fun need(): PtpIpClient = client ?: throw IOException("尚未连接相机")
+    internal fun need(): PtpSession = client ?: throw IOException("尚未连接相机")
 
     /** 相机能力清单：操作码/事件码/属性码原始列表（名称映射在 Flutter 侧） */
     fun capabilities(): Map<String, Any?> {
@@ -326,11 +430,11 @@ object CameraEngine {
     /** 单次枚举的文件数上限，防御异常目录树。 */
     private const val MAX_ENUM_FILES = 5000
 
-    private fun readHandles(c: PtpIpClient, storageId: Long, parent: Long, format: Int = 0): List<Long> =
+    private fun readHandles(c: PtpSession, storageId: Long, parent: Long, format: Int = 0): List<Long> =
         c.transact(Ptp.OP_GET_OBJECT_HANDLES, longArrayOf(storageId, format.toLong(), parent))
             .data.let { ByteReader(it).u32Array() }.toList()
 
-    private fun getObjectInfo(c: PtpIpClient, handle: Long): ObjectInfo =
+    private fun getObjectInfo(c: PtpSession, handle: Long): ObjectInfo =
         PtpDatasets.parseObjectInfo(c.transact(Ptp.OP_GET_OBJECT_INFO, longArrayOf(handle)).data)
 
     private fun infoToMap(o: ObjectInfo): Map<String, Any?> = mapOf(
@@ -605,18 +709,24 @@ object CameraEngine {
                         ?: throw IOException("在所选目录创建文件失败")
                     created = doc
                     isSafDoc = true
-                    resolver.openOutputStream(doc)?.use { out ->
-                        if (resized != null) out.write(resized)
-                        else c.getObjectToStream(handle, size, out) { r, t -> emitProgress(r, t, t0) }
-                    } ?: throw IOException("打开所选目录输出流失败")
+                    val outSaf = resolver.openOutputStream(doc) ?: throw IOException("打开所选目录输出流失败")
+                    // written 是实际落盘的字节数：分块模式少传时 getObjectToStream 会抛异常，
+                    // 绝不会把截断的文件当成成功返回。
+                    val written = outSaf.use { out ->
+                        if (resized != null) {
+                            out.write(resized)
+                            resized.size.toLong()
+                        } else {
+                            c.getObjectToStream(handle, size, out) { r, t -> emitProgress(r, t, t0) }
+                        }
+                    }
                     val ms = SystemClock.elapsedRealtime() - t0
-                    val bytes = resized?.size?.toLong() ?: size
-                    val speed = if (ms > 0) (size / 1048576.0) / (ms / 1000.0) else 0.0
-                    log("下载完成：$fileName → 自定义目录（%.1f MB/s）".format(speed))
-                    emit(mapOf("type" to "progress", "received" to size, "total" to size, "speedMBps" to speed))
+                    val speed = if (ms > 0) (written / 1048576.0) / (ms / 1000.0) else 0.0
+                    log("下载完成：$fileName → 自定义目录（$written 字节，%.1f MB/s）".format(speed))
+                    emit(mapOf("type" to "progress", "received" to written, "total" to written, "speedMBps" to speed))
                     return mapOf(
                         "uri" to doc.toString(),
-                        "bytes" to bytes,
+                        "bytes" to written,
                         "ms" to ms,
                         "speedMBps" to speed,
                         "path" to "所选目录/$fileName",
@@ -638,21 +748,25 @@ object CameraEngine {
                 }
                 val uri = resolver.insert(collection, values) ?: throw IOException("MediaStore 创建文件失败")
                 created = uri
-                resolver.openOutputStream(uri)?.use { out ->
-                    if (resized != null) out.write(resized)
-                    else c.getObjectToStream(handle, size, out) { r, t -> emitProgress(r, t, t0) }
-                } ?: throw IOException("打开输出流失败")
+                val outMs = resolver.openOutputStream(uri) ?: throw IOException("打开输出流失败")
+                val written = outMs.use { out ->
+                    if (resized != null) {
+                        out.write(resized)
+                        resized.size.toLong()
+                    } else {
+                        c.getObjectToStream(handle, size, out) { r, t -> emitProgress(r, t, t0) }
+                    }
+                }
                 values.clear()
                 values.put(MediaStore.MediaColumns.IS_PENDING, 0)
                 resolver.update(uri, values, null, null)
                 val ms = SystemClock.elapsedRealtime() - t0
-                val bytes = resized?.size?.toLong() ?: size
-                val speed = if (ms > 0) (size / 1048576.0) / (ms / 1000.0) else 0.0
-                log("下载完成：$fileName → $relPath（%.1f MB/s）".format(speed))
-                emit(mapOf("type" to "progress", "received" to size, "total" to size, "speedMBps" to speed))
+                val speed = if (ms > 0) (written / 1048576.0) / (ms / 1000.0) else 0.0
+                log("下载完成：$fileName → $relPath（$written 字节，%.1f MB/s）".format(speed))
+                emit(mapOf("type" to "progress", "received" to written, "total" to written, "speedMBps" to speed))
                 return mapOf(
                     "uri" to uri.toString(),
-                    "bytes" to bytes,
+                    "bytes" to written,
                     "ms" to ms,
                     "speedMBps" to speed,
                     "path" to "$relPath/$fileName",
@@ -665,8 +779,10 @@ object CameraEngine {
                     else runCatching { resolver.delete(created, null, null) }
                 }
                 attempt++
-                if (attempt == 1 && e is PtpException && c.effectiveDlMode != PtpIpClient.DlMode.FULL) {
-                    log("分块下载失败（${e.message}），改用整文件下载重试")
+                // 降级条件不能只看 PtpException：分块提前结束抛的是 IOException，
+                // 而那恰恰是最该退回整文件下载的情形。
+                if (attempt == 1 && c.effectiveDlMode != PtpSession.DlMode.FULL) {
+                    log("下载失败（$fileName）：${e.message}；改用整文件下载重试")
                     c.degradeToFullDownload()
                     continue
                 }
@@ -692,10 +808,36 @@ object CameraEngine {
     // ------------------------------------------------------------ 遥控拍摄 / 实时取景
 
     @Volatile var liveViewOn = false
-        private set
+        internal set
 
     /** InitiateCapture 实际可用的参数形态（空参失败后尝试 全存储+默认格式）。 */
     @Volatile private var captureParams: LongArray? = null
+
+    /** 驱动 AF 后留给镜头合焦的时间。发完 0x90C3 只代表指令被接受，不代表已合焦。 */
+    private const val AF_SETTLE_MS = 1_200L
+
+    /**
+     * "相机忙"之后的退避间隔。
+     * 不能短：对焦优先机型在 AF 搜索期间会一直返回 DeviceBusy，
+     * 而**反复按快门会打断并重启 AF**——原来每 500ms 重试一次，
+     * 结果是永远等不到合焦，连试 25 秒后报一句与真实原因无关的"相机忙碌"。
+     */
+    private const val BUSY_RETRY_MS = 1_500L
+
+    /** 快门忙等总预算。原为 25s，太长且没有信息量；8s 足够覆盖一次正常的 AF 合焦。 */
+    private const val CAPTURE_BUDGET_MS = 8_000L
+
+    /** 对焦优先导致拒拍的说明与处理办法（相机侧可关，所以要把菜单路径写清楚）。 */
+    private const val FOCUS_PRIORITY_HINT =
+        "原因通常是相机开启了「未对焦时禁止拍摄」（对焦优先）：对焦没锁定，相机就不会释放快门。\n" +
+            "处理办法（任选其一）：\n" +
+            "· 把相机对准有明暗/线条对比的目标再拍——对着纯色墙面或无纹理物体，AF 永远对不上\n" +
+            "· 先点遥控页的「对焦」按钮，等画面合焦后再按拍摄\n" +
+            "· 相机端改为释放优先：自定义设定菜单 → a1 AF-C 优先选择 / a2 AF-S 优先选择 → 选「释放」\n" +
+            "· 或把镜头切到手动对焦（MF），相机就不再检查对焦"
+
+    /** 向遥控页上报拍摄阶段，让等待过程有解释（对焦 / 快门）。 */
+    private fun emitPhase(phase: String) = emit(mapOf("type" to "capturePhase", "phase" to phase))
 
     /** 实际生效的取景帧操作码（0x9202 / 0x9203 自动探测）。 */
     fun liveViewStart(): Map<String, Any?> {
@@ -722,14 +864,17 @@ object CameraEngine {
     /** 拉取一帧实时取景 JPEG（0x9203；未启动时返回 NotLiveView 错误）。 */
     fun liveViewFrame(): ByteArray {
         val c = need()
-        val data = c.transactShort(Ptp.OP_NIKON_LV_FRAME, LongArray(0), 1500).data
+        // 超时放宽到 3 秒：一次超时会让命令流永久错位、连接作废（见 PtpIpClient），
+        // 不能因为取景热身期单帧慢就误杀整条连接。
+        // 上层的取帧循环另有最小间隔，避免把相机逼到超时。
+        val data = c.transactShort(Ptp.OP_NIKON_LV_FRAME, LongArray(0), 3000).data
         liveViewOn = true
         // 帧数据若带头部，从 JPEG SOI 标记截断
         val soi = indexOfSoi(data)
         return if (soi > 0) data.copyOfRange(soi, data.size) else data
     }
 
-    private fun indexOfSoi(data: ByteArray): Int {
+    internal fun indexOfSoi(data: ByteArray): Int {
         for (i in 0 until data.size - 1) {
             if (data[i] == 0xFF.toByte() && data[i + 1] == 0xD8.toByte()) return i
         }
@@ -740,7 +885,14 @@ object CameraEngine {
     fun capture(): Map<String, Any?> {
         val c = need()
         drainCheckEvents()
-        var attempt = 0
+        // 对焦优先机型：先驱动一次 AF 并**等它稳定**，再按快门。
+        // 否则相机会在 AF 搜索期间返回 DeviceBusy，而重试又会打断 AF，形成死循环。
+        if (isManualFocus() != true && afDriveBlocking(c)) {
+            emitPhase("af")
+            Thread.sleep(AF_SETTLE_MS)
+        }
+        emitPhase("shutter")
+        var busyCount = 0
         var recovered = false
         val t0 = SystemClock.elapsedRealtime()
         while (true) {
@@ -749,26 +901,24 @@ object CameraEngine {
                 captureParams = captureParams ?: LongArray(0)
                 break
             } catch (e: PtpException) {
-                // 未对焦（相机设置"未对焦时禁止拍摄"）：明确提示并结束本次拍摄
+                // 未对焦：相机已明确告知对焦没锁上，直接给结论，不再重试
                 if (e.code == 0xA004) {
                     log("快门被拒：未完成对焦（0xA004）")
-                    throw IOException(
-                        "未完成对焦，快门已锁定（相机开启了「未对焦时禁止拍摄」）。" +
-                            "请半按相机快门完成对焦后再试",
-                    )
+                    throw IOException("未完成对焦，快门未释放。\n$FOCUS_PRIORITY_HINT")
                 }
-                if (e.code == Ptp.RESP_DEVICE_BUSY || e.code == 0x2002 || e.code == 0xA004) {
-                    attempt++
+                val busy = e.code == Ptp.RESP_DEVICE_BUSY || e.code == 0x2002
+                if (busy) {
+                    busyCount++
                     val elapsed = SystemClock.elapsedRealtime() - t0
-                    if (elapsed > 25_000) {
+                    if (elapsed > CAPTURE_BUDGET_MS) {
                         throw IOException(
-                            "相机持续忙碌，无法拍摄（已重试 $attempt 次 / ${elapsed / 1000}s）。" +
-                                "请查看相机屏幕是否有待处理提示",
+                            "快门在 ${elapsed / 1000}s 内始终未被释放（相机一直处于忙碌/未对焦）。\n" +
+                                FOCUS_PRIORITY_HINT,
                         )
                     }
-                    log("相机忙（${Ptp.respName(e.code)}），重试 $attempt（已 ${elapsed / 1000}s）")
-                    // 第 6 次起探测 SDRAM 待取图像：上一张未取走会导致快门持续被拒
-                    if (attempt >= 6) {
+                    log("相机忙（${Ptp.respName(e.code)}）第 $busyCount 次，已 ${elapsed / 1000}s")
+                    // SDRAM 待取图像假说：上一张未取走会让快门持续被拒
+                    if (busyCount == 2) {
                         val info = runCatching {
                             c.transact(Ptp.OP_GET_OBJECT_INFO, longArrayOf(0xFFFF0001L)).data
                         }.getOrNull()
@@ -778,14 +928,14 @@ object CameraEngine {
                         }
                     }
                     // 疑似误入实时取景状态：尝试退出恢复拍摄
-                    if (attempt == 8 && !recovered) {
+                    if (busyCount == 3 && !recovered) {
                         recovered = true
                         val ok = runCatching { c.transactShort(Ptp.OP_NIKON_LV_END, LongArray(0), 2000) }.isSuccess
-                        log(if (ok) "已尝试退出实时取景（0x9201 成功），恢复拍摄" else "0x9201 无效，跳过恢复")
+                        log(if (ok) "已尝试退出实时取景，恢复拍摄" else "退出取景无效，跳过恢复")
                     }
                     drainCheckEvents()
                     runCatching { c.transact(Ptp.OP_NIKON_DEVICE_READY) }
-                    Thread.sleep(500)
+                    Thread.sleep(BUSY_RETRY_MS)
                     continue
                 }
                 if (captureParams == null && e.code in intArrayOf(0x2005, 0x2006, 0x2007)) {
@@ -796,6 +946,7 @@ object CameraEngine {
                 throw e
             }
         }
+        emitPhase("done")
         log("遥控快门已触发")
         // 拍后异步排水：相机事件队列里通常有待处理的新照片事件
         Thread {
@@ -816,30 +967,34 @@ object CameraEngine {
     fun lvCapture(): Map<String, Any?> {
         val c = need()
         if (!liveViewOn) throw IOException("实时取景未开启")
+        // 与盲拍同一策略：先驱动一次 AF 并等它稳定，再按快门。
+        // 取景中驱动 AF 后立刻按快门，会撞上相机正在对焦的忙碌窗口。
+        if (isManualFocus() != true && afDriveBlocking(c)) {
+            emitPhase("af")
+            Thread.sleep(AF_SETTLE_MS)
+        }
+        emitPhase("shutter")
         var attempt = 0
         val t0 = SystemClock.elapsedRealtime()
         while (true) {
             try {
                 c.transact(Ptp.OP_INITIATE_CAPTURE, captureParams ?: LongArray(0))
                 captureParams = captureParams ?: LongArray(0)
+                emitPhase("done")
                 log("取景中快门已触发（0x100E）")
                 return mapOf("ok" to true)
             } catch (e: PtpException) {
                 if (e.code == 0xA004) {
-                    throw IOException(
-                        "相机对焦未锁定（对焦优先）。请半按相机快门对焦后再试，" +
-                            "或在相机菜单关闭「未对焦时禁止拍摄」",
-                    )
+                    throw IOException("相机对焦未锁定，快门未释放。\n$FOCUS_PRIORITY_HINT")
                 }
                 val busy = e.code == Ptp.RESP_DEVICE_BUSY || e.code == 0x2002
                 val paramErr = captureParams == null && e.code in intArrayOf(0x2005, 0x2006, 0x2007)
                 attempt++
                 val elapsed = SystemClock.elapsedRealtime() - t0
                 if (!busy && !paramErr) throw e
-                if (elapsed > 20_000) {
+                if (elapsed > CAPTURE_BUDGET_MS) {
                     throw IOException(
-                        "相机持续忙碌（${elapsed / 1000}s）。请半按相机快门对焦后再试，" +
-                            "或检查相机屏幕是否有待处理提示",
+                        "快门在 ${elapsed / 1000}s 内始终未被释放。\n$FOCUS_PRIORITY_HINT",
                     )
                 }
                 when (attempt) {
@@ -850,7 +1005,7 @@ object CameraEngine {
                             Ptp.respName((r.exceptionOrNull() as? PtpException)?.code ?: -1))
                     }
                     2 -> {
-                        // AF 驱动（0x90C3，取景中可能被拒）
+                        // 再驱动一次 AF（0x90C3，取景中可能被拒）
                         runCatching { c.transact(0x90C3.toInt()) }
                     }
                     3 -> {
@@ -860,33 +1015,12 @@ object CameraEngine {
                         }
                     }
                 }
-                Thread.sleep(400)
+                // 长间隔：与盲拍同理，短间隔重试会打断相机的对焦搜索
+                Thread.sleep(BUSY_RETRY_MS)
             }
         }
     }
 
-    /** 取景中 AF/拍摄通道探针（调试面板用）。 */
-    fun probeLvAf(handle: Long): List<String> {
-        val c = need()
-        val out = ArrayList<String>()
-        fun t(label: String, op: Int, params: LongArray): String {
-            val r = runCatching { c.transactShort(op, params, 2500) }
-            return if (r.isSuccess) {
-                val d = r.getOrThrow().data
-                "$label → OK ${d.size}B 头: ${d.take(12).joinToString(" ") { "%02X".format(it) }}"
-            } else {
-                "$label → ${Ptp.respName((r.exceptionOrNull() as? PtpException)?.code ?: -1)}"
-            }
-        }
-        out += t("0x9405 无参（疑似LV AF/拍摄）", Ptp.OP_NIKON_LV_CAPTURE, LongArray(0))
-        out += t("0x100E 标准快门（会实拍！）", Ptp.OP_INITIATE_CAPTURE, LongArray(0))
-        out += t("0x9205 AF区域[128,128]", 0x9205, longArrayOf(128L, 128L))
-        out += t("0x9204 MF驱动[1,0]", 0x9204, longArrayOf(1L, 0L))
-        out += t("0x90C3 AF驱动", 0x90C3, LongArray(0))
-        out += t("0x9209 状态", 0x9209, LongArray(0))
-        out.forEach { log("LV对焦探针 $it") }
-        return out
-    }
 
     // ---- 厂商事件队列排水（0x90C1 / 0x90C0 自适应）----
 
@@ -946,7 +1080,7 @@ object CameraEngine {
         else -> null
     }
 
-    private fun propDescCurrent(c: PtpIpClient, code: Long): Long? = runCatching {
+    private fun propDescCurrent(c: PtpSession, code: Long): Long? = runCatching {
         val d = c.transact(Ptp.OP_GET_DEVICE_PROP_DESC, longArrayOf(code)).data
         if (d.size < 8) return@runCatching null
         val r = ByteReader(d)
@@ -969,7 +1103,7 @@ object CameraEngine {
      * AF 驱动（试验）：仅尝试 0x90C3。
      * ⚠️ 0x9206 疑似为本代机型的 StartLiveView，调用后快门会被持续拒绝，已移除。
      */
-    private fun afDriveBlocking(c: PtpIpClient): Boolean {
+    private fun afDriveBlocking(c: PtpSession): Boolean {
         if (afDriveOp == -1L) return false
         if (afDriveOp != 0L) {
             return runCatching { c.transact(afDriveOp.toInt()) }.isSuccess
@@ -992,346 +1126,182 @@ object CameraEngine {
         return mapOf("ok" to ok)
     }
 
-    /** 当前拍摄参数（光圈/快门/ISO，只读展示）。经 DevicePropDesc 按数据类型解析。 */
+    // ------------------------------------------------------------ 拍摄参数（描述符 + 设置）
+
+    /**
+     * 两种传输层的设备属性码方言。
+     * USB 走标准 PTP；Wi-Fi 智能设备模式是尼康的裁剪方言（实测映射，见交接文档 §14）。
+     * Wi-Fi 的档位属性码未确认——probeProps 会把全部属性 Dump 出来，确认后填上。
+     */
+    private data class PropDialect(
+        val fNumber: Long, val exposureTime: Long, val iso: Long, val mode: Long?,
+    )
+
+    private val propDialect: PropDialect
+        get() = if (client is PtpUsbClient) {
+            // 标准 PTP：0x5006 FNumber、0x500C ExposureTime、0x5007 ExposureIndex(ISO)、
+            // 0x500D ExposureProgramMode（1=M 2=P(auto) 3=A 4=S）
+            PropDialect(0x5006, 0x500C, 0x5007, 0x500D)
+        } else {
+            PropDialect(0x500D, 0x500E, 0x500F, null)
+        }
+
+    /** 设备属性描述符：当前值 + 可选集/范围 + 是否可写。 */
+    data class PropDesc(
+        val code: Long,
+        val dtype: Int,
+        val writable: Boolean,
+        val value: Long,
+        val values: List<Long>,
+        val range: List<Long>?,
+    )
+
+    /** 完整解析 GetDevicePropDesc（含可选枚举/范围表）。 */
+    private fun propDescFull(c: PtpSession, code: Long): PropDesc? = runCatching {
+        val d = c.transact(Ptp.OP_GET_DEVICE_PROP_DESC, longArrayOf(code)).data
+        val r = ByteReader(d)
+        r.u16() // 属性码
+        val dtype = r.u16()
+        val getSet = r.u8()
+        ptpValue(r, dtype) // 出厂默认值（跳过）
+        val current = ptpValue(r, dtype) ?: return@runCatching null
+        var values = emptyList<Long>()
+        var range: List<Long>? = null
+        when (r.u8()) { // FormFlag：0=无，1=Range，2=Enumeration
+            1 -> {
+                val min = ptpValue(r, dtype)
+                val max = ptpValue(r, dtype)
+                val step = ptpValue(r, dtype)
+                if (min != null && max != null && step != null) range = listOf(min, max, step)
+            }
+            2 -> {
+                val n = r.u16()
+                values = (0 until n).mapNotNull { ptpValue(r, dtype) }
+            }
+        }
+        PropDesc(code, dtype, getSet != 0, current, values, range)
+    }.getOrNull()
+
+    private fun descMap(p: PropDesc?): Map<String, Any?>? = p?.let {
+        mapOf(
+            "code" to it.code,
+            "dtype" to it.dtype,
+            "writable" to it.writable,
+            "value" to it.value,
+            "values" to it.values,
+            "range" to it.range,
+        )
+    }
+
+    /**
+     * 当前拍摄参数（带描述符）：value 用于显示，values/range 供编辑器生成选项，
+     * writable 供置灰。经 DevicePropDesc 按数据类型解析。
+     */
     fun shotParams(): Map<String, Any?> {
         val c = need()
-
-        fun propDesc(code: Long): Long? = propDescCurrent(c, code)
+        val dl = propDialect
+        val mode = dl.mode?.let { propDescFull(c, it) }
         return mapOf(
-            "fNumber" to propDesc(0x500D),
-            "exposureTime" to propDesc(0x500E),
-            "iso" to propDesc(0x500F),
+            "fNumber" to descMap(propDescFull(c, dl.fNumber)),
+            "exposureTime" to descMap(propDescFull(c, dl.exposureTime)),
+            "iso" to descMap(propDescFull(c, dl.iso)),
+            "mode" to mode?.let {
+                mapOf(
+                    "code" to it.code,
+                    "value" to it.value,
+                    "values" to it.values,
+                    "writable" to it.writable,
+                )
+            },
             "battery" to battery(),
         )
     }
 
+    /**
+     * 设置拍摄参数（SetDevicePropDesc，数据外发）。
+     * 相机侧规则（档位不允许改的参数）以 PtpException 原样上抛，由 UI 提示。
+     */
+    fun setShotParam(name: String, value: Long): Map<String, Any?> {
+        val c = need()
+        val dl = propDialect
+        val code = when (name) {
+            "fNumber" -> dl.fNumber
+            "exposureTime" -> dl.exposureTime
+            "iso" -> dl.iso
+            else -> throw IOException("未知参数：$name")
+        }
+        val d = propDescFull(c, code) ?: throw IOException("相机未提供该参数")
+        if (!d.writable) throw IOException("当前模式下该参数不可修改")
+        val payload = ByteArray(4 + when (d.dtype) {
+            0x0001, 0x0002 -> 1
+            0x0003, 0x0004 -> 2
+            else -> 4
+        })
+        var off = 0
+        PtpWire.putU16(payload, off, code.toInt()); off += 2
+        PtpWire.putU16(payload, off, d.dtype); off += 2
+        when (d.dtype) {
+            0x0001, 0x0002 -> payload[off] = value.toByte()
+            0x0003, 0x0004 -> PtpWire.putU16(payload, off, value.toInt())
+            else -> PtpWire.putU32(payload, off, value)
+        }
+        c.transactWithDataOut(Ptp.OP_SET_DEVICE_PROP_DESC, LongArray(0), payload)
+        // 立即回读，UI 拿到相机确认后的真值
+        val dl2 = propDialect
+        val fresh = when (name) {
+            "fNumber" -> descMap(propDescFull(c, dl2.fNumber))
+            "exposureTime" -> descMap(propDescFull(c, dl2.exposureTime))
+            else -> descMap(propDescFull(c, dl2.iso))
+        }
+        return mapOf("name" to name, "desc" to fresh)
+    }
+
+    /**
+     * 属性码 Dump（调试面板）：读常见标准码 + 尼康厂商段的 GetDevicePropDesc，
+     * 用于确认 Wi-Fi 方言的档位属性码（USB连接方案/交接文档均有记录）。
+     */
+    fun probeProps(): List<String> {
+        val c = need()
+        val out = ArrayList<String>()
+        val codes = (0x5001..0x5017L) + (0xD100..0xD11FL)
+        for (code in codes) {
+            val p = propDescFull(c, code) ?: continue
+            val form = when {
+                p.values.isNotEmpty() -> "枚举[${p.values.joinToString(",")}]"
+                p.range != null -> "范围[${p.range.joinToString(",")}]"
+                else -> "无表"
+            }
+            out += "0x%04X dtype=0x%04X %s 当前=%d %s".format(
+                code, p.dtype, if (p.writable) "可写" else "只读", p.value, form,
+            )
+        }
+        if (out.isEmpty()) out += "（没有读到任何设备属性）"
+        return out
+    }
+
+
     // ------------------------------------------------------------ 协议探针（调试面板用）
+    //
+    // 探针实现已移到 CameraProbes.kt（原文件逾 1500 行，探针段约占 380 行）。
+    // 这里只留门面供 NikonsyncPlugin 调用；CameraProbes 需要的那几个成员已放宽为 internal。
 
-    /**
-     * 高速下载探针：0x9400~0x9406 逐个尝试多种参数形态，
-     * 记录响应码/数据量，用于定位新一代高速读取操作。
-     */
-    fun probeHiSpeed(handle: Long): List<String> {
-        val c = need()
-        val out = ArrayList<String>()
-        val shapes = listOf(
-            "句柄,偏移,长度" to longArrayOf(handle, 0, 65536),
-            "句柄,长度" to longArrayOf(handle, 65536),
-            "句柄" to longArrayOf(handle),
-        )
-        var op = 0x9400
-        while (op <= 0x9406) {
-            for ((label, params) in shapes) {
-                val result = try {
-                    val data = c.transact(op, params).data
-                    "OK ${data.size}B"
-                } catch (e: PtpException) {
-                    Ptp.respName(e.code)
-                } catch (e: Exception) {
-                    e.message ?: "异常"
-                }
-                out += "0x%04X [%s] → %s".format(op, label, result)
-            }
-            op++
-        }
-        out.forEach { log("探针 $it") }
-        return out
-    }
+    fun probeHiSpeed(handle: Long): List<String> = CameraProbes.probeHiSpeed(handle)
 
-    /** 相机端缩放探针：0x9207 GetObjectResize 的参数形态尝试。 */
-    fun probeResize(handle: Long): List<String> {
-        val c = need()
-        val out = ArrayList<String>()
-        val shapes = listOf(
-            "句柄" to longArrayOf(handle),
-            "句柄,1920" to longArrayOf(handle, 1920),
-            "句柄,1920,1280" to longArrayOf(handle, 1920, 1280),
-            "句柄,2" to longArrayOf(handle, 2),
-        )
-        for ((label, params) in shapes) {
-            val result = try {
-                val data = c.transact(Ptp.OP_NIKON_GET_OBJECT_RESIZE, params).data
-                "OK ${data.size}B"
-            } catch (e: PtpException) {
-                Ptp.respName(e.code)
-            } catch (e: Exception) {
-                e.message ?: "异常"
-            }
-            out += "0x9207 [$label] → $result"
-        }
-        out.forEach { log("探针 $it") }
-        return out
-    }
+    fun probeResize(handle: Long): List<String> = CameraProbes.probeResize(handle)
 
-    /** 实时取景探针：0x9200~0x9203 逐个试探（不包含会真拍照的操作）。 */
-    fun probeLiveView(): List<String> {
-        val c = need()
-        val out = ArrayList<String>()
-        for (op in intArrayOf(0x9200, 0x9201, 0x9202, 0x9203)) {
-            val r = try {
-                val d = c.transact(op).data
-                "OK ${d.size}B"
-            } catch (e: PtpException) {
-                Ptp.respName(e.code)
-            } catch (e: Exception) {
-                e.message ?: "异常"
-            }
-            out += "0x%04X → %s".format(op, r)
-        }
-        out.forEach { log("取景探针 $it") }
-        return out
-    }
+    fun probeLiveView(): List<String> = CameraProbes.probeLiveView()
 
-    /**
-     * 实时取景链路探针 v3（短超时，总时长 ≤30s，不会卡死）：
-     * 0x9206 疑似 StartLiveView（响应可能迟到，3s 内未回也继续）；
-     * 随后 12 秒内轮询帧候选 0x9403~0x9406/0x9202/0x9203；
-     * 最后 0x9201 疑似 EndLiveView 恢复。全部结果写日志。
-     */
-    fun probeLiveView2(): List<String> {
-        val c = need()
-        val out = ArrayList<String>()
+    fun probeLvFrames(): List<String> = CameraProbes.probeLvFrames()
 
-        fun tryOp(op: Long, params: LongArray, timeoutMs: Int): Pair<Boolean, Int> {
-            val r = runCatching { c.transactShort(op.toInt(), params, timeoutMs) }
-            return if (r.isSuccess) {
-                true to r.getOrThrow().data.size
-            } else {
-                false to ((r.exceptionOrNull() as? PtpException)?.code ?: -1)
-            }
-        }
+    fun probeLiveView2(): List<String> = CameraProbes.probeLiveView2()
 
-        val (startOk, startInfo) = tryOp(0x9206L, LongArray(0), 3000)
-        out += "0x9206(疑似Start) → " + if (startOk) "OK ${startInfo}B" else "无响应/失败(0x%04X)".format(startInfo)
+    fun probeLiveView3(handle: Long): List<String> = CameraProbes.probeLiveView3(handle)
 
-        if (startOk || startInfo == -1) {
-            // 启动疑似成功（或状态未知）：12 秒内轮询帧候选
-            val frameOps = longArrayOf(0x9403L, 0x9404L, 0x9405L, 0x9406L, 0x9202L, 0x9203L)
-            val t0 = SystemClock.elapsedRealtime()
-            var found = false
-            while (SystemClock.elapsedRealtime() - t0 < 12_000 && !found && client != null) {
-                for (op in frameOps) {
-                    val (ok, n) = tryOp(op, LongArray(0), 2000)
-                    if (ok && n > 0) {
-                        out += "帧候选 0x%04X → OK %dB ★".format(op, n)
-                        found = true
-                    }
-                }
-            }
-            if (!found) out += "12s 内未发现返回帧数据的操作"
-        }
-        val (endOk, endInfo) = tryOp(Ptp.OP_NIKON_LV_END.toLong(), LongArray(0), 2000)
-        out += "0x9201(疑似End) → " + if (endOk) "OK ${endInfo}B" else "无响应/失败(0x%04X)".format(endInfo)
-        liveViewOn = false
-        out.forEach { log("取景2 $it") }
-        return out
-    }
+    fun probeLiveView4(handle: Long): List<String> = CameraProbes.probeLiveView4(handle)
 
-    /**
-     * 实时取景探针 v3：启动取景后，对候选操作在"取景中"状态下的响应码全量记录。
-     * 对比基线（未取景：0x9403~06=0xA00B NotLiveView、0x9400~02=ParameterNotSupported），
-     * 响应码发生变化的操作即为取景帧/状态通道。最后恢复并验证。
-     */
-    fun probeLiveView3(handle: Long): List<String> {
-        val c = need()
-        val out = ArrayList<String>()
+    fun probeLiveView5(handle: Long): List<String> = CameraProbes.probeLiveView5(handle)
 
-        fun tryOp(op: Long, params: LongArray, timeoutMs: Int = 2000): Pair<Boolean, Int> {
-            val r = runCatching { c.transactShort(op.toInt(), params, timeoutMs) }
-            return if (r.isSuccess) {
-                true to r.getOrThrow().data.size
-            } else {
-                false to ((r.exceptionOrNull() as? PtpException)?.code ?: -1)
-            }
-        }
-
-        fun fmt(op: Long, ok: Boolean, info: Int): String =
-            "0x%04X → %s".format(op, if (ok) "OK ${info}B" else Ptp.respName(info))
-
-        // 启动取景（首次可能耗时较长，短超时重试）
-        val (s1, _) = tryOp(0x9206L, LongArray(0), 3000)
-        if (!s1) tryOp(0x9206L, LongArray(0), 5000)
-        out += "start 0x9206 → $s1"
-
-        // 取景中状态下的候选操作响应码全量记录
-        val candidates = listOf(
-            Triple(0x9400L, longArrayOf(handle, 0L, 65536L), "句柄,偏移,长度"),
-            Triple(0x9401L, longArrayOf(handle), "句柄"),
-            Triple(0x9402L, longArrayOf(handle), "句柄"),
-            Triple(0x9403L, LongArray(0), "无参"),
-            Triple(0x9404L, LongArray(0), "无参"),
-            Triple(0x9405L, LongArray(0), "无参"),
-            Triple(0x9406L, LongArray(0), "无参"),
-            Triple(0x9202L, LongArray(0), "无参"),
-            Triple(0x9203L, LongArray(0), "无参"),
-            Triple(0x9204L, LongArray(0), "无参"),
-            Triple(0x9205L, LongArray(0), "无参"),
-            Triple(0x9209L, LongArray(0), "无参"),
-        )
-        for ((op, params, label) in candidates) {
-            val (ok, info) = tryOp(op, params)
-            out += "LV 0x%04X [%s] → %s".format(op, label, fmt(op, ok, info).substringAfter("→ "))
-        }
-
-        // 关闭取景并验证回到基线
-        tryOp(Ptp.OP_NIKON_LV_END.toLong(), LongArray(0), 2000)
-        val (ok2, info2) = tryOp(0x9403L, LongArray(0), 2000)
-        out += "end 0x9201 → 已执行；验证 0x9403 → ${Ptp.respName(info2)}"
-
-        liveViewOn = false
-        out.forEach { log("取景3 $it") }
-        return out
-    }
-
-    /**
-     * 实时取景探针 v4：状态机完整探索。
-     * 已知：0x9201 后 0x9403 从 NotLiveView 变 OK；0x9400 三参数稳定返回 OutOfFocus（疑似带对焦检查的拍摄类操作）。
-     * 本探针：对焦 → 0x9400 对比 → 0x9201/0x9206 双向状态翻转 → 每个 OK 响应输出数据头 16 字节 hex。
-     * 注意：0x9400 若为拍摄类操作，对焦后调用可能会实拍一张测试照。
-     */
-    fun probeLiveView4(handle: Long): List<String> {
-        val c = need()
-        val out = ArrayList<String>()
-
-        fun hexHead(data: ByteArray): String =
-            data.take(16).joinToString(" ") { "%02X".format(it) }
-
-        fun tryOp(label: String, op: Long, params: LongArray): String {
-            val r = runCatching { c.transactShort(op.toInt(), params, 2500) }
-            return if (r.isSuccess) {
-                val d = r.getOrThrow().data
-                "$label → OK ${d.size}B 头: ${hexHead(d)}"
-            } else {
-                val code = (r.exceptionOrNull() as? PtpException)?.code ?: -1
-                "$label → ${Ptp.respName(code)}"
-            }
-        }
-
-        // 0) 先对焦（0x90C3），排除未对焦干扰
-        runCatching { c.transact(0x90C3.toInt()) }
-        out += "0x90C3 AF 已驱动"
-        out += tryOp("基线 0x9403", 0x9403L, LongArray(0))
-
-        // 1) 对焦后的 0x9400：若为拍摄类操作会在此现形
-        out += tryOp("对焦后 0x9400[句柄,偏移,长度]", 0x9400L, longArrayOf(handle, 0L, 65536L))
-
-        // 2) 0x9201 后的全家族状态
-        out += tryOp("0x9201", 0x9201L, LongArray(0))
-        out += tryOp("0x9201后 0x9403", 0x9403L, LongArray(0))
-        out += tryOp("0x9201后 0x9403再来一次", 0x9403L, LongArray(0))
-        out += tryOp("0x9201后 0x9404", 0x9404L, LongArray(0))
-        out += tryOp("0x9201后 0x9405", 0x9405L, LongArray(0))
-        out += tryOp("0x9201后 0x9406", 0x9406L, LongArray(0))
-        out += tryOp("0x9201后 0x9202", 0x9202L, LongArray(0))
-        out += tryOp("0x9201后 0x9209", 0x9209L, LongArray(0))
-        out += tryOp("0x9201后 0x9400[句柄,偏移,长度]", 0x9400L, longArrayOf(handle, 0L, 65536L))
-
-        // 3) 0x9206 后的状态（若 0x9206=end 则回到基线）
-        out += tryOp("0x9206", 0x9206L, LongArray(0))
-        out += tryOp("0x9206后 0x9403", 0x9403L, LongArray(0))
-
-        // 4) 再次 0x9201，验证可重复开启
-        out += tryOp("再次 0x9201", 0x9201L, LongArray(0))
-        out += tryOp("再次后 0x9403", 0x9403L, LongArray(0))
-        out += tryOp("收尾 0x9206", 0x9206L, LongArray(0))
-        out += tryOp("收尾后 0x9403", 0x9403L, LongArray(0))
-
-        liveViewOn = false
-        out.forEach { log("取景4 $it") }
-        return out
-    }
-
-    /**
-     * 实时取景探针 v5：候机唤醒 → 启动取景 → 耐心轮询等取景热身（最长 30s） → 抳焦后测试 LV 拍摄 → 关闭。
-     * 已知：0x9201=开启取景状态、0x9206=关闭、0x9403 在取景中返回 OK（首先 0B，可能热身后出帧）、
-     *       0x9405 在取景中返回 OutOfFocus（疑似取景中拍摄，对焦优先）、0x9209 返回状态字节。
-     */
-    fun probeLiveView5(handle: Long): List<String> {
-        val c = need()
-        val out = ArrayList<String>()
-
-        fun tryOp(op: Long, params: LongArray, timeoutMs: Int = 2500): Pair<Boolean, Int> {
-            val r = runCatching { c.transactShort(op.toInt(), params, timeoutMs) }
-            return if (r.isSuccess) {
-                true to r.getOrThrow().data.size
-            } else {
-                false to ((r.exceptionOrNull() as? PtpException)?.code ?: -1)
-            }
-        }
-
-        fun hexHead(data: ByteArray): String = data.take(16).joinToString(" ") { "%02X".format(it) }
-
-        // 0) 唤醒相机：DeviceReady 轮询直到就绪
-        var wake = 0
-        while (wake < 10) {
-            val r = runCatching { c.transact(Ptp.OP_NIKON_DEVICE_READY) }
-            if (r.isSuccess) break
-            wake++
-            Thread.sleep(500)
-        }
-        out += "唤醒：${
-            if (wake == 0) "立即就绪" else "等待 ${wake * 500}ms 后就绪"
-        }"
-
-        // 1) 基线
-        out += "基线 0x9203 → " + tryOp(0x9203L, LongArray(0)).let { (ok, n) -> if (ok) "OK ${n}B" else Ptp.respName(n) }
-        out += "基线 0x9209 → " + tryOp(0x9209L, LongArray(0)).let { (ok, n) -> if (ok) "OK ${n}B" else Ptp.respName(n) }
-
-        // 2) 启动取景
-        val (sOk, _) = tryOp(0x9201L, LongArray(0), 3000)
-        out += "0x9201 启动 → $sOk"
-
-        // 3) 耐心轮询 30s：等 0x9403/0x9203 出帧
-        var frameOp: Long = 0
-        var frames = 0
-        val t0 = SystemClock.elapsedRealtime()
-        var lastSizes = ""
-        var afDone = false
-        while (SystemClock.elapsedRealtime() - t0 < 30_000 && client != null) {
-            val (ok3, n3) = tryOp(0x9403L, LongArray(0), 1500)
-            val (ok2, n2) = tryOp(0x9203L, LongArray(0), 1500)
-            lastSizes = "0x9403=${if (ok3) "${n3}B" else Ptp.respName(n3)} 0x9203=${if (ok2) "${n2}B" else Ptp.respName(n2)}"
-            if (ok3 && n3 > 0 && frameOp == 0L) frameOp = 0x9403L
-            if (ok2 && n2 > 0 && frameOp == 0L) frameOp = 0x9203L
-            if (frameOp != 0L) {
-                // 拿到帧：连续采样 5 次记录帧大小曲线
-                var i = 0
-                while (i < 5 && client != null) {
-                    val (okF, nF) = tryOp(frameOp, LongArray(0), 1500)
-                    out += "帧#${frames + 1} 0x%04X → ${if (okF) "${nF}B" else Ptp.respName(nF)}".format(frameOp)
-                    if (okF) frames++
-                    i++
-                    Thread.sleep(300)
-                }
-                break
-            }
-            // 第 6 轮后驱动一次 AF（取景中对焦可能是出帧前提）
-            if (attempt_marker(t0)) {
-                runCatching { c.transact(0x90C3.toInt()) }
-                out += "取景中驱动 AF"
-            }
-        }
-        out += "轮询结果：$lastSizes，帧数=$frames，帧通道=0x%04X".format(frameOp)
-
-        // 4) 取景中拍摄测试（先 AF 再 0x9405）
-        if (frameOp != 0L || frames > 0) {
-            runCatching { c.transact(0x90C3.toInt()) }
-            val (ok5, n5) = tryOp(0x9405L, LongArray(0), 2500)
-            out += "取景中 0x9405 拍摄测试 → " + if (ok5) "OK ${n5}B" else Ptp.respName(n5)
-        }
-
-        // 5) 关闭并验证
-        tryOp(0x9206L, LongArray(0), 2000)
-        val (okF2, nF2) = tryOp(0x9403L, LongArray(0), 2000)
-        out += "关闭后 0x9403 → " + if (okF2) "OK ${nF2}B" else Ptp.respName(nF2)
-
-        liveViewOn = false
-        out.forEach { log("取景5 $it") }
-        return out
-    }
-
-    private fun attempt_marker(t0: Long): Boolean =
-        SystemClock.elapsedRealtime() - t0 > 6_000 && (SystemClock.elapsedRealtime() - t0) % 3000 < 700
+    fun probeLvAf(handle: Long): List<String> = CameraProbes.probeLvAf(handle)
 
     // ------------------------------------------------------------ 已下载媒体管理
 

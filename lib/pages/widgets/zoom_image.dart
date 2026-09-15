@@ -4,10 +4,19 @@ import 'package:flutter/material.dart';
 
 /// 支持双击放大/还原的图片（配合双指缩放）。
 class ZoomableImage extends StatefulWidget {
-  const ZoomableImage({super.key, required this.bytes, this.fit = BoxFit.contain});
+  const ZoomableImage({
+    super.key,
+    required this.bytes,
+    this.fit = BoxFit.contain,
+    this.quarterTurns = 0,
+  });
 
   final Uint8List bytes;
   final BoxFit fit;
+
+  /// 顺时针 90° 的次数。旋转放在 InteractiveViewer 内层，
+  /// 这样缩放/拖拽的坐标系仍与屏幕一致，手感不会跟着转。
+  final int quarterTurns;
 
   @override
   State<ZoomableImage> createState() => _ZoomableImageState();
@@ -48,7 +57,12 @@ class _ZoomableImageState extends State<ZoomableImage> {
         transformationController: _tc,
         maxScale: 6,
         panEnabled: true,
-        child: Center(child: Image.memory(widget.bytes, fit: widget.fit, gaplessPlayback: true)),
+        child: Center(
+          child: RotatedBox(
+            quarterTurns: widget.quarterTurns,
+            child: Image.memory(widget.bytes, fit: widget.fit, gaplessPlayback: true),
+          ),
+        ),
       ),
     );
   }

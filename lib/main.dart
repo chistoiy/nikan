@@ -6,6 +6,7 @@ import 'app_model.dart';
 import 'engine/app_log.dart';
 import 'pages/connect_page.dart';
 import 'pages/downloads_page.dart';
+import 'pages/widgets/app_widgets.dart';
 
 /// 全局模型（应用生命周期单例）
 final AppModel appModel = AppModel();
@@ -68,7 +69,7 @@ class _HomeShellState extends State<HomeShell> {
       bottomNavigationBar: NavigationBarTheme(
         data: NavigationBarThemeData(
           backgroundColor: const Color(0xFF0F0F0F),
-          indicatorColor: const Color(0xFFFFE100),
+          indicatorColor: kAccent,
           iconTheme: WidgetStateProperty.resolveWith(
             (s) => IconThemeData(color: s.contains(WidgetState.selected) ? Colors.black : Colors.white70),
           ),
@@ -108,7 +109,7 @@ class NikonSyncApp extends StatelessWidget {
 
   /// SnapBridge 风格深色主题：黑底 + 尼康黄
   ThemeData _darkTheme() {
-    const yellow = Color(0xFFFFE100);
+    const yellow = kAccent;
     final base = ThemeData(brightness: Brightness.dark, useMaterial3: true);
     return base.copyWith(
       scaffoldBackgroundColor: const Color(0xFF0A0A0A),

@@ -26,6 +26,25 @@ class CameraGateway {
   final Set<int> _pendingInfo = {};
   final Set<int> _pendingThumb = {};
 
+  /// 详情/缩略图的失败次数。没有这个负缓存时，单元格每次重建都会重新发起
+  /// 请求，而这些请求的回调又会触发重建，形成请求风暴。
+  /// 用计数而非一次性放弃：瞬时失败（相机忙）值得重试，反复失败的才止损。
+  static const int _maxInfoRetry = 3;
+  final Map<int, int> _infoFailCnt = {};
+  final Map<int, int> _thumbFailCnt = {};
+
+  bool _exhausted(Map<int, int> counts, int handle) =>
+      (counts[handle] ?? 0) >= _maxInfoRetry;
+
+  void _countFail(Map<int, int> counts, int handle) =>
+      counts[handle] = (counts[handle] ?? 0) + 1;
+
+  /// 重新枚举文件后清空失败计数，给这些句柄一次完整重试机会。
+  void resetFailures() {
+    _infoFailCnt.clear();
+    _thumbFailCnt.clear();
+  }
+
   /// 任一文件详情/缩略图加载完成时回调（驱动 UI 刷新）
   void Function()? onFileUpdated;
 
@@ -58,12 +77,20 @@ class CameraGateway {
 
   // -------------------------------------------------------- 文件加载
 
+  /// 是否还需要（且值得）发起加载请求。给 UI 用来判断要不要安排加载，
+  /// 避免每个单元格每次重建都排一个注定什么都不做的回调。
+  bool needsLoad(CameraFile f, {bool withThumb = false}) {
+    final needInfo = !f.infoLoaded && !_exhausted(_infoFailCnt, f.handle);
+    final needThumb = withThumb && !f.hasThumb && !_exhausted(_thumbFailCnt, f.handle);
+    return needInfo || needThumb;
+  }
+
   /// 确保文件详情已加载（可选缩略图）。网格单元格可见时调用。
   /// 返回是否发起了新请求（配合 UI 占位动画）。
   bool ensureLoaded(CameraFile f, {bool withThumb = false}) {
+    if (!needsLoad(f, withThumb: withThumb)) return false;
     final needInfo = !f.infoLoaded;
     final needThumb = withThumb && !f.hasThumb;
-    if (!needInfo && !needThumb) return false;
     if (needInfo && !_pendingInfo.add(f.handle)) return false;
     if (needThumb && !_pendingThumb.add(f.handle)) return false;
 
@@ -88,9 +115,12 @@ class CameraGateway {
           f.hasThumb = true;
         }
       }
-    }, priority: withThumb).whenComplete(() {
+    }, priority: withThumb).catchError((_) {}).whenComplete(() {
       _pendingInfo.remove(f.handle);
       _pendingThumb.remove(f.handle);
+      // 本轮尝试过但没拿到就记一次失败；连续失败到上限后不再重试
+      if (withThumb && !f.infoLoaded) _countFail(_infoFailCnt, f.handle);
+      if (withThumb && !f.hasThumb) _countFail(_thumbFailCnt, f.handle);
       onFileUpdated?.call();
     });
     return true;
@@ -114,7 +144,7 @@ class CameraGateway {
     if (cached != null) return cached;
     Uint8List bytes;
     if (f.kind == 'video' || f.kind == 'raw') {
-      if (!f.hasThumb) {
+      if (!f.hasThumb && !_exhausted(_thumbFailCnt, f.handle)) {
         await schedule(() async {
           final m = await NikonEngine.fileView(f.handle);
           f.applyInfo(m);
@@ -122,8 +152,12 @@ class CameraGateway {
           if (t != null && t.isNotEmpty) {
             thumbCache.put(f.handle, t);
             f.hasThumb = true;
+          } else {
+            _countFail(_thumbFailCnt, f.handle);
           }
-        }, priority: true);
+        }, priority: true).catchError((_) {
+          _countFail(_thumbFailCnt, f.handle);
+        });
       }
       final t = thumbCache.memGet(f.handle) ?? await thumbCache.get(f.handle);
       if (t == null) throw StateError('预览图不可用');

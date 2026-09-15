@@ -19,9 +19,26 @@ class AppModel extends ChangeNotifier {
     });
     gateway.records.load().then((_) => notifyListeners());
     settings.load().then((_) => notifyListeners());
-    gateway.onFileUpdated = notifyListeners;
+    gateway.onFileUpdated = _notifyThrottled;
+    // 下载记录变化也要驱动重建：否则删除后列表要等下一次引擎通知才刷新
+    gateway.records.addListener(_notifyThrottled);
     NikonEngine.getSaveFolder().then((v) {
       saveFolderUri = v;
+      notifyListeners();
+    });
+  }
+
+  Timer? _notifyTimer;
+  bool _notifyPending = false;
+
+  /// 节流通知。后台索引会为每个文件触发一次回调，直接 notifyListeners 等于
+  /// 按文件数重建所有页面（几千张照片 = 几千次全页重建 + 排序）。
+  /// 状态本身是实时读取的，最后一次变更必定会被渲染，只是最多延迟 150ms。
+  void _notifyThrottled() {
+    if (_notifyPending) return;
+    _notifyPending = true;
+    _notifyTimer = Timer(const Duration(milliseconds: 150), () {
+      _notifyPending = false;
       notifyListeners();
     });
   }
@@ -129,10 +146,16 @@ class AppModel extends ChangeNotifier {
     }
   }
 
+  /// 是否由本模型自己发起连接。
+  /// 用于区分"主动连接"（返回后由这里初始化）与"其他入口连接成功"
+  /// （调试面板直连原生，只能靠 connected 事件初始化），避免重复枚举。
+  bool _connectingSelf = false;
+
   Future<void> connect(String ip) async {
     connState = 'connecting';
     connError = null;
     notifyListeners();
+    _connectingSelf = true;
     try {
       cameraInfo = await NikonEngine.connect(ip, 'Nikon Wireless Mobile Utility');
       await _afterConnected();
@@ -141,6 +164,27 @@ class AppModel extends ChangeNotifier {
       connError = e.toString();
       notifyListeners();
       rethrow;
+    } finally {
+      _connectingSelf = false;
+    }
+  }
+
+  /// USB 连接：相机经数据线直连手机，走 PTP/USB 传输层（27.1 MB/s）
+  Future<void> connectUsb() async {
+    connState = 'connecting';
+    connError = null;
+    notifyListeners();
+    _connectingSelf = true;
+    try {
+      cameraInfo = await NikonEngine.connectUsb('Nikon Wireless Mobile Utility');
+      await _afterConnected();
+    } catch (e) {
+      connState = 'disconnected';
+      connError = e.toString();
+      notifyListeners();
+      rethrow;
+    } finally {
+      _connectingSelf = false;
     }
   }
 
@@ -149,6 +193,7 @@ class AppModel extends ChangeNotifier {
     connState = 'connecting';
     connError = null;
     notifyListeners();
+    _connectingSelf = true;
     try {
       cameraInfo = await NikonEngine.connectSmart();
       await _afterConnected();
@@ -157,6 +202,8 @@ class AppModel extends ChangeNotifier {
       connError = e.toString();
       notifyListeners();
       rethrow;
+    } finally {
+      _connectingSelf = false;
     }
   }
 
@@ -216,6 +263,8 @@ class AppModel extends ChangeNotifier {
       files = next;
       loadingFiles = false;
       notifyListeners();
+      // 重新枚举说明用户主动刷新或相机有新照片：给此前读取失败的句柄一次重试机会
+      gateway.resetFailures();
       _startIndexing();
       _autoProbe();
     } catch (e) {
@@ -322,10 +371,16 @@ class AppModel extends ChangeNotifier {
         AppLog.add(map['line']?.toString() ?? '');
       case 'status':
         final state = map['state'];
-        if (state == 'disconnected' && connState != 'disconnected') {
-          connState = 'disconnected';
-          _indexRunning = false;
-          notifyListeners();
+        if (state == 'disconnected') {
+          if (connState != 'disconnected') {
+            connState = 'disconnected';
+            _indexRunning = false;
+            notifyListeners();
+          }
+        } else if (state == 'connected' && !_connectingSelf && connState != 'connected') {
+          // 相机连上了，但连接不是本模型发起的（调试面板直连原生）：
+          // 只能靠事件补齐状态与文件列表，否则相机已连上、相册页却显示"连接已断开"。
+          unawaited(_afterConnected());
         }
       case 'progress':
         if (downloading) {
@@ -345,6 +400,8 @@ class AppModel extends ChangeNotifier {
 
   @override
   void dispose() {
+    _notifyTimer?.cancel();
+    gateway.records.removeListener(_notifyThrottled);
     _sub?.cancel();
     super.dispose();
   }

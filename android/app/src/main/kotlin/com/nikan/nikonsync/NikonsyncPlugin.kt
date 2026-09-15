@@ -24,6 +24,7 @@ object NikonsyncPlugin {
     private val mainHandler = Handler(Looper.getMainLooper())
     private var executor: ExecutorService? = null
     private var activity: Activity? = null
+    private var appContext: Context? = null
     private var engineRef: FlutterEngine? = null
     private var pendingFolderResult: MethodChannel.Result? = null
 
@@ -35,6 +36,7 @@ object NikonsyncPlugin {
     fun register(messenger: BinaryMessenger, context: Context, engine: FlutterEngine, activity: Activity?) {
         CameraEngine.init(context)
         this.activity = activity
+        this.appContext = context.applicationContext
         this.engineRef = engine
         executor = Executors.newCachedThreadPool()
         MethodChannel(messenger, "nikonsync/engine").setMethodCallHandler { call, result ->
@@ -92,6 +94,17 @@ object NikonsyncPlugin {
         when (call.method) {
             // 轻量方法直接在主线程执行
             "wifiInfo" -> result.success(CameraEngine.wifiInfo())
+            // 应用版本：读实际安装的包信息（AGP 8 起 BuildConfig 默认不生成，
+            // 且这样拿到的是真正生效的版本，不会与 pubspec 失同步）
+            "appVersion" -> {
+                val ctx = appContext
+                result.success(
+                    runCatching {
+                        val info = ctx!!.packageManager.getPackageInfo(ctx.packageName, 0)
+                        "${info.versionName} (${info.longVersionCode})"
+                    }.getOrNull(),
+                )
+            }
             "openWifiSettings" -> {
                 runCatching { CameraEngine.openWifiSettings() }
                 result.success(true)
@@ -128,6 +141,13 @@ object NikonsyncPlugin {
                             CameraEngine.connect(
                                 ip = args["ip"] as String,
                                 friendlyName = (args["friendlyName"] as? String)
+                                    ?: CameraEngine.DEFAULT_FRIENDLY_NAME,
+                            )
+                        }
+                        "connectUsb" -> {
+                            val args = call.arguments as Map<*, *>
+                            CameraEngine.connectUsb(
+                                (args["friendlyName"] as? String)
                                     ?: CameraEngine.DEFAULT_FRIENDLY_NAME,
                             )
                         }
@@ -189,6 +209,14 @@ object NikonsyncPlugin {
                         "lvCapture" -> CameraEngine.lvCapture()
                         "afDrive" -> CameraEngine.afDrive()
                         "shotParams" -> CameraEngine.shotParams()
+                        "setShotParam" -> {
+                            val args = call.arguments as Map<*, *>
+                            CameraEngine.setShotParam(
+                                args["name"] as String,
+                                (args["value"] as Number).toLong(),
+                            )
+                        }
+                        "probeProps" -> CameraEngine.probeProps()
                         "probeHiSpeed" -> {
                             val args = call.arguments as Map<*, *>
                             CameraEngine.probeHiSpeed((args["handle"] as Number).toLong())
@@ -198,6 +226,13 @@ object NikonsyncPlugin {
                             CameraEngine.probeResize((args["handle"] as Number).toLong())
                         }
                         "probeLiveView" -> CameraEngine.probeLiveView()
+                        "probeLvFrames" -> CameraEngine.probeLvFrames()
+                        // USB 连接模式 U0 实验（见 docs/USB连接方案.md）：
+                        // 会等用户点一次系统授权弹窗，最长 60s，必须留在工作线程
+                        "usbProbe" -> {
+                            val ctx = appContext ?: throw IllegalStateException("插件未注册")
+                            PtpUsbProbe.run(ctx) { CameraEngine.log(it) }
+                        }
                         "probeLiveView2" -> CameraEngine.probeLiveView2()
                         "probeLiveView5" -> {
                             val args = call.arguments as? Map<*, *>
