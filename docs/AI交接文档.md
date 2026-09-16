@@ -41,9 +41,10 @@ FLUTTER_STORAGE_BASE_URL=https://storage.flutter-io.cn flutter build apk --debug
 # 安装：adb install -r <apk>（手机需开 USB 调试；小米会拦 adb input 注入，UI 自动化用 uiautomator 工具）
 ```
 
-⚠️ **versionCode 陷阱**：pubspec.yaml 里是 `1.0.0+1`（versionCode=1），但手机上装的是带
-`--build-number` 的 release 包（曾为 2001，现为 2002）。直接 `flutter build apk` 产出的包
-versionCode=1，会被系统以 `INSTALL_FAILED_VERSION_DOWNGRADE` 拒绝。
+⚠️ **versionCode 陷阱**：pubspec.yaml 当前是 `1.0.1+2040`（基号 2040）。手机上装的是
+带 `--build-number` 的 release 包；直接 `flutter build apk` 产出的包 versionCode=1，
+会被系统以 `INSTALL_FAILED_VERSION_DOWNGRADE` 拒绝。**分 ABI 包还会再叠加 ABI 偏移
+（见下面「发版 / 建 Release」）**。
 
 装机用这条（release、同签名、versionCode 递增，升级安装保留应用数据）：
 ```bash
@@ -56,6 +57,46 @@ adb install -r build/app/outputs/flutter-apk/app-release.apk
 不要用 `adb install -r` 装 debug 包覆盖 release 包：debug 用 debug keystore 签名，
 与 release 签名不一致会报 `INSTALL_FAILED_UPDATE_INCOMPATIBLE`；卸载重装则会清空
 应用数据（下载去重记录 nikonsync_downloads.json 与设置）。
+
+### 发版 / 建 Release（2026-09-16 定，1.0.1 起照此执行）
+
+`gh` 已安装并登录（账号 `chistoiy`），但**不在 Git Bash 的 PATH 里**，用绝对路径：
+
+```bash
+GH="/c/Program Files/GitHub CLI/gh.exe"
+
+# 1) 改版本号（pubspec.yaml 的 version: <名>+<基号>），再打三个分 ABI 包
+FLUTTER_STORAGE_BASE_URL=https://storage.flutter-io.cn \
+  flutter build apk --release --split-per-abi --build-number <基号>
+cp -f build/app/outputs/flutter-apk/app-arm64-v8a-release.apk  dist/NikonSync-v<名>-arm64.apk
+cp -f build/app/outputs/flutter-apk/app-armeabi-v7a-release.apk dist/NikonSync-v<名>-arm32.apk
+cp -f build/app/outputs/flutter-apk/app-x86_64-release.apk      dist/NikonSync-v<名>-x86_64.apk
+
+# 2) 核对（必做）：versionName 必须是新版本，versionCode 必须高于上一版对应 ABI
+AAPT=/d/app_workplace/android_studio_sdk/build-tools/36.1.0/aapt2.exe
+"$AAPT" dump badging dist/NikonSync-v<名>-arm64.apk | grep -E "^package:|^native-code:"
+
+# 3) 提交 + 打标签 + 推送
+git commit ... && git push origin main
+git tag -a <名> -m "..." && git push origin <名>
+
+# 4) 建 Release（dist/ 被 gitignore，APK 只能走 Release 附件）
+"$GH" release create <名> --title "版本 <名>" --notes-file .workbuddy/release-body-<名>.md \
+  --latest --verify-tag dist/NikonSync-v<名>-arm64.apk dist/NikonSync-v<名>-arm32.apk dist/NikonSync-v<名>-x86_64.apk
+"$GH" release list   # 确认已置 Latest
+```
+
+⚠️ **两个坑**（1.0.1 实际踩到）：
+1. **分 ABI 包只能用 `--split-per-abi`**。`--target-platform android-arm,android-x64` 打的是
+   一个通用包，而 `build/app/outputs/flutter-apk/` 里**残留上一版的 per-ABI 文件**——
+   照名字 `cp` 会把**旧版本包**拷进 dist（1.0.1 时差点把 1.0.0 的 arm32 传上去）。
+   所以第 2 步的 aapt2 核对不能省。
+2. **versionCode 会被 Flutter 叠加 ABI 偏移 ×1000**：基号 2040 → arm64 **4040** / arm32 **3040** /
+   x86_64 **6040**。1.0.0 的对应值是 2001 / 1001 / 4001。新版基号必须让三个值都高于旧版，
+   否则老包会被 `INSTALL_FAILED_VERSION_DOWNGRADE` 拒绝。
+
+Release 正文模板见 `.workbuddy/release-body-1.0.1.md`（本机文件，未入库；结构：亮点 → 本版更新 →
+修复表 → 下载表 → 使用方法 → 已知限制 → 验证 → 开源）。
 
 - Flutter 3.38.9 / Dart 3.10.8 / Java 21 / minSdk 29 / 仅 Android
 - 依赖：path_provider、exif（EXIF 解析）。状态管理用 ChangeNotifier（AppModel 单例，无第三方状态库）
