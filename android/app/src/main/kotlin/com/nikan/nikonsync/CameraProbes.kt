@@ -13,7 +13,15 @@ import android.os.SystemClock
  * ⚠️ 其中若干探针会真实改变相机状态（实拍、写卡），新增时必须标注并走调试面板的二次确认。
  */
 internal object CameraProbes {
-    /** 取景中 AF/拍摄通道探针（调试面板用）。 */
+    /**
+     * 取景中 AF 通道探针（调试面板用）。
+     *
+     * ⚠️ 2026-09-15 第三轮按 libgphoto2 ptp.h 重写：旧版本试的是 0x9405（实为
+     * **MeasureSpotWb 点测白平衡**）和 0x90C3（实为 **DelImageSDRAM，需 1 参数**），
+     * 两个都不是对焦操作，探针结论因此一直误导。
+     * 现在的候选按证据排序：0x90C1=AfDrive（无参，本轮采用）、0x9205=ChangeAfArea(2 参数)、
+     * 0x9204=MfDrive(2 参数)、0x9206=AfDriveCancel（无参）、0x90C8=DeviceReady（对照）。
+     */
     fun probeLvAf(handle: Long): List<String> {
         val c = CameraEngine.need()
         val out = ArrayList<String>()
@@ -26,13 +34,269 @@ internal object CameraProbes {
                 "$label → ${Ptp.respName((r.exceptionOrNull() as? PtpException)?.code ?: -1)}"
             }
         }
-        out += t("0x9405 无参（疑似LV AF/拍摄）", Ptp.OP_NIKON_LV_CAPTURE, LongArray(0))
-        out += t("0x100E 标准快门（会实拍！）", Ptp.OP_INITIATE_CAPTURE, LongArray(0))
-        out += t("0x9205 AF区域[128,128]", 0x9205, longArrayOf(128L, 128L))
-        out += t("0x9204 MF驱动[1,0]", 0x9204, longArrayOf(1L, 0L))
-        out += t("0x90C3 AF驱动", 0x90C3, LongArray(0))
-        out += t("0x9209 状态", 0x9209, LongArray(0))
+        out += t("0x90C1 AfDrive（无参，应采用）", Ptp.OP_NIKON_AF_DRIVE, LongArray(0))
+        out += t("0x9205 ChangeAfArea(128,128)", Ptp.OP_NIKON_CHANGE_AF_AREA, longArrayOf(128L, 128L))
+        out += t("0x9204 MfDrive(1,0)", Ptp.OP_NIKON_MF_DRIVE, longArrayOf(1L, 0L))
+        out += t("0x9206 AfDriveCancel", Ptp.OP_NIKON_AF_DRIVE_CANCEL, LongArray(0))
+        out += t("0x90C8 DeviceReady（对照）", Ptp.OP_NIKON_DEVICE_READY, LongArray(0))
+        out += t("0x90C3 DelImageSDRAM(0)（对照，旧版误当AF）", Ptp.OP_NIKON_DEL_IMAGE_SDRAM, longArrayOf(0L))
         out.forEach { CameraEngine.log("LV对焦探针 $it") }
+        return out
+    }
+
+    /**
+     * 实时 ISO 发现探针（自动，无需用户操作相机）。
+     *
+     * 起因：Auto ISO 下相机屏幕显示 `ISO AUTO 2500`，而属性 `0x500F` 读出来停在 2000
+     * ——0x500F 报的很可能只是"ISO 设定/上限"，不是当下实际使用的感光度。
+     *
+     * 做法（**差分法**，不需要知道属性名）：
+     * 1. 读 `0x500F` 描述符，拿到它的 ISO 取值表（例如 100…51200）；
+     * 2. `0x90CA` 列出全部厂商属性码，逐个用 `0x1015 GetDevicePropValue` 读当前值；
+     * 3. 等 8 秒（Auto ISO 会自己变），再读一遍；
+     * 4. 报告**值发生变化的属性码**，并把新值落在 ISO 取值表里的码标为"疑似实时 ISO"。
+     *
+     * 运行期间请把镜头对着明暗变化的地方，否则 Auto ISO 不会动、差分为空。
+     */
+    fun probeLiveIso(): List<String> {
+        val c = CameraEngine.need()
+        val out = ArrayList<String>()
+
+        // 1) ISO 取值表
+        val isoDesc = runCatching {
+            c.transact(Ptp.OP_GET_DEVICE_PROP_DESC, longArrayOf(0x500FL)).data
+        }.getOrNull()
+        var isoTable = emptySet<Long>()
+        var isoCurrent = -1L
+        if (isoDesc != null) {
+            val r = ByteReader(isoDesc)
+            r.u16()
+            val dtype = r.u16()
+            r.u8()
+            ptpValue(r, dtype)
+            isoCurrent = ptpValue(r, dtype) ?: -1L
+            if (r.u8() == 2) {
+                val n = r.u16()
+                isoTable = (0 until n).mapNotNull { ptpValue(r, dtype) }.toSet()
+            }
+        }
+        out += "0x500F 当前=$isoCurrent，取值表 ${isoTable.size} 项" +
+            if (isoTable.isNotEmpty()) "（最小 ${isoTable.min()} 最大 ${isoTable.max()}）" else ""
+
+        // 2) 属性码清单：**标准段与厂商段都要差**——
+        //    0x500F(ExposureIndex) 在 Auto ISO 下不反映实际值，实时值可能在标准段的其他码
+        //    （0x5008 等）或某个厂商码里。
+        val codes = (0x5001L..0x5017L).toList() +
+            vendorPropCodes(c).filter { it in 0xD000L..0xDFFFL }.take(150)
+        if (codes.isEmpty()) {
+            out += "未取到可读属性码，无法差分"
+            out.forEach { CameraEngine.log("实时ISO探针 $it") }
+            return out
+        }
+        val first = readPropValues(c, codes)
+        out += "第一遍读取 ${first.size}/${codes.size} 个厂商属性"
+
+        // 3) 等 Auto ISO 变化
+        CameraEngine.log("实时ISO探针 等待 8 秒（请对着明暗变化的地方，让 Auto ISO 动起来）")
+        Thread.sleep(8_000)
+        val second = readPropValues(c, codes)
+
+        // 4) 差分
+        val changed = ArrayList<String>()
+        for (code in codes) {
+            val a = first[code] ?: continue
+            val b = second[code] ?: continue
+            if (a == b) continue
+            val isoHint = if (b in isoTable) "  ← 值在 ISO 表内" else ""
+            changed += "0x%04X %d→%d%s".format(code, a, b, isoHint)
+        }
+        out += if (changed.isEmpty()) {
+            "8 秒内没有任何厂商属性变化（Auto ISO 可能没在动，或本机把实时值放在别处）"
+        } else {
+            "8 秒内变化 ${changed.size} 项：" + changed.joinToString(" | ")
+        }
+        out.forEach { CameraEngine.log("实时ISO探针 $it") }
+        return out
+    }
+
+    /** 读厂商属性码列表（0x90CA 返回 [u32 数量] + N×u16，或裸 u16 数组）。 */
+    private fun vendorPropCodes(c: PtpSession): List<Long> {
+        val d = runCatching {
+            c.transact(Ptp.OP_NIKON_GET_VENDOR_PROP_CODES, LongArray(0)).data
+        }.getOrNull() ?: return emptyList()
+        var i = 0
+        if (d.size >= 4) {
+            val n = PtpWire.getU32(d, 0)
+            if (n in 1..4000) i = 4
+        }
+        val out = ArrayList<Long>()
+        while (i + 1 < d.size && out.size < 4000) {
+            out += PtpWire.getU16(d, i).toLong()
+            i += 2
+        }
+        return out
+    }
+
+    /** 逐码读当前值（0x1015）；按返回字节数猜类型。读不到的码不进结果。 */
+    private fun readPropValues(c: PtpSession, codes: List<Long>): Map<Long, Long> {
+        val map = LinkedHashMap<Long, Long>()
+        for (code in codes) {
+            val d = runCatching {
+                c.transactShort(Ptp.OP_GET_DEVICE_PROP_VALUE, longArrayOf(code), 1500).data
+            }.getOrNull() ?: continue
+            val v = when {
+                d.size >= 4 -> PtpWire.getU32(d, 0)
+                d.size == 2 -> PtpWire.getU16(d, 0).toLong()
+                d.size == 1 -> (d[0].toLong() and 0xFF)
+                else -> continue
+            }
+            map[code] = v
+        }
+        return map
+    }
+
+    /** 读一个属性描述符的取值（按 dtype；8 字节类型只取低 32 位，够用） */
+    private fun ptpValue(r: ByteReader, dtype: Int): Long? = when (dtype) {
+        0x0001, 0x0002 -> r.u8().toLong()
+        0x0003, 0x0004 -> r.u16().toLong()
+        0x0005, 0x0006 -> r.u32()
+        0x0007, 0x0008 -> {
+            val lo = r.u32()
+            r.u32()
+            lo
+        }
+        else -> null
+    }
+
+    /**
+     * 休眠/自动关机相关属性探针（只读）。
+     *
+     * 起因：真机上相机空闲十几秒就息屏，息屏后 `0x9203` 恒 NotLiveView、`0x9205`
+     * 被接受却不生效，遥控拍摄直接不可用（必须手动按相机快门才醒）。
+     * 这里把"能延长屏幕/待机时间"的属性全部读出来，取值表就是可写范围的答案：
+     * - 0xD064 MonitorOff（LCD Off Time，libgphoto2 标注**可写**）
+     * - 0xD062 MeterOff（Auto Meter Off Time，可写）
+     * - 0xD066 AutoOffTimers（自动关机组合档）
+     * - 0xD0B3 MonitorOffDelay
+     */
+    fun probeSleep(): List<String> {
+        val c = CameraEngine.need()
+        val out = ArrayList<String>()
+        for ((code, name) in listOf(
+            0xD064L to "MonitorOff LCD关闭",
+            0xD062L to "MeterOff 测光关闭",
+            0xD066L to "AutoOffTimers 自动关机",
+            0xD0B3L to "MonitorOffDelay",
+        )) {
+            val line = CameraEngine.propDescDebugLine(code)
+            out += "0x%04X %s → %s".format(code, name, line ?: "不支持")
+        }
+        // DeviceReady 在息屏后是否仍应答（判断"能不能从 App 唤醒"）
+        val t0 = SystemClock.elapsedRealtime()
+        val awake = runCatching { c.transactShort(Ptp.OP_NIKON_DEVICE_READY, LongArray(0), 3000) }
+        val ms = SystemClock.elapsedRealtime() - t0
+        out += if (awake.isSuccess) {
+            "0x90C8 DeviceReady（唤醒）→ OK ${ms}ms（屏幕此刻是亮的吗？）"
+        } else {
+            "0x90C8 DeviceReady（唤醒）→ ${Ptp.respName((awake.exceptionOrNull() as? PtpException)?.code ?: -1)} ${ms}ms"
+        }
+        out.forEach { CameraEngine.log("休眠探针 $it") }
+        return out
+    }
+
+    /**
+     * 取景对焦坐标标定探针（必须**先进入实时取景**再跑）。
+     *
+     * 要回答的问题：`0x9205 ChangeAfArea` 的 x/y 到底在哪个坐标空间里？
+     * 我们的点击换算用的是「取景帧像素」（实测 640×424），相机接受了这些值、
+     * 但对焦点落到别处——典型的"空间不同、比例不同"。
+     *
+     * 做法（只读 + 三个无副作用的坐标试探）：
+     * 1. `0x90CA GetVendorPropCodes` 列出相机支持的厂商属性码，看有没有
+     *    0xD05D LiveViewAFArea / 0xD061 LiveViewAFFocus / 0xD108 AutofocusArea /
+     *    0xD08D AFAreaPoint —— 有的话它们的取值范围就是 AF 坐标空间的第一手证据；
+     * 2. 对上述码逐个读描述符（类型/枚举/范围/当前值）；
+     * 3. 按**两种候选缩放**（×1 = 取景帧像素，×3 = 相机内部 1920 宽的取景图）
+     *    各发一个"画面 1/4 处"的点，人眼在相机屏幕上即可判断哪一种落在 1/4 处。
+     */
+    fun probeAfArea(frameW: Int, frameH: Int): List<String> {
+        val c = CameraEngine.need()
+        val out = ArrayList<String>()
+        val fw = if (frameW > 0) frameW else 640
+        val fh = if (frameH > 0) frameH else 424
+
+        // 1) 支持的厂商属性码
+        val codes = runCatching {
+            c.transact(Ptp.OP_NIKON_GET_VENDOR_PROP_CODES, LongArray(0)).data
+        }.getOrNull()
+        if (codes == null || codes.isEmpty()) {
+            out += "0x90CA GetVendorPropCodes → 无数据（该机型可能不支持）"
+        } else {
+            val list = ArrayList<Long>()
+            var i = 0
+            if (codes.size >= 4) {
+                // 载荷可能是 [u32 数量] + N×u16，也可能直接是 u16 数组，两种都试
+                val n = PtpWire.getU32(codes, 0)
+                if (n in 1..2000) i = 4 else i = 0
+            }
+            while (i + 1 < codes.size && list.size < 2000) {
+                list += PtpWire.getU16(codes, i).toLong()
+                i += 2
+            }
+            out += "0x90CA 厂商属性码：${list.size} 个"
+            val interest = listOf(0xD05DL, 0xD061L, 0xD08DL, 0xD108L, 0xD1A0L, 0xD0B2L)
+            val hits = interest.filter { list.contains(it) }
+            out += "其中 AF/取景相关：${
+                if (hits.isEmpty()) "均未出现" else hits.joinToString(", ") { "0x%04X".format(it) }
+            }"
+        }
+
+        // 2) 候选属性描述符：0xD08D「AF Area Point」若可读，就能**读回相机实际的对焦点**
+        //     ——那意味着可以自动标定倍数（发一个坐标、读回落点、解方程），不必靠肉眼。
+        for (code in longArrayOf(0xD08DL, 0xD05DL, 0xD061L, 0xD108L)) {
+            val d = runCatching {
+                c.transact(Ptp.OP_GET_DEVICE_PROP_DESC, longArrayOf(code)).data
+            }.getOrNull()
+            if (d == null || d.size < 8) {
+                out += "0x%04X → 不支持".format(code)
+                continue
+            }
+            val r = ByteReader(d)
+            val dtype = r.u16(); r.u16()
+            val getSet = r.u8()
+            val dm = CameraEngine.propDescDebugLine(code)
+            out += "0x%04X dtype=0x%04X %s %s".format(
+                code, dtype, if (getSet != 0) "可写" else "只读", dm ?: "",
+            )
+        }
+        // 顺带读回一次当前值（若存在）——用于判断"能否读回对焦点位置"
+        runCatching {
+            val v = c.transactShort(Ptp.OP_GET_DEVICE_PROP_VALUE, longArrayOf(0xD08DL), 2000).data
+            if (v.isNotEmpty()) {
+                out += "0xD08D 当前值 = ${v.joinToString(" ") { "%02X".format(it) }}（读回可用！）"
+            }
+        }
+
+        // 3) 坐标空间试探：**中心点对任何等比缩放都是不变量**，先用它验证"有没有偏移"；
+        //    再用"画面 1/4 处"在 ×4 下发一次，人眼比对即可确认倍数。
+        //    2026-09-15 真机实测：×4 与相机一致（×16 会把对焦点顶到右下角 = 被截断）。
+        val cx = fw / 2
+        val cy = fh / 2
+        for ((label, sx, sy) in listOf(
+            Triple("中心（任何倍数都应落在正中，验证原点）", cx.toLong(), cy.toLong()),
+            Triple("1/4 处 ×4（实测倍数，应落在画面 1/4 处）", (fw / 4 * 4).toLong(), (fh / 4 * 4).toLong()),
+            Triple("3/4 处 ×4（应落在画面 3/4 处）", (fw * 3 / 4 * 4).toLong(), (fh * 3 / 4 * 4).toLong()),
+        )) {
+            val r = runCatching {
+                c.transactShort(Ptp.OP_NIKON_CHANGE_AF_AREA, longArrayOf(sx, sy), 2500)
+            }
+            out += "0x9205 $label → 发送[$sx,$sy] " + if (r.isSuccess) {
+                "OK（看相机屏幕：对焦框落在画面什么位置？）"
+            } else {
+                Ptp.respName((r.exceptionOrNull() as? PtpException)?.code ?: -1)
+            }
+        }
+        out.forEach { CameraEngine.log("AF标定 $it") }
         return out
     }
 
@@ -43,10 +307,16 @@ internal object CameraProbes {
     fun probeHiSpeed(handle: Long): List<String> {
         val c = CameraEngine.need()
         val out = ArrayList<String>()
+        // 0x9400 的真实形态（libgphoto2 ptp.h）：
+        //   3 参数 = [对象句柄, 32bit 传输长度, 结束标志]，返回 r1=已发送字节数、
+        //   r2/r3 = 传输前偏移（低/高 32 位，可用于续传）。
+        // 旧代码把它当 [句柄, 偏移, 长度] 试，得到 OutOfFocus —— 参数语义完全不同。
+        // ⚠️ 结束标志只试 0：置 1 会让相机认为"传完即结束"，可能后续数据无人接收
+        // （这条探针在连接后自动跑，不能有副作用）。
         val shapes = listOf(
-            "句柄,偏移,长度" to longArrayOf(handle, 0, 65536),
-            "句柄,长度" to longArrayOf(handle, 65536),
-            "句柄" to longArrayOf(handle),
+            "句柄,传输长度,结束标志=0" to longArrayOf(handle, 1048576, 0),
+            "句柄,长度" to longArrayOf(handle, 1048576),
+            "句柄（旧猜法 偏移0 长度64K）" to longArrayOf(handle, 0, 65536),
         )
         var op = 0x9400
         while (op <= 0x9406) {
@@ -67,27 +337,35 @@ internal object CameraProbes {
         return out
     }
 
-    /** 相机端缩放探针：0x9207 GetObjectResize 的参数形态尝试。 */
+    /**
+     * 中等图探针：查看器"中"档用的 GetFhdPicture(0x920F，1 参数=对象句柄)，
+     * 返回 ≤1920×1028 的图片。
+     *
+     * ⚠️ 本探针此前叫 probeResize 并试 0x9207——按 libgphoto2 ptp.h，**0x9207 是
+     * InitiateCaptureRecInMedia（拍摄操作）**，当只读探针反复试是危险的。
+     * 0x920F 才是相机端出小图的正解。
+     */
     fun probeResize(handle: Long): List<String> {
         val c = CameraEngine.need()
         val out = ArrayList<String>()
-        val shapes = listOf(
-            "句柄" to longArrayOf(handle),
-            "句柄,1920" to longArrayOf(handle, 1920),
-            "句柄,1920,1280" to longArrayOf(handle, 1920, 1280),
-            "句柄,2" to longArrayOf(handle, 2),
-        )
-        for ((label, params) in shapes) {
+        val tryOp = { label: String, op: Int, params: LongArray ->
             val result = try {
-                val data = c.transact(Ptp.OP_NIKON_GET_OBJECT_RESIZE, params).data
-                "OK ${data.size}B"
+                val data = c.transact(op, params).data
+                val soi = CameraEngine.indexOfSoi(data)
+                val jpeg = if (soi > 0) data.copyOfRange(soi, data.size) else data
+                val dims = jpegDims(jpeg)
+                val extra = if (dims.isNotEmpty()) " $dims" else ""
+                "OK ${data.size}B（JPEG 偏移 $soi）$extra"
             } catch (e: PtpException) {
                 Ptp.respName(e.code)
             } catch (e: Exception) {
                 e.message ?: "异常"
             }
-            out += "0x9207 [$label] → $result"
+            out += "0x%04X [%s] → %s".format(op, label, result)
         }
+        tryOp("句柄", Ptp.OP_NIKON_GET_FHD_PICTURE, longArrayOf(handle))
+        tryOp("句柄（对照 GetThumb）", Ptp.OP_GET_THUMB, longArrayOf(handle))
+        tryOp("句柄（对照 大缩略图）", Ptp.OP_NIKON_GET_LARGE_THUMB, longArrayOf(handle))
         out.forEach { CameraEngine.log("探针 $it") }
         return out
     }

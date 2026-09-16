@@ -9,7 +9,6 @@ import java.io.InputStream
 import java.io.OutputStream
 import java.net.InetSocketAddress
 import java.net.Socket
-import java.net.SocketTimeoutException
 import java.util.concurrent.atomic.AtomicInteger
 import javax.net.SocketFactory
 
@@ -43,8 +42,21 @@ class PtpIpClient(
 
         private const val PROGRESS_STEP = 1L shl 20
 
+        /**
+         * 数据外发（data-OUT）单包上限。
+         * 与 libgphoto2 的 `WRITE_BLOCKSIZE`（64KiB）保持一致——相机端按这个量级
+         * 组包最稳妥，属性写入这类几字节的数据只会产生一包 EndData。
+         */
+        private const val DATA_OUT_BLOCK = 64 * 1024
+
         /** DevicePropChanged 汇总输出间隔 */
         private const val PROP_FLUSH_MS = 2_000L
+
+        /** 放弃一个事务后，等待它那笔迟到响应的预算（超时到就继续，不再等） */
+        private const val ABANDON_DRAIN_MS = 1_200L
+
+        /** 被放弃的是"数据相位可能很大"的操作时用的预算（等不到就必须作废连接） */
+        private const val ABANDON_DRAIN_HEAVY_MS = 4_000L
     }
 
     private var cmd: Socket? = null
@@ -58,6 +70,23 @@ class PtpIpClient(
 
     /** 事务超时后命令流已错位且无法安全恢复，此连接作废（需重新连接）。 */
     @Volatile private var streamDesynced = false
+
+    /**
+     * 超时发生在包边界时被"放弃"的事务号：它的响应可能稍后才到，
+     * 下一笔事务开始前要把它读掉（否则会被当成自己的响应）。
+     * 只有确认相机回显事务号（[txnEcho] == true）时才启用这条恢复路径。
+     */
+    @Volatile private var abandonedTxn: Long = 0L
+
+    /** 被放弃事务的操作码：用于判断它的数据相位有多大（决定清理预算与是否必须成功）。 */
+    @Volatile private var abandonedOp: Int = 0
+
+    /**
+     * 相机是否在 OperationResponse 里回显事务号（null = 尚未观测到）。
+     * 标准 PTP/IP 要求回显；一旦发现不回显，就退回"超时即作废"的老行为，
+     * 因为那时无法区分迟到响应与自己的响应。
+     */
+    @Volatile private var txnEcho: Boolean? = null
 
     override var deviceInfo: DeviceInfo? = null
         private set
@@ -90,6 +119,9 @@ class PtpIpClient(
             closing = false
             linkDeadNotified = false
             streamDesynced = false
+            abandonedTxn = 0L
+            abandonedOp = 0
+            txnEcho = null
             log("连接 $host:$PORT …")
             try {
                 connectLocked(host, friendlyName)
@@ -173,6 +205,11 @@ class PtpIpClient(
         }
         deviceInfo = PtpDatasets.parseDeviceInfo(transact(Ptp.OP_GET_DEVICE_INFO).data)
         log("设备信息：$deviceInfo")
+        // 连上时报一次链路信号：UI 的信号格若与这行不符，一眼能看出取数有问题
+        runCatching {
+            val w = CameraEngine.wifiInfo()
+            log("链路信号：${w["signalLevel"]}/4 格（${w["rssi"]} dBm）· 速率 ${w["linkSpeed"]} Mbps")
+        }
     }
 
     /** 握手失败时的清理：只关底层 socket，不发协议层结束会话，并抑制断线回调。 */
@@ -307,10 +344,10 @@ class PtpIpClient(
         lastProgressNotified = 0L
         val written = when (resolveDlMode(handle, size)) {
             DlMode.HISPEED -> downloadChunked(size, out, onProgress) { off, want ->
-                writeChunk(out, hiSpeedOp, handle, off, want)
+                writeChunk(out, hiSpeedOp, handle, off, want, off, size, onProgress)
             }
             DlMode.PARTIAL -> downloadChunked(size, out, onProgress) { off, want ->
-                writeChunk(out, Ptp.OP_GET_PARTIAL_OBJECT, handle, off, want)
+                writeChunk(out, Ptp.OP_GET_PARTIAL_OBJECT, handle, off, want, off, size, onProgress)
             }
             DlMode.FULL -> transactToStream(Ptp.OP_GET_OBJECT, longArrayOf(handle), out, size, onProgress)
         }
@@ -321,12 +358,30 @@ class PtpIpClient(
     /**
      * 取一个分块写入 out，返回本次实际写入字节数。
      * 相机在响应参数里声明了长度时，必须与实际写入量一致——否则不能以声明值推进偏移。
+     *
+     * [base]/[total]/[onProgress] 用于**分块内部的进度上报**：一个 4MiB 分块在
+     * 1.5MB/s 的 Wi-Fi 上要 2.7 秒，若只在分块结束时才报一次，UI 的进度条会
+     * 长时间不动——看起来就像卡死（用户完全无法区分两者）。按 1MiB 上报后
+     * 进度条是连续走的。
      */
-    private fun writeChunk(out: OutputStream, op: Int, handle: Long, offset: Long, want: Long): Long {
+    private fun writeChunk(
+        out: OutputStream,
+        op: Int,
+        handle: Long,
+        offset: Long,
+        want: Long,
+        base: Long = 0L,
+        total: Long = 0L,
+        onProgress: ((Long, Long) -> Unit)? = null,
+    ): Long {
         var written = 0L
         val res = doTransact(op, longArrayOf(handle, offset, want), { chunk, _, _ ->
             out.write(chunk)
             written += chunk.size
+            if (onProgress != null && written - lastProgressNotified >= PROGRESS_STEP) {
+                lastProgressNotified = written
+                onProgress(base + written, total)
+            }
         })
         out.flush()
         if (res.params.isNotEmpty()) {
@@ -382,11 +437,14 @@ class PtpIpClient(
     }
 
     /**
-     * 短超时事务：用于探针等"相机可能不应答"的场景。
+     * 短超时事务：用于探针、取景帧等"相机可能不应答"的场景。
      *
-     * ⚠️ 超时即意味着命令流里可能残留半个包，之后每个事务都会解析错位。
-     * 命令流无法安全恢复，因此**一次超时就会把该连接标记为作废**并触发断线回调，
-     * 需要重新连接。调用方要接受"这次调用之后连接可能已失效"。
+     * 超时处理分两种情况（见 [doTransactLocked]）：
+     * - **超时落在包边界**（相机只是没答）→ 放弃这笔事务，但**连接保留**，
+     *   迟到的响应会在下一笔事务前被读掉并丢弃；
+     * - **半个包留在流里**，或相机不回显事务号 → 无法安全恢复，作废连接 + 断线回调。
+     *
+     * 因此调用方仍然要容忍"这次调用失败"，但不必再假定"这次调用之后连接一定已死"。
      */
     override fun transactShort(op: Int, params: LongArray, timeoutMs: Int): TransactResult =
         synchronized(txnLock) {
@@ -430,45 +488,75 @@ class PtpIpClient(
         if (streamDesynced) throw IOException("上次事务超时后命令流已失同步，需重新连接相机")
         val cin = cmdIn ?: throw IOException("未连接相机")
         val cout = cmdOut ?: throw IOException("未连接相机")
-        val txn = txnCounter.incrementAndGet() and 0x7FFFFFFF
+        // 上一笔被放弃的事务若已回包，先把它读掉，避免它的数据被算进本笔
+        drainAbandonedLocked(cin)
+        // 清理过程中若读到半个包，流已失同步，本笔不能再发
+        if (streamDesynced) throw IOException("上次事务超时后命令流已失同步，需重新连接相机")
+        val txn = (txnCounter.incrementAndGet() and 0x7FFFFFFF).toLong()
         val req = ByteArray(10 + params.size * 4)
         PtpWire.putU32(req, 0, if (dataOut != null) 2 else 1) // data phase: 无/数据入=1，数据出=2
         PtpWire.putU16(req, 4, op)
         PtpWire.putU32(req, 6, txn.toLong())
         params.forEachIndexed { i, v -> PtpWire.putU32(req, 10 + i * 4, v) }
         PtpWire.writePacket(cout, Ptp.PKT_OPERATION_REQUEST, req)
-        // 数据外发：StartData(total) → Data(offset+data)… → EndData(offset+尾块)。
-        // SetDevicePropDesc 这类小数据（≤5B）用一包 Data 全量 + 空 EndData 收尾。
+        // 数据外发（PTP_DP_SENDDATA）。
+        //
+        // 报文格式按 libgphoto2 `ptpip.c` 的 `ptp_ptpip_senddata()` 实现，**两处关键**：
+        // 1) StartData 载荷 = [事务号 u32][总长度 u32][未知 u32=0]，共 12 字节（整包 20）；
+        // 2) Data / EndData 载荷 = [事务号 u32][数据]，**这里是事务号，不是偏移量**；
+        //    最后一块必须是 EndData（即使数据很小、只有一包）。
+        //
+        // 此前实现写的是 [总长度 u64] 与 [偏移 u32]：相机读到的"事务号"分别等于
+        // 数据长度和 0，与请求里的事务号对不上 → 相机一律回
+        // `TransactionCancelled(0x2017)`。这就是"改光圈/快门/ISO 永远失败"的根因，
+        // 也是 SetDevicePropValue 修好之后仍旧失败的原因（症状相同、层次不同）。
         if (dataOut != null) {
-            val start = ByteArray(8)
-            PtpWire.putU64(start, 0, dataOut.size.toLong())
+            val start = ByteArray(12)
+            PtpWire.putU32(start, 0, txn)
+            PtpWire.putU32(start, 4, dataOut.size.toLong())
+            PtpWire.putU32(start, 8, 0)
             PtpWire.writePacket(cout, Ptp.PKT_START_DATA, start)
             var off = 0
-            while (off < dataOut.size) {
-                val n = minOf(4096, dataOut.size - off)
+            do {
+                val n = minOf(DATA_OUT_BLOCK, dataOut.size - off)
+                val isLast = off + n >= dataOut.size
                 val pkt = ByteArray(4 + n)
-                PtpWire.putU32(pkt, 0, off.toLong())
-                dataOut.copyInto(pkt, 4, off, off + n)
-                PtpWire.writePacket(cout, Ptp.PKT_DATA, pkt)
+                PtpWire.putU32(pkt, 0, txn)
+                if (n > 0) dataOut.copyInto(pkt, 4, off, off + n)
+                PtpWire.writePacket(cout, if (isLast) Ptp.PKT_END_DATA else Ptp.PKT_DATA, pkt)
                 off += n
-            }
-            val end = ByteArray(4)
-            PtpWire.putU32(end, 0, off.toLong())
-            PtpWire.writePacket(cout, Ptp.PKT_END_DATA, end)
+            } while (off < dataOut.size)
         }
 
         var total = -1L
         var received = 0L
         while (true) {
             val pkt = try {
-                PtpWire.readPacket(cin)
-            } catch (e: SocketTimeoutException) {
-                // 关键：超时后无法知道流里还剩多少字节，无法安全恢复。
-                // 此前只是把异常抛给上层，连接表面还"活着"，于是：
-                // 取景帧请求超时（1500ms）→ 流错位 → 保活探针排在后面
-                // 读到 30 秒超时 → 判定断线 → 相机侧也放弃主机、关闭热点。
+                PtpWire.readPacketTracked(cin)
+            } catch (e: PacketTimeoutException) {
+                if (e.partialBytes == 0 && abandonedTxn == 0L && txnEcho == true) {
+                    // 超时落在包边界：流位置仍然合法，只是这笔事务的响应还没来。
+                    // 记下事务号，下一笔事务开始前会把它读掉并丢弃，连接继续可用。
+                    // 这正是"取景帧慢 → 整条连接作废 → 相机三分钟不认新连接"的破局点。
+                    abandonedTxn = txn
+                    abandonedOp = op
+                    log(
+                        "命令通道读超时（操作 0x%04X）：超时在包边界，放弃该事务、连接保留"
+                            .format(op),
+                    )
+                    throw IOException(
+                        "事务 0x%04X 超时（相机未在超时内应答），已放弃该事务，连接仍可用"
+                            .format(op),
+                        e,
+                    )
+                }
+                // 半个包留在流里（或相机不回显事务号，无法安全归属迟到响应）：
+                // 无法安全恢复，一次超时就把连接标记为作废并触发断线回调。
                 streamDesynced = true
-                log("命令通道读超时（操作 0x%04X）：流已失同步，连接作废".format(op))
+                log(
+                    "命令通道读超时（操作 0x%04X）：已收 ${e.partialBytes} 字节，流已失同步，连接作废"
+                        .format(op),
+                )
                 notifyLinkDead("命令通道读超时，流已失同步")
                 throw IOException("事务超时（操作 0x%04X），命令流已失同步".format(op), e)
             }
@@ -480,6 +568,22 @@ class PtpIpClient(
                     onChunk?.invoke(chunk, received, total)
                 }
                 Ptp.PKT_OPERATION_RESPONSE -> {
+                    // 事务号在响应载荷的偏移 2（响应码 u16 之后）。
+                    val respTxn = if (pkt.payload.size >= 6) PtpWire.getU32(pkt.payload, 2) else -1L
+                    if (txnEcho == null) {
+                        txnEcho = respTxn == txn
+                        log(
+                            if (txnEcho == true) "事务号回显校验通过（$respTxn）"
+                            else "相机不回显事务号（回显 $respTxn / 发送 $txn）：超时恢复退化为作废重连",
+                        )
+                    }
+                    if (txnEcho == true && respTxn != txn) {
+                        // 迟到/无法归属的响应：丢弃后继续等自己的那一笔。
+                        // 这是放弃事务后"不把别人的响应当自己的"的最后一道保险。
+                        if (respTxn == abandonedTxn) abandonedTxn = 0L
+                        log("丢弃过期响应（事务号 $respTxn ≠ 当前 $txn）")
+                        continue
+                    }
                     val code = PtpWire.getU16(pkt.payload, 0)
                     if (code != Ptp.RESP_OK) throw PtpException(code, "操作 0x%04X".format(op))
                     val respParams = ArrayList<Long>()
@@ -488,12 +592,84 @@ class PtpIpClient(
                         respParams.add(PtpWire.getU32(pkt.payload, off))
                         off += 4
                     }
+                    abandonedTxn = 0L
                     return TransactResult(code, respParams.toLongArray(), ByteArray(0))
                 }
                 Ptp.PKT_EVENT -> log("命令通道收到事件包（忽略）")
                 else -> log("命令通道收到未知包类型 ${pkt.type}（${pkt.payload.size}B）")
             }
         }
+    }
+
+    /**
+     * 读掉上一笔被放弃事务的迟到响应（含它的数据相位），使流回到"只属于当前事务"的状态。
+     *
+     * 必须在发送新请求之前、持有 txnLock 时调用。做法：短超时轮询，
+     * 依次丢弃收到的报文，直到看见该事务号的 OperationResponse（PTP/IP 规定数据
+     * 相位一定在终结响应之前，所以看到它就代表这笔事务彻底结束了）。
+     *
+     * **预算按"被放弃操作的数据量"分级**（真机教训 2026-09-15）：0x920F 中等图
+     * 单张就有 881KB，超时后它的响应会稍后涌入；若按小操作的 1.2s 预算草率放弃，
+     * 这 881KB 就可能被算进紧接着开始的下载里。因此数据相位可能很大的操作给 4s，
+     * 而且**等不到就明确作废连接**——宁可让用户重连，也不能把数据混进大文件传输。
+     * 小操作（探针/取景帧）仍按 1.2s 软放弃：最坏只是多一帧旧画面。
+     */
+    private fun drainAbandonedLocked(cin: InputStream) {
+        val t = abandonedTxn
+        if (t == 0L) return
+        val op = abandonedOp
+        val c = cmd
+        abandonedTxn = 0L
+        abandonedOp = 0
+        if (c == null || txnEcho != true) return
+        val heavy = isDataHeavy(op)
+        val budget = if (heavy) ABANDON_DRAIN_HEAVY_MS else ABANDON_DRAIN_MS
+        val prev = c.soTimeout
+        val deadline = SystemClock.elapsedRealtime() + budget
+        try {
+            while (SystemClock.elapsedRealtime() < deadline) {
+                c.soTimeout = 250
+                val pkt = try {
+                    PtpWire.readPacketTracked(cin)
+                } catch (e: PacketTimeoutException) {
+                    if (e.partialBytes > 0) {
+                        streamDesynced = true
+                        log("清理迟到响应时读到半个包，流已失同步，连接作废")
+                        notifyLinkDead("清理迟到响应时流失同步")
+                        return
+                    }
+                    continue // 250ms 内没有数据：还在等，继续轮询
+                } catch (e: Exception) {
+                    return // socket 异常交给后续事务路径处理
+                }
+                if (pkt.type == Ptp.PKT_OPERATION_RESPONSE && pkt.payload.size >= 6 &&
+                    PtpWire.getU32(pkt.payload, 2) == t
+                ) {
+                    log("已清理上一笔超时事务（0x%s）的迟到响应".format(t.toString(16)))
+                    return
+                }
+            }
+            if (heavy) {
+                streamDesynced = true
+                log(
+                    "放弃的事务 0x%04X（数据相位较大）在 ${budget}ms 内未收到终结响应，" +
+                        "无法保证后续大文件传输不被混入，连接作废".format(op),
+                )
+                notifyLinkDead("大事务的迟到响应未清理，为避免数据混淆作废连接")
+            } else {
+                log("超时事务 0x%s 的响应在 ${budget}ms 内未到达，继续后续事务".format(t.toString(16)))
+            }
+        } finally {
+            c.soTimeout = prev
+        }
+    }
+
+    /** 数据相位可能很大的操作：放弃它们之后必须确认清理干净，否则不能开始大传输。 */
+    private fun isDataHeavy(op: Int): Boolean {
+        if (op in 0x9400..0x9406) return true // 厂商高速读取族
+        return op == Ptp.OP_GET_OBJECT ||
+            op == Ptp.OP_GET_PARTIAL_OBJECT ||
+            op == Ptp.OP_NIKON_GET_FHD_PICTURE
     }
 
     // ---------------------------------------------------------------- 事件

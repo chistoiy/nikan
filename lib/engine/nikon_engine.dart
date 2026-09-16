@@ -66,6 +66,16 @@ class NikonEngine {
     return (r as num).toInt();
   }
 
+  /// 存储卡信息：`{cards: [...], primary: {maxBytes, freeBytes, freeImages, label}}`
+  static Future<Map<String, dynamic>> storageInfo() => _map('storageInfo');
+
+  /// 轻量预览（查看器默认路径）。
+  /// [quality]：low=大缩略图(~1600px) / medium=相机端 FHD 图(≤1920×1028)。
+  /// 返回 `{bytes, quality(实际生效), fallback?, note?}`——medium 不被支持时
+  /// 会回退 low 并在 `quality` 里如实反映，不会静默给原图。
+  static Future<Map<String, dynamic>> previewBytes(int handle, String quality) =>
+      _map('previewBytes', {'handle': handle, 'quality': quality});
+
   /// 相机能力清单（需已连接）：操作码/事件码/属性码原始列表
   static Future<Map<String, dynamic>> capabilities() => _map('capabilities');
 
@@ -86,6 +96,10 @@ class NikonEngine {
 
   static Future<void> liveViewStart() => _m.invokeMethod('liveViewStart');
 
+  /// 强制重进取景（先 0x9202 结束、再 0x9201 启动，忽略缓存的取景标志）。
+  /// 用于"相机报 NotLiveView 但其实没真退出"的半死状态——只重复发 0x9201 无效。
+  static Future<void> liveViewRestart() => _m.invokeMethod('liveViewRestart');
+
   static Future<void> liveViewStop() => _m.invokeMethod('liveViewStop');
 
   static Future<Uint8List> liveViewFrame() async {
@@ -96,11 +110,14 @@ class NikonEngine {
   /// 遥控快门（拍到卡上）
   static Future<void> capture() => _m.invokeMethod('capture');
 
-  /// 手动触发一次 AF 对焦
-  static Future<bool> afDrive() async {
-    final r = await _m.invokeMethod('afDrive');
-    return r == true;
-  }
+  /// 手动触发一次 AF 对焦（不指定区域，用相机当前 AF 区域）。
+  /// 返回 `{ok, reason}`：失败时 reason 是相机给出的响应码说明。
+  static Future<Map<String, dynamic>> afDrive() => _map('afDrive');
+
+  /// 指定对焦区域并驱动 AF（点击取景画面）。
+  /// 返回 `{ok, area(是否成功指定区域), reason, areaError?}`。
+  static Future<Map<String, dynamic>> afArea(int x, int y) =>
+      _map('afArea', {'x': x, 'y': y});
 
   /// 取景中拍摄（0x100E 优先，忙则 AF 探测回退）
   static Future<void> lvCapture() => _m.invokeMethod('lvCapture');
@@ -110,6 +127,58 @@ class NikonEngine {
     final r = await _m.invokeMethod('probeLvAf', {'handle': handle});
     return List<String>.from(r as List);
   }
+
+  /// 取景对焦坐标标定探针（需已在取景态）：厂商属性码清单 + AF 相关属性描述 +
+  /// 两种候选缩放下"画面 1/4 处"的 0x9205 试探，用于确定 ChangeAfArea 的坐标空间。
+  static Future<List<String>> probeAfArea(int frameW, int frameH) async {
+    final r = await _m.invokeMethod('probeAfArea', {'frameW': frameW, 'frameH': frameH});
+    return List<String>.from(r as List);
+  }
+
+  /// 休眠/自动关机属性探针：读出 LCD关闭/测光关闭/自动关机 的取值表，
+  /// 以及息屏后 DeviceReady 是否仍应答（判断"能不能从 App 唤醒相机"）。
+  static Future<List<String>> probeSleep() async {
+    final r = await _m.invokeMethod('probeSleep');
+    return List<String>.from(r as List);
+  }
+
+  /// 实时 ISO 发现探针（差分法，约 15 秒）：找出随 Auto ISO 变化的属性，
+  /// 用于解决"相机显示 ISO AUTO 2500、App 停在 2000"的问题。
+  static Future<List<String>> probeLiveIso() async {
+    final r = await _m.invokeMethod('probeLiveIso');
+    return List<String>.from(r as List);
+  }
+
+  /// 取景帧头部解出的**自动对焦倍数**（相机图像尺寸 ÷ 取景帧尺寸，x/y 各一个）。
+  /// 返回 `{ok, scaleX, scaleY, info}`；ok=false 表示头部未解析出来，需人工标定。
+  static Future<Map<String, dynamic>> afScaleFromHeader() => _map('afScaleFromHeader');
+
+  /// 取景帧头部完整 dump（调试面板用）：384 字节逐字段，用于定位实时 ISO/光圈/快门。
+  static Future<List<String>> probeLvHeader() async {
+    final r = await _m.invokeMethod('probeLvHeader');
+    return List<String>.from(r as List);
+  }
+
+  /// 遥控期间保持相机屏幕常亮：把 LCD 关闭 / 测光关闭 时间写到相机允许的最大值，
+  /// 记住原值；退出遥控时用 `enable: false` 还原。
+  /// 返回 `{ok, changed, failed, note}`——相机不允许修改时如实上报，不假装成功。
+  static Future<Map<String, dynamic>> keepAwake(bool enable) =>
+      _map('keepAwake', {'enable': enable});
+
+  /// 息屏后尝试唤醒相机（0x90C8 DeviceReady）。返回是否拿到应答。
+  static Future<bool> wakeUp() async {
+    final r = await _m.invokeMethod('wakeUp');
+    return r == true;
+  }
+
+  /// 防待机"戳一下"（实验）：DeviceReady + 重发上次对焦点，无副作用。
+  /// 用于试探相机能否因为协议活动而不进入待机。
+  static Future<Map<String, dynamic>> pokeActivity() => _map('pokeActivity');
+
+  /// 把一行 Dart 侧日志写进 logcat（release 包里 UI 日志原本只存在于应用内面板，
+  /// 真机排查界面问题时外部拿不到任何证据）。
+  static Future<void> logToNative(String line) =>
+      _m.invokeMethod('logToNative', {'line': line});
 
   /// 当前拍摄参数（光圈/快门/ISO/电量）
   static Future<Map<String, dynamic>> shotParams() => _map('shotParams');
@@ -210,6 +279,13 @@ class NikonEngine {
     final r = await _m.invokeMethod('fetchObject', {'handle': handle, 'size': size});
     return r as Uint8List;
   }
+
+  /// 在线取原图（**不落盘**）且**持续上报进度**：
+  /// 返回 `{bytes, bytesWritten, ms, speedMBps}`，过程中通过 `progress` 事件
+  /// 上报 `received/total/speedMBps`。大图页在"不保存到手机"设置下走这里——
+  /// 有进度条才知道是在下载还是已经卡住（旧的无进度取图只能一直转圈）。
+  static Future<Map<String, dynamic>> fetchOriginal(int handle, int size) =>
+      _map('fetchOriginal', {'handle': handle, 'size': size});
 
   /// 读取本地媒体完整字节（查看器用）
   static Future<Uint8List> mediaBytes(String uri) async {

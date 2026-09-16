@@ -7,6 +7,7 @@ import 'engine/camera_gateway.dart';
 import 'engine/nikon_engine.dart';
 import 'engine/settings_store.dart';
 import 'models/camera_file.dart';
+import 'models/pair_linker.dart';
 
 /// 全局应用状态：连接、文件列表、按需索引、下载、设置。
 class AppModel extends ChangeNotifier {
@@ -60,6 +61,105 @@ class AppModel extends ChangeNotifier {
   bool get deleteAfterDownload => settings.deleteAfterDownload;
   String get sortMode => settings.sortMode;
 
+  /// 大图查看器默认画质：low / medium / original（默认 medium）
+  String get viewerQuality => settings.viewerQuality;
+
+  Future<void> setViewerQuality(String v) async {
+    settings.viewerQuality = v;
+    await settings.save();
+    notifyListeners();
+  }
+
+  /// 大图页点「显示原图」时是否顺带保存到手机（默认关）
+  bool get viewerSaveOriginal => settings.viewerSaveOriginal;
+
+  Future<void> setViewerSaveOriginal(bool v) async {
+    settings.viewerSaveOriginal = v;
+    await settings.save();
+    notifyListeners();
+  }
+
+  /// 取景点击对焦的坐标缩放（见 SettingsStore.afAreaScale）
+  double get afAreaScale => settings.afAreaScale;
+
+  Future<void> setAfAreaScale(double v) async {
+    settings.afAreaScale = v;
+    await settings.save();
+    notifyListeners();
+  }
+
+  /// RAW+JPEG 成对联动（见 SettingsStore.linkRawJpegPairs）
+  bool get linkRawJpegPairs => settings.linkRawJpegPairs;
+
+  Future<void> setLinkRawJpegPairs(bool v) async {
+    settings.linkRawJpegPairs = v;
+    await settings.save();
+    notifyListeners();
+  }
+
+  // ---- 大图页原图加载进度 ----
+  //
+  // 两条路径（仅查看 / 顺带保存）都会把进度写进这几项。有进度条才说得清
+  // "是在下载还是卡住了"——此前只有一个转圈指示，转 30 秒用户只能干等。
+  bool originalLoading = false;
+  bool originalSaving = false; // true = 同时在保存到手机（文案不同）
+  double originalFrac = 0;
+  double originalSpeed = 0;
+  int originalReceived = 0;
+  int originalTotal = 0;
+
+  void beginOriginalLoad({required bool saving, int totalBytes = 0}) {
+    originalLoading = true;
+    originalSaving = saving;
+    originalFrac = 0;
+    originalSpeed = 0;
+    originalReceived = 0;
+    originalTotal = totalBytes;
+    notifyListeners();
+  }
+
+  void endOriginalLoad() {
+    originalLoading = false;
+    originalSaving = false;
+    originalFrac = 0;
+    originalSpeed = 0;
+    originalReceived = 0;
+    originalTotal = 0;
+    notifyListeners();
+  }
+
+  // ---- 存储卡状态 ----
+  /// 相机存储卡摘要（连接后自动拉取）：{freeBytes, freeImages, maxBytes, label}
+  Map<String, dynamic>? storage;
+  List<Map<String, dynamic>> storageCards = [];
+
+  Future<void> refreshStorage() async {
+    if (connState != 'connected') return;
+    try {
+      final r = await NikonEngine.storageInfo();
+      final cards = ((r['cards'] as List?) ?? const [])
+          .map((e) => (e as Map).cast<String, dynamic>())
+          .toList();
+      storageCards = cards;
+      storage = (r['primary'] as Map?)?.cast<String, dynamic>();
+    } catch (_) {
+      storage = null;
+    }
+    notifyListeners();
+  }
+
+  /// 卡剩余容量的可读文案（无数据时返回空串）
+  String get storageText {
+    final s = storage;
+    if (s == null) return '';
+    final free = (s['freeBytes'] as num?)?.toDouble() ?? 0;
+    final imgs = (s['freeImages'] as num?)?.toInt() ?? 0;
+    if (free <= 0) return '';
+    final gb = free / (1024 * 1024 * 1024);
+    final size = gb >= 1 ? '${gb.toStringAsFixed(1)}GB' : '${(free / (1024 * 1024)).round()}MB';
+    return '卡剩余 $size${imgs > 0 ? ' · 可拍 $imgs 张' : ''}';
+  }
+
   Future<void> setDownloadVariant(String v) async {
     settings.downloadVariant = v;
     await settings.save();
@@ -101,6 +201,104 @@ class AppModel extends ChangeNotifier {
   List<String> foundCameras = [];
   bool scanning = false;
 
+  /// 自动重连进度（原生在意外断开后自行重试时上报）。
+  /// attempt > 0 表示"连接中"是重连，而不是用户主动连接——UI 据此区分文案。
+  int reconnectAttempt = 0;
+  int reconnectTotal = 0;
+  int reconnectNextMs = 0;
+  String? reconnectReason;
+
+  // ---- 链路健康：相机活性 + Wi-Fi 信号 ----
+  //
+  // 用户遇到的困惑很具体：「不知道是卡住了、相机断开了、还是别的原因」。
+  // 只显示"已连接"回答不了这个问题，所以这里给两组可感知的证据：
+  // 1）Wi-Fi 信号强度（RSSI/格数/链路速率）——链路层面；
+  // 2）相机的活性（距上次收到相机消息多久、保活探针往返耗时）——协议层面。
+  // 空闲 60s 无消息是正常的（相机本就 3~60s 才推一次属性），但探针必须答得上。
+  String transport = 'wifi'; // wifi / usb（USB 无 Wi-Fi 信号可测）
+  int camIdleMs = -1; // 距上次收到相机消息（-1 = 本会话还没收到过）
+  int camRttMs = -1; // 最近一次保活探针往返耗时（-1 = 还没探过）
+  bool camProbeOk = true; // 最近一次探针是否成功（复探成功也算成功）
+  int wifiRssi = 0; // dBm；0 = 无数据
+  int wifiLevel = -1; // 0~4 格；-1 = 无数据
+  int wifiLinkSpeed = 0; // Mbps
+
+  Timer? _signalTimer;
+
+  void _startSignalWatch() {
+    _signalTimer?.cancel();
+    _signalTimer = Timer.periodic(const Duration(seconds: 4), (_) => _tickSignal());
+    unawaited(_tickSignal());
+  }
+
+  void _stopSignalWatch() {
+    _signalTimer?.cancel();
+    _signalTimer = null;
+    camIdleMs = -1;
+    camRttMs = -1;
+    camProbeOk = true;
+    wifiLevel = -1;
+    wifiRssi = 0;
+    wifiLinkSpeed = 0;
+  }
+
+  /// 每 4 秒刷新一次 Wi-Fi 信号（顺带驱动"距上次消息 N 秒"的文案刷新）
+  Future<void> _tickSignal() async {
+    if (connState != 'connected') return;
+    if (transport == 'usb') {
+      // USB 没有 Wi-Fi 信号可测：不要拿当前家庭 Wi-Fi 的格数冒充相机链路
+      notifyListeners();
+      return;
+    }
+    try {
+      final w = await NikonEngine.wifiInfo();
+      wifi = w;
+      wifiRssi = (w['rssi'] as num?)?.toInt() ?? 0;
+      wifiLevel = (w['signalLevel'] as num?)?.toInt() ?? -1;
+      wifiLinkSpeed = (w['linkSpeed'] as num?)?.toInt() ?? 0;
+    } catch (_) {}
+    notifyListeners();
+  }
+
+  /// Wi-Fi 信号的可读文案（无数据时如实说明，不猜）
+  String get wifiSignalText {
+    if (wifiLevel < 0) return '无数据';
+    final dbm = wifiRssi < 0 ? ' · $wifiRssi dBm' : '';
+    final quality = switch (wifiLevel) {
+      4 => '很强',
+      3 => '良好',
+      2 => '一般',
+      1 => '较弱',
+      _ => '很弱',
+    };
+    return '$wifiLevel/4 格（$quality）$dbm';
+  }
+
+  /// 立即刷新一次链路健康（详情面板的「立即检测」）
+  Future<void> refreshSignal() => _tickSignal();
+
+  /// 一句话链路诊断（点 AppBar 的信号图标可见详情）
+  String get linkHealthText {
+    if (connState == 'connected') {
+      final rtt = camRttMs >= 0 ? '响应 $camRttMs ms' : '等待相机响应…';
+      if (!camProbeOk) return '相机未响应，正在确认…';
+      final s = camIdleMs >= 0 ? (camIdleMs / 1000).round() : -1;
+      if (s < 0) return '已连接 · $rtt';
+      if (s <= 12) return '已连接 · $rtt';
+      if (s <= 90) return '相机空闲 ${s}s（无新消息，正常）';
+      return '已 ${s}s 未收到相机消息';
+    }
+    if (connState == 'connecting') return connStateText;
+    return '未连接相机';
+  }
+
+  void _clearReconnect() {
+    reconnectAttempt = 0;
+    reconnectTotal = 0;
+    reconnectNextMs = 0;
+    reconnectReason = null;
+  }
+
   // ---- 文件 ----
   List<CameraFile> files = [];
   bool loadingFiles = false;
@@ -120,6 +318,18 @@ class AppModel extends ChangeNotifier {
   String? dlResult;
 
   bool get isDownloadReady => connState == 'connected';
+
+  /// 连接态文案（相册页/遥控页的断开占位共用）。
+  /// 区分"用户主动连接中"与"意外断开后的自动重连"，否则两种情况都只说一句
+  /// "连接已断开"，用户既不知道发生了什么，也不知道该等还是该手动重连。
+  String get connStateText {
+    if (connState == 'connected') return '已连接';
+    if (connState == 'connecting' && reconnectAttempt > 0) {
+      return '连接已断开，正在自动重连（第 $reconnectAttempt/$reconnectTotal 次）';
+    }
+    if (connState == 'connecting') return '正在连接相机…';
+    return '连接已断开';
+  }
 
   bool isDownloaded(CameraFile f) => gateway.records.contains(f.name, f.size);
 
@@ -154,6 +364,7 @@ class AppModel extends ChangeNotifier {
   Future<void> connect(String ip) async {
     connState = 'connecting';
     connError = null;
+    transport = 'wifi';
     notifyListeners();
     _connectingSelf = true;
     try {
@@ -173,6 +384,7 @@ class AppModel extends ChangeNotifier {
   Future<void> connectUsb() async {
     connState = 'connecting';
     connError = null;
+    transport = 'usb';
     notifyListeners();
     _connectingSelf = true;
     try {
@@ -192,6 +404,7 @@ class AppModel extends ChangeNotifier {
   Future<void> connectSmart() async {
     connState = 'connecting';
     connError = null;
+    transport = 'wifi';
     notifyListeners();
     _connectingSelf = true;
     try {
@@ -210,9 +423,13 @@ class AppModel extends ChangeNotifier {
   Future<void> _afterConnected() async {
     connState = 'connected';
     hasNewPhotos = false;
+    _clearReconnect();
     notifyListeners();
     battery = await NikonEngine.battery();
     notifyListeners();
+    // 存储卡状态、信号/心跳监控与文件列表并行拉取
+    unawaited(refreshStorage());
+    _startSignalWatch();
     await loadFiles();
   }
 
@@ -220,6 +437,7 @@ class AppModel extends ChangeNotifier {
     await NikonEngine.disconnect();
     connState = 'disconnected';
     cameraInfo = null;
+    _stopSignalWatch();
     notifyListeners();
   }
 
@@ -262,6 +480,7 @@ class AppModel extends ChangeNotifier {
       });
       files = next;
       loadingFiles = false;
+      _rebuildPairIndex();
       notifyListeners();
       // 重新枚举说明用户主动刷新或相机有新照片：给此前读取失败的句柄一次重试机会
       gateway.resetFailures();
@@ -276,6 +495,46 @@ class AppModel extends ChangeNotifier {
 
   bool _indexRunning = false;
   bool _probedOnce = false;
+
+  // ------------------------------------------------------------ RAW+JPEG 配对
+
+  /// 基名索引：目录/基名 → 文件。配对与"找另一半"都走它，避免每次 O(n) 扫全表。
+  final Map<String, CameraFile> _pairIndex = {};
+
+  /// 重新枚举后重建索引（只有已读到文件名的条目能入索引）。
+  void _rebuildPairIndex() {
+    _pairIndex.clear();
+    for (final f in files) {
+      final k = PairLinker.keyOf(f);
+      if (k != null) _pairIndex[k] = f;
+    }
+    // 规则集中在 PairLinker（可单测），这里只做装配
+    PairLinker.linkAll(files);
+  }
+
+  /// 给一个文件找配对：同目录 + 同基名 + 类型互补（一个 JPEG 一个 RAW）。
+  /// 视频不参与配对；同名同类的两个文件不配对——宁可不连，也不要连错。
+  void _pairOne(CameraFile f) {
+    final k = PairLinker.keyOf(f);
+    if (k == null) return;
+    PairLinker.link(f, _pairIndex[k]);
+  }
+
+  /// 取配对文件（无配对返回 null）
+  CameraFile? pairOf(CameraFile f) {
+    final h = f.pairHandle;
+    if (h == null) return null;
+    for (final x in files) {
+      if (x.handle == h) return x;
+    }
+    return null;
+  }
+
+  /// 该文件的配对是否已下载到手机
+  bool isPairDownloaded(CameraFile f) {
+    final p = pairOf(f);
+    return p != null && isDownloaded(p);
+  }
 
   /// 连接后自动运行一次协议探针（高速下载 0x9400 族 / 相机端缩放 0x9207），
   /// 结果写入调试日志，用于确定能否接入更快的下载通道。
@@ -315,9 +574,16 @@ class AppModel extends ChangeNotifier {
       notifyListeners();
       return;
     }
+    final target = next;
     gateway
-        .schedule(() => NikonEngine.fileInfo(next!.handle), priority: false)
-        .then(next.applyInfo)
+        .schedule(() => NikonEngine.fileInfo(target.handle), priority: false)
+        .then((m) {
+      target.applyInfo(m);
+      // 索引补全后才拿得到文件名——RAW+JPEG 配对只能在这里增量做（O(1)）
+      final k = target.pairKey;
+      if (k != null) _pairIndex[k] = target;
+      _pairOne(target);
+    })
         .catchError((_) {})
         .whenComplete(() {
       if (files.length % 16 == 0 || indexingDone) notifyListeners();
@@ -327,7 +593,13 @@ class AppModel extends ChangeNotifier {
 
   // ------------------------------------------------------------ 下载
 
-  Future<String> download(List<CameraFile> picks) async {
+  /// 批量下载。[variantOverride] 用于显式指定画质（查看器"显示原图"要强制原图，
+  /// 不受设置里的下载画质影响）。
+  Future<String> download(
+    List<CameraFile> picks, {
+    String? variantOverride,
+    void Function(CameraFile f, String? uri)? onSaved,
+  }) async {
     if (downloading || picks.isEmpty) return '';
     downloading = true;
     cancelRequested = false;
@@ -338,9 +610,11 @@ class AppModel extends ChangeNotifier {
     dlResult = null;
     dlCurrentName = '';
     notifyListeners();
+    final variant = variantOverride ?? downloadVariant;
     final summary = await gateway.downloadFiles(
       picks,
-      variant: downloadVariant,
+      variant: variant,
+      onSaved: onSaved,
       deleteAfterDownload: deleteAfterDownload,
       onProgress: (done, total, current, fileFrac, speed) {
         dlDone = done;
@@ -371,7 +645,17 @@ class AppModel extends ChangeNotifier {
         AppLog.add(map['line']?.toString() ?? '');
       case 'status':
         final state = map['state'];
-        if (state == 'disconnected') {
+        if (state == 'reconnecting') {
+          // 自动重连中：UI 显示"连接中…"并给出第几次尝试，不置灰
+          reconnectAttempt = (map['attempt'] as num?)?.toInt() ?? 0;
+          reconnectTotal = (map['total'] as num?)?.toInt() ?? 0;
+          reconnectNextMs = (map['nextInMs'] as num?)?.toInt() ?? 0;
+          reconnectReason = map['reason']?.toString();
+          connState = 'connecting';
+          notifyListeners();
+        } else if (state == 'disconnected') {
+          _clearReconnect();
+          _stopSignalWatch();
           if (connState != 'disconnected') {
             connState = 'disconnected';
             _indexRunning = false;
@@ -383,13 +667,28 @@ class AppModel extends ChangeNotifier {
           unawaited(_afterConnected());
         }
       case 'progress':
+        final received = (map['received'] as num?)?.toDouble() ?? 0;
+        final total = (map['total'] as num?)?.toDouble() ?? 0;
+        final speed = (map['speedMBps'] as num?)?.toDouble() ?? 0;
         if (downloading) {
-          final received = (map['received'] as num?)?.toDouble() ?? 0;
-          final total = (map['total'] as num?)?.toDouble() ?? 0;
           dlFileFrac = total > 0 ? (received / total).clamp(0.0, 1.0) : 0;
-          dlSpeed = (map['speedMBps'] as num?)?.toDouble() ?? 0;
-          notifyListeners();
+          dlSpeed = speed;
         }
+        // 大图页的"显示原图"也会走到这里（下载与仅查看两条路径共用同一套进度事件）
+        if (originalLoading) {
+          originalReceived = received.round();
+          if (total > 0) originalTotal = total.round();
+          originalFrac = total > 0 ? (received / total).clamp(0.0, 1.0) : 0;
+          originalSpeed = speed;
+        }
+        if (downloading || originalLoading) notifyListeners();
+      case 'health':
+        // 保活心跳（每 5s 一次，来自原生）：只有它才能回答
+        // "相机是空闲还是已经失联"——事件通道安静时这两种情况长得一样。
+        camIdleMs = (map['eventAgoMs'] as num?)?.toInt() ?? -1;
+        camRttMs = (map['rttMs'] as num?)?.toInt() ?? -1;
+        camProbeOk = map['probeOk'] != false;
+        notifyListeners();
       case 'objectAdded':
         if (connState == 'connected') {
           hasNewPhotos = true;
@@ -401,6 +700,7 @@ class AppModel extends ChangeNotifier {
   @override
   void dispose() {
     _notifyTimer?.cancel();
+    _signalTimer?.cancel();
     gateway.records.removeListener(_notifyThrottled);
     _sub?.cancel();
     super.dispose();

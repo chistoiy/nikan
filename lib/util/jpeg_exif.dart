@@ -51,6 +51,10 @@ String describeJpegFrame(Uint8List bytes) {
   return parts.join(' ');
 }
 
+/// JPEG 的像素尺寸（读 SOF 段，不解码）。
+/// 取景画面点击对焦要把屏幕坐标换算回相机帧坐标，需要这个尺寸。
+(int, int)? jpegDimensions(Uint8List bytes) => _sofDimensions(bytes);
+
 // ------------------------------------------------------------------ 段遍历
 
 const int _markerSoi = 0xD8;

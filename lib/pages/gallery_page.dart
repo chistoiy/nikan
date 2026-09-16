@@ -1,7 +1,10 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import '../app_model.dart';
+import '../engine/nikon_engine.dart';
 import '../models/camera_file.dart';
 import 'viewer_page.dart';
 import 'widgets/app_widgets.dart';
@@ -10,6 +13,7 @@ import 'widgets/gallery_cell.dart';
 import 'widgets/gallery_filter_bar.dart';
 import 'widgets/gallery_options_sheet.dart';
 import 'widgets/gallery_status_bars.dart';
+import 'widgets/link_status.dart';
 
 /// 相册页：3 列缩略图网格、按需加载、类型/文件夹筛选、
 /// 长按进入选择 + 按住滑动批量勾选（微信式）、批量下载。
@@ -40,6 +44,9 @@ class _GalleryPageState extends State<GalleryPage> {
   /// 只看未下载（与 _kind 是正交维度，因此单独一个开关）
   bool _undownloadedOnly = false;
 
+  /// 只看 RAW+JPEG 成对照片（相机开了"同时记录"时，一张照片是两个文件）
+  bool _pairedOnly = false;
+
   /// 按拍摄日期分组显示（分组后点日期头部即可整选当天）
   bool _groupByDay = false;
 
@@ -58,8 +65,48 @@ class _GalleryPageState extends State<GalleryPage> {
     indexAt: (g) => _groupByDay ? _hitIndex(g) : _indexAt(g),
     scrollController: _gridCtrl,
     viewportBox: () => _gridKey.currentContext?.findRenderObject() as RenderBox?,
-    onChanged: () => setState(() {}),
+    onChanged: () => setState(_syncPairs),
   );
+
+  /// RAW+JPEG 成对联动：任何选择变化后补齐/去除配对的另一半。
+  ///
+  /// 放在 [DragSelection.onChanged] 里做，是因为选择集的所有入口（点格子、点勾选
+  /// 热区、长按滑动、全选、按日期整组）最终都会走这个回调——只在这一处实现，
+  /// 就不会出现"点选会联动、滑动不会"这种半生效。
+  bool _syncingPairs = false;
+
+  void _syncPairs() {
+    if (!model.linkRawJpegPairs || _syncingPairs) return;
+    _syncingPairs = true;
+    try {
+      final byHandle = {for (final f in model.files) f.handle: f};
+      // 配对是一对一关系，一轮即可收敛；两轮是保险（配对在索引过程中可能刚补齐）
+      for (var pass = 0; pass < 2; pass++) {
+        var changed = false;
+        // ① 选中项 → 带上它的配对
+        for (final h in _sel.selected.toList()) {
+          final p = byHandle[h]?.pairHandle;
+          if (p != null && !_sel.selected.contains(p)) {
+            _sel.selected.add(p);
+            changed = true;
+          }
+        }
+        // ② 取消项 → 带下它的配对（否则配对会一直粘着，取消不掉）
+        for (final f in byHandle.values) {
+          final p = f.pairHandle;
+          if (p == null) continue;
+          if (!_sel.selected.contains(f.handle) && _sel.selected.contains(p)) {
+            _sel.selected.remove(p);
+            changed = true;
+          }
+        }
+        if (!changed) break;
+      }
+      if (_sel.selected.isEmpty && _sel.selectMode) _sel.selectMode = false;
+    } finally {
+      _syncingPairs = false;
+    }
+  }
 
   AppModel get model => widget.model;
 
@@ -95,6 +142,7 @@ class _GalleryPageState extends State<GalleryPage> {
     var list = List<CameraFile>.of(model.files);
     if (_undownloadedOnly) list = list.where((f) => !model.isDownloaded(f)).toList();
     if (_kind != 'all') list = list.where((f) => f.kind == _kind).toList();
+    if (_pairedOnly) list = list.where((f) => f.isPaired).toList();
     if (_folder != '全部') list = list.where((f) => f.folder == _folder).toList();
     int cmp(CameraFile a, CameraFile b) {
       switch (model.sortMode) {
@@ -124,12 +172,13 @@ class _GalleryPageState extends State<GalleryPage> {
 
   /// 改筛选条件：丢弃筛选缓存，并把选择集收敛到新列表上。
   /// 不收敛的话"已选 N"会包含看不见的条目，"取消全选"也按不干净。
-  void _setFilter({String? kind, String? folder, bool? undownloaded, bool? groupByDay}) =>
+  void _setFilter({String? kind, String? folder, bool? undownloaded, bool? groupByDay, bool? pairedOnly}) =>
       setState(() {
         if (kind != null) _kind = kind;
         if (folder != null) _folder = folder;
         if (undownloaded != null) _undownloadedOnly = undownloaded;
         if (groupByDay != null) _groupByDay = groupByDay;
+        if (pairedOnly != null) _pairedOnly = pairedOnly;
         _filteredCache = null;
         _sel.prune(_filtered.map((f) => f.handle).toSet());
       });
@@ -291,6 +340,80 @@ class _GalleryPageState extends State<GalleryPage> {
     }
   }
 
+  /// 相机端操作：保护 / 取消保护 / 删除卡上原片。
+  ///
+  /// 原生的 `deleteObject(0x100B)` 与 `protectObject(0x1012)` 早就实现并封装到了
+  /// Dart 侧，但此前**没有任何 UI 入口**（审查文档 C1）——相机上"保护"过的照片
+  /// 不会被相机自己的删除操作清掉，是现场挑片的刚需。
+  Future<void> _cameraOp(String kind) async {
+    _sel.prune(_filtered.map((f) => f.handle).toSet());
+    final picks = _filtered.where((f) => _sel.selected.contains(f.handle)).toList();
+    if (picks.isEmpty) return;
+
+    if (kind == 'delete') {
+      final ok = await showDialog<bool>(
+        context: context,
+        builder: (ctx) => AlertDialog(
+          backgroundColor: const Color(0xFF1E1E1E),
+          title: Text('删除相机上的 ${picks.length} 个文件？', style: const TextStyle(fontSize: 16)),
+          content: const Text(
+            '直接从相机存储卡删除，删除后无法恢复。\n'
+            '已下载到手机的副本不受影响；受保护的文件相机会拒绝删除。',
+            style: TextStyle(fontSize: 13.5, height: 1.5),
+          ),
+          actions: [
+            TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('取消')),
+            FilledButton(
+              style: FilledButton.styleFrom(
+                  minimumSize: const Size(64, 40), backgroundColor: const Color(0xFFE53935)),
+              onPressed: () => Navigator.pop(ctx, true),
+              child: const Text('删除'),
+            ),
+          ],
+        ),
+      );
+      if (ok != true) return;
+    }
+
+    final protect = kind != 'delete';
+    var done = 0;
+    final failed = <String>[];
+    for (final f in picks) {
+      try {
+        if (kind == 'delete') {
+          await NikonEngine.deleteObject(f.handle);
+        } else {
+          await NikonEngine.protectObject(f.handle, protect: protect);
+        }
+        done++;
+      } catch (e) {
+        failed.add('${f.name ?? f.handle}（$e）');
+      }
+    }
+    if (!mounted) return;
+    _sel.exitSelect();
+    if (kind == 'delete') {
+      await model.loadFiles(); // 卡上没了，重新枚举
+      if (!mounted) return;
+      unawaited(model.refreshStorage());
+    }
+    final label = switch (kind) {
+      'delete' => '已删除',
+      'unprotect' => '已取消保护',
+      _ => '已保护',
+    };
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(
+          failed.isEmpty
+              ? '$label $done 个文件'
+              : '$label $done 个，失败 ${failed.length} 个：${failed.take(3).join('、')}',
+        ),
+        duration: Duration(seconds: failed.isEmpty ? 2 : 8),
+      ),
+    );
+  }
+
   /// 状态条：按「进行中的下载 > 新照片 > 索引」的优先级**只显示一条**。
   /// 三块状态条此前各自判断、可以同时出现，最多挤掉网格 100dp 以上。
   Widget _statusBar(int total) {
@@ -343,7 +466,8 @@ class _GalleryPageState extends State<GalleryPage> {
                 Text(
                   filtered
                       ? '当前筛选 ${_filtered.length} 张 · 卡内 ${model.files.length}'
-                      : '已下载 ${model.files.length - pendingAll} · 卡内 ${model.files.length}',
+                      : '已下载 ${model.files.length - pendingAll} · 卡内 ${model.files.length}'
+                          '${model.storageText.isEmpty ? '' : ' · ${model.storageText}'}',
                   style: TextStyle(fontSize: 11, color: Colors.white.withValues(alpha: 0.55)),
                 ),
               ],
@@ -381,7 +505,7 @@ class _GalleryPageState extends State<GalleryPage> {
           return Scaffold(
             appBar: AppBar(title: const Text('照片')),
             body: DisconnectedView(
-              message: '连接已断开',
+              message: model.connStateText,
               action: FilledButton(
                 onPressed: () => Navigator.pop(context),
                 child: const Text('返回重新连接'),
@@ -407,6 +531,9 @@ class _GalleryPageState extends State<GalleryPage> {
                 onToggleUndownloaded: () => _setFilter(undownloaded: !_undownloadedOnly),
                 groupByDay: _groupByDay,
                 onToggleGroupByDay: () => _setFilter(groupByDay: !_groupByDay),
+                pairedOnly: _pairedOnly,
+                pairedCount: model.files.where((f) => f.isPaired).length,
+                onTogglePaired: () => _setFilter(pairedOnly: !_pairedOnly),
               ),
               // 状态条只显示一条：此前三块各自判断、可同时堆叠，最多挤掉网格 100dp 以上
               _statusBar(files.length),
@@ -422,6 +549,8 @@ class _GalleryPageState extends State<GalleryPage> {
   PreferredSizeWidget _normalAppBar() => AppBar(
         title: Text('照片${model.files.isEmpty ? '' : ' ${model.files.length}'}'),
         actions: [
+          // 链路状态：点开可分辨"卡住了 / 相机忙 / 链路已断"
+          LinkStatusButton(model: model),
           IconButton(
             tooltip: '显示选项',
             icon: const Icon(Icons.tune),
@@ -568,6 +697,7 @@ class _GalleryPageState extends State<GalleryPage> {
       thumb: f.hasThumb ? model.gateway.memThumb(f.handle) : null,
       selected: _sel.selected.contains(f.handle),
       downloaded: model.isDownloaded(f),
+      pairDownloaded: model.isPairDownloaded(f),
       onTap: () => _sel.selectMode ? _sel.toggle(f.handle) : _openViewer(index, files),
       onLongPress: () {
         HapticFeedback.mediumImpact();
@@ -636,6 +766,17 @@ class _GalleryPageState extends State<GalleryPage> {
                         ],
                       ),
                     ),
+                  ),
+                  // 相机端操作：保护/取消保护（无损）+ 删除卡上原片（不可恢复）
+                  PopupMenuButton<String>(
+                    tooltip: '相机端操作',
+                    onSelected: _cameraOp,
+                    itemBuilder: (_) => const [
+                      PopupMenuItem(value: 'protect', child: Text('保护（相机上标记为不可删）', style: TextStyle(fontSize: 14))),
+                      PopupMenuItem(value: 'unprotect', child: Text('取消保护', style: TextStyle(fontSize: 14))),
+                      PopupMenuItem(value: 'delete', child: Text('删除相机上的原片', style: TextStyle(fontSize: 14))),
+                    ],
+                    icon: const Icon(Icons.more_vert, color: Colors.white70),
                   ),
                 ],
               ),

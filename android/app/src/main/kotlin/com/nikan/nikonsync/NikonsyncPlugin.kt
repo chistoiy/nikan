@@ -5,6 +5,8 @@ import android.content.Context
 import android.content.Intent
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
+import android.util.Log
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.BinaryMessenger
 import io.flutter.plugin.common.EventChannel
@@ -176,6 +178,14 @@ object NikonsyncPlugin {
                             CameraEngine.thumbnail((args["handle"] as Number).toLong())
                         }
                         "battery" -> CameraEngine.battery()
+                        "storageInfo" -> CameraEngine.storageInfo()
+                        "previewBytes" -> {
+                            val args = call.arguments as Map<*, *>
+                            CameraEngine.previewBytes(
+                                (args["handle"] as Number).toLong(),
+                                (args["quality"] as? String) ?: "medium",
+                            )
+                        }
                         "capabilities" -> CameraEngine.capabilities()
                         "download" -> {
                             val args = call.arguments as Map<*, *>
@@ -200,6 +210,7 @@ object NikonsyncPlugin {
                             true
                         }
                         "liveViewStart" -> CameraEngine.liveViewStart()
+                        "liveViewRestart" -> CameraEngine.liveViewRestart()
                         "liveViewStop" -> {
                             CameraEngine.liveViewStop()
                             true
@@ -208,6 +219,13 @@ object NikonsyncPlugin {
                         "capture" -> CameraEngine.capture()
                         "lvCapture" -> CameraEngine.lvCapture()
                         "afDrive" -> CameraEngine.afDrive()
+                        "afArea" -> {
+                            val args = call.arguments as Map<*, *>
+                            CameraEngine.afArea(
+                                (args["x"] as Number).toInt(),
+                                (args["y"] as Number).toInt(),
+                            )
+                        }
                         "shotParams" -> CameraEngine.shotParams()
                         "setShotParam" -> {
                             val args = call.arguments as Map<*, *>
@@ -244,6 +262,36 @@ object NikonsyncPlugin {
                             val args = call.arguments as? Map<*, *>
                             CameraEngine.probeLvAf(((args?.get("handle") as? Number) ?: 0L).toLong())
                         }
+                        // 取景对焦坐标标定：帧尺寸由 Dart 侧传入（它才知道当前取景帧多大）
+                        "probeAfArea" -> {
+                            val args = call.arguments as? Map<*, *>
+                            CameraEngine.probeAfArea(
+                                ((args?.get("frameW") as? Number) ?: 0).toInt(),
+                                ((args?.get("frameH") as? Number) ?: 0).toInt(),
+                            )
+                        }
+                        "probeSleep" -> CameraEngine.probeSleep()
+                        // 自动对焦倍数（从取景帧头部解出的相机图像尺寸 ÷ 取景帧尺寸）
+                        "afScaleFromHeader" -> CameraEngine.afScaleFromHeader()
+                        // 取景帧头部完整 dump（384B，找实时 ISO 用）
+                        "probeLvHeader" -> CameraEngine.probeLvHeader()
+                        // 实时 ISO 发现（差分法，约 15 秒；期间请对着明暗变化处让 Auto ISO 动起来）
+                        "probeLiveIso" -> CameraEngine.probeLiveIso()
+                        // 防待机"戳一下"（实验）：DeviceReady + 重发上次对焦点，无副作用
+                        "pokeActivity" -> CameraEngine.pokeActivity()
+                        // 遥控期间保持相机屏幕常亮（可写 MonitorOff/MeterOff，退出时还原）
+                        "keepAwake" -> {
+                            val args = call.arguments as? Map<*, *>
+                            CameraEngine.keepAwake(args?.get("enable") != false)
+                        }
+                        // 息屏后尝试唤醒（DeviceReady），返回是否应答
+                        "wakeUp" -> CameraEngine.wakeUp()
+                        // Dart 侧写一行到 logcat：release 包里 UI 层日志原本无处可查
+                        "logToNative" -> {
+                            val args = call.arguments as? Map<*, *>
+                            CameraEngine.logFromDart(args?.get("line")?.toString() ?: "")
+                            true
+                        }
                         "probeLiveView4" -> {
                             val args = call.arguments as? Map<*, *>
                             CameraEngine.probeLiveView4(
@@ -275,6 +323,15 @@ object NikonsyncPlugin {
                                 (args["size"] as Number).toLong(),
                             )
                         }
+                        // 带进度的在线取原图（不落盘）：大图页「显示原图」在
+                        // "不保存到本地"设置下走这里，进度事件让 UI 能显示真实百分比
+                        "fetchOriginal" -> {
+                            val args = call.arguments as Map<*, *>
+                            CameraEngine.fetchOriginal(
+                                (args["handle"] as Number).toLong(),
+                                (args["size"] as Number).toLong(),
+                            )
+                        }
                         "mediaBytes" -> {
                             val args = call.arguments as Map<*, *>
                             CameraEngine.mediaBytes(args["uri"] as String)
@@ -288,9 +345,37 @@ object NikonsyncPlugin {
                     mainHandler.post { result.success(r) }
                 } catch (e: Throwable) {
                     val msg = e.message ?: e.javaClass.simpleName
+                    // 原生侧记一笔失败原因：download() 内部没有 catch，异常直接穿过这里
+                    // 回到 Dart，此前 logcat 里对"下载中途失败"完全没有痕迹（真机踩过）。
+                    //
+                    // 高频方法（取景帧）必须限流：相机退出取景时它每秒失败 8 次，
+                    // 实测能把 logcat 缓冲整个冲掉，反而丢失真正有用的日志。
+                    if (shouldLogMethodFailure(call.method)) {
+                        CameraEngine.log("✗ 方法 ${call.method} 失败：$msg")
+                    }
+                    if (e !is PtpException) {
+                        Log.w("NikonSync", "方法 ${call.method} 异常", e)
+                    }
                     mainHandler.post { result.error("ENGINE_ERROR", msg, null) }
                 }
             }
         }
     }
+
+    /** 方法名 → 上次失败日志时间戳（仅高频方法需要限流） */
+    private val methodFailLogAt = java.util.concurrent.ConcurrentHashMap<String, Long>()
+
+    private fun shouldLogMethodFailure(method: String): Boolean {
+        if (!HIGH_FREQ_METHODS.contains(method)) return true
+        val now = SystemClock.elapsedRealtime()
+        val prev = methodFailLogAt[method] ?: 0L
+        if (now - prev < FAIL_LOG_MIN_GAP_MS) return false
+        methodFailLogAt[method] = now
+        return true
+    }
+
+    /** 会被上层以每帧一次的频率调用的方法 */
+    private val HIGH_FREQ_METHODS = setOf("liveViewFrame")
+
+    private const val FAIL_LOG_MIN_GAP_MS = 5_000L
 }

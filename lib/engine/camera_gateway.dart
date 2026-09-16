@@ -177,6 +177,9 @@ class CameraGateway {
     List<CameraFile> picks, {
     void Function(int done, int total, CameraFile current, double fileFrac, double speedMBps)? onProgress,
     void Function(CameraFile f, String message)? onFileSkipped,
+    /// 每张落盘成功后回调一次，带本地 uri —— 查看器"显示原图"靠它拿到刚下载的
+    /// 本地文件直接展示（而不是再走一次网络取图）。
+    void Function(CameraFile f, String? uri)? onSaved,
     bool Function()? isCancelled,
     String variant = 'original',
     bool deleteAfterDownload = false,
@@ -213,6 +216,7 @@ class CameraGateway {
           uri: r['uri'] as String?,
           path: r['path'] as String?,
         ));
+        onSaved?.call(f, r['uri'] as String?);
         if (deleteAfterDownload) {
           try {
             await NikonEngine.deleteObject(f.handle);

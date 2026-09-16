@@ -60,10 +60,19 @@ class _LocalViewerPageState extends State<LocalViewerPage> {
     try {
       final b = await NikonEngine.mediaBytes(e.uri!);
       if (!mounted) return;
-      setState(() => _bytes[e.key] = b);
+      setState(() {
+        // 上限必须有：原图可达 40MB，翻十张就是 OOM（审查文档 A3）
+        _bytes.remove(e.key);
+        _bytes[e.key] = b;
+        while (_bytes.length > _cacheMax) {
+          _bytes.remove(_bytes.keys.first);
+        }
+      });
       _parseExif(e.key, b);
     } catch (_) {}
   }
+
+  static const int _cacheMax = 3;
 
   Future<void> _parseExif(String key, Uint8List bytes) async {
     final info = await ExifSummary.parse(bytes);

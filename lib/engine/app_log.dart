@@ -2,6 +2,8 @@ import 'dart:async';
 
 import 'package:flutter/foundation.dart';
 
+import 'nikon_engine.dart';
+
 /// 全局协议日志缓冲：App 启动即开始记录（原生事件 → AppModel 转发到这里），
 /// 任何页面打开调试面板时都能看到历史日志。
 ///
@@ -23,6 +25,16 @@ class AppLog {
   static bool _reporting = false;
 
   static void add(String text) => _push(text);
+
+  /// 关键路径日志：同时写进 logcat。
+  ///
+  /// 起因（2026-09-15）：release 包里 Dart 侧日志只在应用内面板，真机上"参数为什么
+  /// 没刷新"这类**界面层**问题外部完全拿不到证据，只能靠用户口述。
+  /// 只给关键路径用——全量镜像会把 logcat 缓冲冲掉，反而丢失协议日志。
+  static void addKey(String text) {
+    _push(text);
+    unawaited(NikonEngine.logToNative(text).catchError((_) {}));
+  }
 
   /// 错误堆栈上报：防递归 + 500ms 频率限制
   static void reportError(String text) {

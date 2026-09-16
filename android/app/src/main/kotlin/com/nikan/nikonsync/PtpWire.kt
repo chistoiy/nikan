@@ -3,9 +3,26 @@ package com.nikan.nikonsync
 import java.io.IOException
 import java.io.InputStream
 import java.io.OutputStream
+import java.net.SocketTimeoutException
 
 /** PTP/IP 原始报文：类型 + 载荷（不含 8 字节头）。 */
 class PtpPacket(val type: Int, val payload: ByteArray)
+
+/**
+ * 读包超时，且**已收到部分字节**。
+ *
+ * [partialBytes] 是本次读包已经吃掉的字节数：
+ * - `0` → 超时发生在**包边界**，流里的位置仍然合法，后续报文可以照常解析；
+ * - `>0` → 半个包留在流里，之后每个事务都会解析错位，**只能作废连接**。
+ *
+ * 这个区分是"超时不再必然掉线"的关键：此前 readFully 不报告进度，任何超时
+ * 都被当成错位处理，于是一次取景帧慢就直接把整条连接判死（见交接文档 §15/§19）。
+ */
+class PacketTimeoutException(
+    val partialBytes: Int,
+    message: String,
+    cause: Throwable? = null,
+) : IOException(message, cause)
 
 /** 编解码错误。 */
 class WireException(message: String) : IOException(message)
@@ -82,6 +99,43 @@ object PtpWire {
         val payloadLen = (len - HEADER_SIZE).toInt()
         val payload = ByteArray(payloadLen)
         if (payloadLen > 0) readFully(input, payload)
+        return PtpPacket(type, payload)
+    }
+
+    /**
+     * 与 [readPacket] 相同，但读超时时抛出带**已读字节数**的 [PacketTimeoutException]，
+     * 让调用方能区分"卡在包边界"（可继续用）与"卡在包中间"（流已错位）。
+     */
+    fun readPacketTracked(input: InputStream): PtpPacket {
+        val hdr = ByteArray(HEADER_SIZE)
+        var off = 0
+        while (off < HEADER_SIZE) {
+            val n = try {
+                input.read(hdr, off, HEADER_SIZE - off)
+            } catch (e: SocketTimeoutException) {
+                throw PacketTimeoutException(off, "读包头超时（已收 $off/$HEADER_SIZE 字节）", e)
+            }
+            if (n < 0) throw IOException("socket EOF")
+            off += n
+        }
+        val len = getU32(hdr, 0)
+        val type = getU32(hdr, 4).toInt()
+        if (len < HEADER_SIZE || len > MAX_PACKET_BYTES) {
+            throw WireException("非法包长度 $len（允许 $HEADER_SIZE~$MAX_PACKET_BYTES）")
+        }
+        val payloadLen = (len - HEADER_SIZE).toInt()
+        val payload = ByteArray(payloadLen)
+        off = 0
+        while (off < payloadLen) {
+            val n = try {
+                input.read(payload, off, payloadLen - off)
+            } catch (e: SocketTimeoutException) {
+                // 已经读完包头：即使载荷一个字节都没到，位置也不再是包边界
+                throw PacketTimeoutException(HEADER_SIZE + off, "读载荷超时（已收 $off/$payloadLen 字节）", e)
+            }
+            if (n < 0) throw IOException("socket EOF")
+            off += n
+        }
         return PtpPacket(type, payload)
     }
 

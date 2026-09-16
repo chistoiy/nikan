@@ -1,0 +1,1167 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NikonSync · UI 设计稿</title>
+<style>
+/* ============================================================
+   设计令牌（Design Tokens）
+   两套主题共用同一组语义令牌，只改值不改名——
+   这是"白天/深色一键切换"能成立的前提，也是落地到 Flutter
+   ThemeData / ThemeExtension 的映射表。
+   ============================================================ */
+:root{
+  /* 背景层次：底 → 卡片 → 卡片内嵌 */
+  --bg:#F4F5F7;
+  --surface:#FFFFFF;
+  --surface-2:#EFF1F5;
+  --border:#E2E5EB;
+  /* 文字三级 */
+  --text:#15171C;
+  --text-2:#5B6273;
+  --text-3:#8C93A3;
+  /* 品牌强调色：尼康黄。浅色下作为填充色（配深字），
+     accent-text 是"当文字/图标用"的对比安全版本 */
+  --accent:#FFD100;
+  --accent-ink:#3A2F00;
+  --accent-text:#8A6B00;
+  --accent-soft:rgba(255,209,0,.16);
+  /* 语义色 */
+  --blue:#2C6BE0;
+  --danger:#D92D36;
+  --warn:#B9612C;
+  --ok:#158F58;
+  --screen:#FFFFFF;         /* 取景/大图容器底 */
+  --bezel:#D6D9E0;
+  --shadow:0 12px 32px rgba(16,20,30,.10), 0 2px 6px rgba(16,20,30,.06);
+}
+[data-theme="dark"]{
+  --bg:#0B0C0F;
+  --surface:#16181D;
+  --surface-2:#1F2229;
+  --border:#2B2F38;
+  --text:#F2F3F5;
+  --text-2:#A9AFBC;
+  --text-3:#767D8C;
+  --accent:#FFE100;
+  --accent-ink:#1A1500;
+  --accent-text:#FFE100;
+  --accent-soft:rgba(255,225,0,.14);
+  --blue:#7BA5FF;
+  --danger:#FF6B6B;
+  --warn:#E5A08A;
+  --ok:#4ADE80;
+  --screen:#000000;
+  --bezel:#2B2F38;
+  --shadow:0 16px 44px rgba(0,0,0,.55);
+}
+*{box-sizing:border-box}
+html,body{margin:0;padding:0}
+body{
+  background:var(--bg);color:var(--text);
+  font:15px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;
+  -webkit-font-smoothing:antialiased;
+  transition:background .25s ease,color .25s ease;
+}
+/* ---------- 顶栏 ---------- */
+.topbar{
+  position:sticky;top:0;z-index:50;
+  display:flex;align-items:center;gap:16px;
+  padding:14px 24px;background:color-mix(in srgb,var(--bg) 88%,transparent);
+  backdrop-filter:blur(14px);border-bottom:1px solid var(--border);
+}
+.brand{display:flex;align-items:baseline;gap:10px;font-weight:700;font-size:16px;letter-spacing:.2px}
+.brand .sub{font-weight:400;font-size:12px;color:var(--text-3)}
+.navlinks{display:flex;gap:6px;margin-left:8px;flex-wrap:wrap}
+.navlinks a{
+  color:var(--text-2);text-decoration:none;font-size:13px;
+  padding:5px 10px;border-radius:999px;border:1px solid transparent;
+}
+.navlinks a:hover{color:var(--text);background:var(--surface);border-color:var(--border)}
+.spacer{flex:1}
+.theme-btn{
+  display:inline-flex;align-items:center;gap:8px;cursor:pointer;
+  background:var(--surface);color:var(--text);border:1px solid var(--border);
+  padding:8px 14px;border-radius:999px;font-size:13px;font-weight:600;
+  box-shadow:var(--shadow);
+}
+.theme-btn .dot{width:14px;height:14px;border-radius:50%;background:var(--accent);border:1px solid var(--border)}
+/* ---------- 版式 ---------- */
+main{max-width:1500px;margin:0 auto;padding:32px 24px 90px}
+section{margin-bottom:52px}
+h1{font-size:28px;margin:0 0 6px;letter-spacing:.2px}
+h2{font-size:19px;margin:0 0 4px;display:flex;align-items:center;gap:10px}
+h2::before{content:"";width:4px;height:18px;border-radius:2px;background:var(--accent)}
+h3{font-size:15px;margin:0 0 8px}
+.lead{color:var(--text-2);max-width:900px;margin:0 0 20px}
+.muted{color:var(--text-3);font-size:13px}
+.card{
+  background:var(--surface);border:1px solid var(--border);border-radius:16px;
+  padding:20px;box-shadow:var(--shadow);
+}
+.grid{display:grid;gap:20px}
+.grid.tokens{grid-template-columns:repeat(auto-fit,minmax(280px,1fr))}
+/* ---------- 颜色样本 ---------- */
+.swatches{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:10px}
+.sw{border:1px solid var(--border);border-radius:12px;overflow:hidden;background:var(--surface)}
+.sw .chip{height:52px}
+.sw .meta{padding:8px 10px;font-size:11.5px;line-height:1.45;color:var(--text-2)}
+.sw .meta b{display:block;color:var(--text);font-size:12.5px;font-weight:600}
+code,kbd{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px}
+code{background:var(--surface-2);padding:2px 6px;border-radius:6px;color:var(--text)}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th,td{text-align:left;padding:9px 10px;border-bottom:1px solid var(--border);vertical-align:top}
+th{color:var(--text-3);font-weight:600;font-size:12px;text-transform:uppercase;letter-spacing:.4px}
+tbody tr:last-child td{border-bottom:none}
+/* ---------- 手机画框 ---------- */
+.screens{display:grid;gap:34px;grid-template-columns:repeat(auto-fit,minmax(360px,1fr))}
+.screen{display:flex;flex-direction:column;gap:14px;align-items:center}
+.phone{
+  width:352px;height:724px;border-radius:40px;position:relative;overflow:hidden;
+  background:var(--screen);border:9px solid var(--bezel);box-shadow:var(--shadow);
+  display:flex;flex-direction:column;flex:none;
+}
+.phone.small{width:340px;height:700px}
+.notch{
+  position:absolute;top:8px;left:50%;transform:translateX(-50%);
+  width:96px;height:22px;border-radius:12px;background:var(--bezel);z-index:20;opacity:.85;
+}
+.statusbar{
+  height:30px;flex:none;display:flex;align-items:center;justify-content:space-between;
+  padding:0 18px;font-size:11px;color:var(--text-2);
+}
+.appbar{
+  height:50px;flex:none;display:flex;align-items:center;gap:6px;padding:0 8px 0 14px;
+  border-bottom:1px solid var(--border);
+}
+.appbar .title{font-size:17px;font-weight:600;flex:1;display:flex;align-items:baseline;gap:6px}
+.appbar .title small{font-size:11.5px;color:var(--text-3);font-weight:400}
+.icon-btn{
+  width:40px;height:40px;border-radius:12px;display:flex;align-items:center;justify-content:center;
+  color:var(--text-2);font-size:17px;flex:none;
+}
+.pill{
+  display:inline-flex;align-items:center;gap:6px;font-size:11.5px;color:var(--text-2);
+  padding:4px 10px;border-radius:999px;background:var(--surface-2);
+}
+.body{flex:1;overflow:hidden;display:flex;flex-direction:column;position:relative}
+.pad{padding:16px}
+/* 信号格 */
+.bars{display:inline-flex;align-items:flex-end;gap:2px;height:14px}
+.bars i{width:3px;border-radius:1px;display:block;background:var(--text-3)}
+.bars i:nth-child(1){height:5px}.bars i:nth-child(2){height:8px}
+.bars i:nth-child(3){height:11px}.bars i:nth-child(4){height:14px}
+.bars.on i{background:var(--accent)}
+.bars.warn i{background:var(--warn)}
+.bars i.off{background:var(--text-3);opacity:.35}
+/* 按钮 */
+.btn{
+  display:flex;align-items:center;justify-content:center;gap:8px;
+  height:46px;border-radius:14px;font-size:14.5px;font-weight:600;
+  background:var(--accent);color:var(--accent-ink);
+}
+.btn.ghost{background:transparent;color:var(--text);border:1px solid var(--border)}
+.btn.blue{background:var(--blue);color:#fff}
+.btn.danger{background:var(--danger);color:#fff}
+.btn.sm{height:38px;font-size:13px;border-radius:12px}
+/* 卡片 */
+.scard{
+  background:var(--surface);border:1px solid var(--border);border-radius:14px;padding:13px;
+}
+.kv{display:flex;align-items:center;gap:10px;font-size:13.5px}
+.kv .k{color:var(--text-2)}
+.kv .v{margin-left:auto;font-weight:600}
+.sect-title{font-size:12px;color:var(--text-3);margin:2px 0 10px;letter-spacing:.3px}
+/* 相册网格 */
+.cells{display:grid;grid-template-columns:repeat(3,1fr);gap:3px;flex:1;overflow:hidden}
+.cell{background:var(--surface-2);position:relative;aspect-ratio:1;border-radius:2px;overflow:hidden}
+.cell.done::after{
+  content:"✓";position:absolute;right:4px;bottom:4px;width:16px;height:16px;border-radius:50%;
+  background:var(--ok);color:#fff;font-size:10px;display:flex;align-items:center;justify-content:center;
+}
+.cell.sel{outline:3px solid var(--blue);outline-offset:-3px}
+.cell .tick{
+  position:absolute;left:4px;top:4px;width:17px;height:17px;border-radius:50%;
+  border:2px solid #fff;background:rgba(0,0,0,.35);
+}
+.cell.sel .tick{background:var(--blue);border-color:#fff}
+/* 底部操作条 */
+.bottombar{
+  flex:none;border-top:1px solid var(--border);padding:10px 12px;
+  display:flex;gap:10px;align-items:center;background:var(--surface);
+}
+/* 大图查看器 */
+.viewer{flex:1;background:var(--screen);position:relative;display:flex;align-items:center;justify-content:center}
+.badge{
+  position:absolute;right:10px;top:10px;font-size:10.5px;color:#fff;
+  background:rgba(0,0,0,.62);padding:4px 9px;border-radius:8px;letter-spacing:.2px;
+}
+.badge.light{background:rgba(255,255,255,.82);color:#111}
+/* 进度卡片 */
+.progress-card{
+  position:absolute;left:14px;right:14px;bottom:16px;
+  background:rgba(8,9,11,.9);border:1px solid rgba(255,255,255,.16);
+  border-radius:14px;padding:12px 14px;color:#fff;backdrop-filter:blur(6px);
+}
+.progress-card.warn{border-color:var(--warn)}
+.pc-head{display:flex;align-items:center;gap:8px;font-size:12.5px;font-weight:600}
+.pc-head .pct{margin-left:auto;color:var(--accent);font-weight:700}
+.progress-card.warn .pc-head .pct{color:var(--warn)}
+.track{height:5px;border-radius:3px;background:rgba(255,255,255,.22);margin:9px 0 7px;overflow:hidden}
+.track i{display:block;height:100%;background:var(--accent);border-radius:3px}
+.progress-card.warn .track i{background:var(--warn)}
+.pc-meta{font-size:11.5px;color:rgba(255,255,255,.78)}
+.pc-warn{margin-top:7px;font-size:11.5px;line-height:1.5;color:var(--warn)}
+/* 取景 */
+.finder{flex:1;background:#000;position:relative;display:flex;align-items:center;justify-content:center}
+.finder .frame{
+  width:100%;aspect-ratio:3/2;background:
+    radial-gradient(120% 90% at 30% 20%,#2b3a4a 0%,#131a22 55%,#07090c 100%);
+}
+.chip{
+  position:absolute;font-size:10.5px;color:rgba(255,255,255,.8);
+  background:rgba(0,0,0,.55);padding:4px 8px;border-radius:7px;
+}
+.af-box{
+  position:absolute;width:52px;height:52px;border:2px solid var(--accent);border-radius:5px;
+  left:62%;top:38%;transform:translate(-50%,-50%);
+}
+.af-box.stale{border-color:var(--warn)}
+.af-box small{
+  position:absolute;left:0;right:0;top:54px;text-align:center;font-size:9.5px;color:var(--warn);
+  text-shadow:0 1px 3px #000;
+}
+/* 参数条 */
+.parambar{
+  flex:none;display:flex;align-items:center;gap:8px;padding:8px 10px;
+  border-top:1px solid var(--border);background:var(--surface);overflow:hidden;
+}
+.pcell{
+  font-size:12px;font-weight:600;padding:5px 9px;border-radius:9px;background:var(--surface-2);
+  display:flex;flex-direction:column;align-items:center;line-height:1.25;white-space:nowrap;
+}
+.pcell em{font-size:9.5px;font-weight:400;color:var(--text-3);font-style:normal}
+.pcell.editable{outline:1px solid var(--blue)}
+.shutter{
+  flex:none;display:flex;align-items:center;justify-content:center;padding:12px;
+}
+.shutter .ring{
+  width:64px;height:64px;border-radius:50%;border:3px solid var(--border);
+  display:flex;align-items:center;justify-content:center;
+}
+.shutter .inner{width:50px;height:50px;border-radius:50%;background:var(--accent)}
+/* 弹窗 */
+.sheet{
+  position:absolute;left:0;right:0;bottom:0;background:var(--surface);
+  border-radius:20px 20px 0 0;border-top:1px solid var(--border);
+  padding:16px 16px 20px;box-shadow:0 -18px 40px rgba(0,0,0,.35);
+}
+.sheet .handle{width:38px;height:4px;border-radius:2px;background:var(--border);margin:0 auto 12px}
+.row{display:flex;align-items:center;gap:10px;padding:9px 0;font-size:13.5px}
+.row .lbl{color:var(--text-2)}
+.row .val{margin-left:auto;font-weight:600}
+.divider{height:1px;background:var(--border);margin:8px 0}
+/* 标注 */
+.notes{width:100%;max-width:352px}
+.notes ol{margin:0;padding-left:20px}
+.notes li{font-size:12.5px;color:var(--text-2);margin-bottom:6px;line-height:1.55}
+.notes li b{color:var(--text)}
+.caption{font-size:13.5px;font-weight:700;margin:0;text-align:center}
+.caption small{display:block;font-weight:400;color:var(--text-3);font-size:11.5px;margin-top:2px}
+.marker{
+  position:absolute;width:20px;height:20px;border-radius:50%;
+  background:var(--blue);color:#fff;font-size:11px;font-weight:700;
+  display:flex;align-items:center;justify-content:center;z-index:15;
+  box-shadow:0 2px 8px rgba(0,0,0,.35);
+}
+.legend{display:flex;gap:16px;flex-wrap:wrap;margin:14px 0 0}
+.legend span{font-size:12px;color:var(--text-2);display:inline-flex;align-items:center;gap:6px}
+.legend i{width:12px;height:12px;border-radius:3px;display:inline-block}
+.tag{font-size:11px;padding:2px 8px;border-radius:999px;background:var(--surface-2);color:var(--text-2)}
+.tag.new{background:var(--accent-soft);color:var(--accent-text);font-weight:600}
+.footer{color:var(--text-3);font-size:12px;text-align:center;padding:30px 0 10px}
+@media (max-width:420px){
+  .phone,.phone.small{width:100%;height:640px}
+  main{padding:20px 14px 60px}
+}
+</style>
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">NikonSync <span class="sub">UI 设计稿 · 2026-09-15 · 对应 APK 2034</span></div>
+  <nav class="navlinks">
+    <a href="#tokens">设计令牌</a>
+    <a href="#connect">连接</a>
+    <a href="#gallery">相册</a>
+    <a href="#viewer">大图</a>
+    <a href="#remote">遥控</a>
+    <a href="#settings">设置</a>
+    <a href="#states">状态与流程</a>
+  </nav>
+  <div class="spacer"></div>
+  <button class="theme-btn" id="themeToggle" aria-label="切换主题">
+    <span class="dot"></span><span id="themeLabel">深色</span>
+  </button>
+</header>
+
+<main>
+
+  <!-- ============================================================ 概述 -->
+  <section>
+    <h1>尼康速传 · 界面设计稿</h1>
+    <p class="lead">
+      按现有页面与操作逻辑重画一遍，并补齐白天/深色两套主题。设计目标只有三句话：
+      <b>任何耗时操作都要能看见进度</b>、<b>任何失败都要给出下一步</b>、<b>单手可达的主操作放在下方</b>。
+      本稿所有状态都对应真机实测过的行为（Z50 II · 固件 1.02 · Wi-Fi 智能设备模式）。
+    </p>
+    <div class="grid tokens">
+      <div class="card">
+        <h3>① 进度可见性</h3>
+        <p class="muted">
+          传输超过一秒就必须有真实百分比 + 已接收量 + 速率 + 已用时；
+          连续 8 秒没有新数据就转"可能卡住"的警示态。
+          只有转圈指示时，"正在传 20MB"和"已经卡死"在屏幕上长得一模一样。
+        </p>
+      </div>
+      <div class="card">
+        <h3>② 失败可行动</h3>
+        <p class="muted">
+          报错必须包含原因与下一步：取景没画面要指出"相机是否在回放/菜单/休眠"；
+          对焦被拒要说明档位与 AF 模式的影响；参数不可写要说清是哪一档限制。
+        </p>
+      </div>
+      <div class="card">
+        <h3>③ 单手可达</h3>
+        <p class="muted">
+          主操作（下载、快门、浏览照片）固定在下缘 1/3 区域；顶部只放状态与低频入口。
+          所有可点元素 ≥ 40×40，间距 ≥ 8。
+        </p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ 令牌 -->
+  <section id="tokens">
+    <h2>设计令牌</h2>
+    <p class="lead">两套主题共用同一组令牌名，只换值。右侧色块会随顶栏的主题按钮实时切换。</p>
+    <div class="grid tokens">
+      <div class="card">
+        <h3>颜色</h3>
+        <div class="swatches">
+          <div class="sw"><div class="chip" style="background:var(--bg)"></div><div class="meta"><b>bg</b>页面底色</div></div>
+          <div class="sw"><div class="chip" style="background:var(--surface)"></div><div class="meta"><b>surface</b>卡片/栏</div></div>
+          <div class="sw"><div class="chip" style="background:var(--surface-2)"></div><div class="meta"><b>surface-2</b>内嵌块</div></div>
+          <div class="sw"><div class="chip" style="background:var(--border)"></div><div class="meta"><b>border</b>描边/分隔</div></div>
+          <div class="sw"><div class="chip" style="background:var(--text)"></div><div class="meta"><b>text</b>主文字</div></div>
+          <div class="sw"><div class="chip" style="background:var(--text-2)"></div><div class="meta"><b>text-2</b>次要文字</div></div>
+          <div class="sw"><div class="chip" style="background:var(--text-3)"></div><div class="meta"><b>text-3</b>辅助/占位</div></div>
+          <div class="sw"><div class="chip" style="background:var(--accent)"></div><div class="meta"><b>accent</b>品牌黄（填充）</div></div>
+          <div class="sw"><div class="chip" style="background:var(--accent-text)"></div><div class="meta"><b>accent-text</b>强调文字</div></div>
+          <div class="sw"><div class="chip" style="background:var(--blue)"></div><div class="meta"><b>blue</b>选中/链接</div></div>
+          <div class="sw"><div class="chip" style="background:var(--warn)"></div><div class="meta"><b>warn</b>降级/需注意</div></div>
+          <div class="sw"><div class="chip" style="background:var(--danger)"></div><div class="meta"><b>danger</b>不可逆操作</div></div>
+          <div class="sw"><div class="chip" style="background:var(--ok)"></div><div class="meta"><b>ok</b>已下载/成功</div></div>
+        </div>
+        <p class="muted" style="margin:14px 0 0">
+          ⚠️ 品牌黄在白底上不可当文字用（对比度不足），浅色主题下文字类强调改用 <code>accent-text</code>（深琥珀），
+          黄只用于填充块 + 深色字 <code>accent-ink</code>。这是本稿与现状最大的差异点：
+          现版本所有颜色写死在 Dart 里且只有深色一套。
+        </p>
+      </div>
+      <div class="card">
+        <h3>字阶 / 间距 / 圆角</h3>
+        <table>
+          <tbody>
+            <tr><td><code>28 / w700</code></td><td>页面大标题（连接页相机名）</td></tr>
+            <tr><td><code>17 / w600</code></td><td>AppBar 标题</td></tr>
+            <tr><td><code>15 / w600</code></td><td>卡片主文字、按钮</td></tr>
+            <tr><td><code>13.5</code></td><td>正文、列表项</td></tr>
+            <tr><td><code>12</code></td><td>说明、副标题</td></tr>
+            <tr><td><code>10.5</code></td><td>角标、状态 chip</td></tr>
+          </tbody>
+        </table>
+        <div class="divider"></div>
+        <table>
+          <tbody>
+            <tr><td>间距</td><td><code>4 · 8 · 12 · 16 · 20 · 24</code></td></tr>
+            <tr><td>圆角</td><td>卡片 16 · 按钮/输入 14 · chip 8 · 弹窗 20</td></tr>
+            <tr><td>点击区</td><td>图标按钮 40×40，列表项高 ≥ 48</td></tr>
+            <tr><td>层级</td><td>浅色用阴影、深色用描边 + 表面台阶（不用阴影堆叠）</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ 连接页 -->
+  <section id="connect">
+    <h2>连接页</h2>
+    <p class="lead">未连接时是"三步向导 + 一键连接"；连上后同一页变成状态面板。信号格与相机活性是新增的可观测入口。</p>
+    <div class="screens">
+
+      <!-- 未连接 -->
+      <div class="screen">
+        <div class="phone">
+          <div class="notch"></div>
+          <div class="statusbar"><span>9:41</span><span>⌁ 5G ▮▮▮ 82%</span></div>
+          <div class="appbar">
+            <div class="title">尼康速传</div>
+            <div class="icon-btn">⚙</div>
+          </div>
+          <div class="body pad">
+            <div class="scard" style="display:flex;gap:12px;align-items:center">
+              <div style="width:38px;height:38px;border-radius:12px;background:var(--surface-2);display:flex;align-items:center;justify-content:center;font-size:18px">📶</div>
+              <div style="flex:1">
+                <div style="font-size:13.5px;font-weight:600">手机 Wi-Fi</div>
+                <div class="muted">未连接相机热点 · 当前 Xiaomi_0C69</div>
+              </div>
+              <span class="pill">去设置</span>
+            </div>
+
+            <div style="margin-top:20px;text-align:center">
+              <div style="width:118px;height:118px;margin:0 auto;border-radius:34px;background:var(--surface-2);display:flex;align-items:center;justify-content:center;font-size:52px;opacity:.7">📷</div>
+              <div style="font-size:20px;font-weight:700;margin-top:18px">连接尼康相机</div>
+              <div class="muted" style="margin-top:4px">Z50 II · Wi-Fi 智能设备模式</div>
+            </div>
+
+            <ol style="margin:20px 0 0;padding-left:22px;font-size:13px;color:var(--text-2);line-height:1.9">
+              <li>相机：<b style="color:var(--text)">MENU → 网络菜单 → 连接至智能设备 → Wi-Fi 连接（AP 模式）</b></li>
+              <li>依次选 <b style="color:var(--text)">「建立连接」→「开始」</b>，相机屏幕会显示 SSID 与密码</li>
+              <li>手机 Wi-Fi 里连接该 SSID（密码见相机屏幕）</li>
+              <li>回到本页点下面的按钮</li>
+            </ol>
+
+            <div style="flex:1"></div>
+            <div class="btn" style="margin-bottom:10px">连接相机</div>
+            <div class="btn ghost">USB 连接（更快，27MB/s）</div>
+          </div>
+        </div>
+        <p class="caption">连接前 · 三步向导<small>主按钮贴底，单手可达</small></p>
+        <div class="notes">
+          <ol>
+            <li><b>不做自动扫描</b>：直接向网关握手。旧的"扫描 254 个地址"在相机释放会话期间必然得出"未发现相机"，属于误导。</li>
+            <li>连接失败时错误文案要能执行：<code>Connection reset</code> → "相机仍在释放上一个会话，请等 30 秒~3 分钟"。</li>
+          </ol>
+        </div>
+      </div>
+
+      <!-- 已连接 -->
+      <div class="screen">
+        <div class="phone">
+          <div class="notch"></div>
+          <div class="statusbar"><span>9:41</span><span>⌁ 5G ▮▮▮ 82%</span></div>
+          <div class="appbar">
+            <div class="title">尼康速传</div>
+            <span class="pill" style="margin-right:4px"><span class="bars on"><i></i><i></i><i></i><i></i></span></span>
+            <div class="icon-btn">⚙</div>
+          </div>
+          <div class="body pad">
+            <div style="text-align:center;margin-top:4px">
+              <div style="width:96px;height:96px;margin:0 auto;border-radius:28px;background:var(--surface-2);display:flex;align-items:center;justify-content:center;font-size:42px">📷</div>
+              <div style="font-size:22px;font-weight:700;margin-top:14px">Nikon Z50_2</div>
+              <div class="pill" style="margin-top:8px">
+                <span class="bars on"><i></i><i></i><i></i><i></i></span>
+                Wi-Fi 已连接 · 192.168.1.1
+                <span style="color:var(--text-3)">›</span>
+              </div>
+            </div>
+
+            <div class="scard" style="margin-top:18px">
+              <div class="kv"><span class="k">电量</span><span class="v">82%</span></div>
+              <div class="divider"></div>
+              <div class="kv"><span class="k">相机内文件</span><span class="v">1545 张</span></div>
+              <div class="divider"></div>
+              <div class="kv"><span class="k">存储卡</span><span class="v">剩余 105GB · 可拍 7491 张</span></div>
+              <div class="divider"></div>
+              <div class="kv"><span class="k">链路</span><span class="v" style="color:var(--ok)">正常 · 响应 12ms</span></div>
+            </div>
+
+            <div style="flex:1"></div>
+            <div class="btn" style="margin-bottom:10px">浏览照片</div>
+            <div class="btn ghost">遥控拍摄（试验性）</div>
+          </div>
+        </div>
+        <p class="caption">已连接 · 状态面板<small>点"Wi-Fi 已连接"这一行 → 链路诊断</small></p>
+        <div class="notes">
+          <ol>
+            <li><b>信号格</b>取自 Wi-Fi 真实 RSSI（0~4 格）；USB 连接时显示"不适用"，不拿家庭 Wi-Fi 冒充相机链路。</li>
+            <li><b>链路活性</b>来自每 5 秒一次的保活探针回包耗时。只写"已连接"回答不了"是卡住还是断了"。</li>
+            <li>卡片容量来自 <code>GetStorageInfo(0x1005)</code>，数字直接与相机菜单对得上。</li>
+          </ol>
+        </div>
+      </div>
+
+      <!-- USB 连接向导 -->
+      <div class="screen">
+        <div class="phone">
+          <div class="notch"></div>
+          <div class="statusbar"><span>9:41</span><span>⌁ USB ▮▮▮ 82%</span></div>
+          <div class="appbar">
+            <div class="icon-btn">‹</div>
+            <div class="title">USB 连接</div>
+            <span class="pill" style="color:var(--ok)">更快 27MB/s</span>
+          </div>
+          <div class="body pad">
+            <div style="text-align:center;margin-top:6px">
+              <div style="width:112px;height:112px;margin:0 auto;border-radius:32px;background:var(--surface-2);display:flex;align-items:center;justify-content:center;font-size:50px">🔌</div>
+              <div style="font-size:19px;font-weight:700;margin-top:16px">用数据线连接相机</div>
+              <div class="muted" style="margin-top:4px">实测 27MB/s · 是 Wi-Fi 的 11 倍，适合整卡同步</div>
+            </div>
+
+            <ol style="margin:22px 0 0;padding-left:22px;font-size:13px;color:var(--text-2);line-height:1.95">
+              <li>相机：<b style="color:var(--text)">MENU → 网络菜单 → 连接至智能设备 → 选「关闭」</b>
+                <span class="muted">（不关掉的话相机会一直找手机热点，USB 不会进入 PTP 模式）</span></li>
+              <li>相机：<b style="color:var(--text)">MENU → 网络菜单 → USB → 选「MTP/PTP」</b></li>
+              <li>用数据线连接相机与手机（先在相机关机状态下连线，再开机）</li>
+              <li>手机弹出「允许访问设备」时点<b style="color:var(--text)">允许</b>，回到本页点下面的按钮</li>
+            </ol>
+
+            <div class="scard" style="margin-top:16px">
+              <div class="kv"><span class="k">USB 授权</span><span class="v" style="color:var(--ok)">已允许</span></div>
+              <div class="divider"></div>
+              <div class="kv"><span class="k">已发现设备</span><span class="v">Nikon Z50_2</span></div>
+            </div>
+
+            <div class="muted" style="margin-top:12px;line-height:1.7">
+              提示：USB 连接不需要相机热点，手机可保持连着家庭 Wi-Fi；
+              一旦连上，本 App 的相册、下载、遥控全部自动切到 USB 通道。
+            </div>
+
+            <div style="flex:1"></div>
+            <div class="btn" style="margin-bottom:10px">连接 USB 相机</div>
+            <div class="btn ghost" style="margin-bottom:6px">改用 Wi-Fi 连接</div>
+          </div>
+        </div>
+        <p class="caption">USB 连接 · 四步向导<small>与 Wi-Fi 向导对等，且先说明"会弹系统授权"</small></p>
+        <div class="notes">
+          <ol>
+            <li><b>必须提前说清会弹系统授权框</b>：这一步是 USB 路径失败率最高的地方（用户以为卡住就退出了）。</li>
+            <li>连上后 AppBar 的传输方式显示"USB"，信号格改显示"不适用"而不是家庭 Wi-Fi 的格数。</li>
+            <li>USB 下载与 Wi-Fi 共用同一套上层逻辑（枚举/下载/遥控），用户不需要学两套操作。</li>
+          </ol>
+        </div>
+      </div>
+
+    </div>
+  </section>
+
+  <!-- ============================================================ 相册 -->
+  <section id="gallery">
+    <h2>相册页</h2>
+    <p class="lead">默认网格浏览，长按进入选择模式。下载、保护、删除三件事都在选择模式的底栏完成。</p>
+    <div class="screens">
+
+      <div class="screen">
+        <div class="phone">
+          <div class="notch"></div>
+          <div class="statusbar"><span>9:41</span><span>⌁ 5G ▮▮▮ 82%</span></div>
+          <div class="appbar">
+            <div class="title">照片 <small>1545</small></div>
+            <span class="pill"><span class="bars on"><i></i><i></i><i></i><i></i></span></span>
+            <div class="icon-btn">⚙</div>
+            <div class="icon-btn">↻</div>
+          </div>
+          <div class="body">
+            <div style="padding:8px 12px;display:flex;gap:6px;overflow:hidden">
+              <span class="pill">全部 1545</span>
+              <span class="pill">JPEG 1200</span>
+              <span class="pill">RAW 300</span>
+              <span class="pill">视频 45</span>
+            </div>
+            <div style="padding:0 12px 8px;display:flex;gap:10px;align-items:center">
+              <span class="muted">已下载 320 · 卡内 1545</span>
+              <span class="spacer" style="flex:1"></span>
+              <span class="pill" style="color:var(--accent-text)">筛选</span>
+            </div>
+            <div class="cells">
+              <div class="cell done"></div><div class="cell"></div><div class="cell done"></div>
+              <div class="cell"></div><div class="cell done"></div><div class="cell"></div>
+              <div class="cell"></div><div class="cell done"></div><div class="cell"></div>
+              <div class="cell done"></div><div class="cell"></div><div class="cell"></div>
+            </div>
+          </div>
+          <div class="bottombar">
+            <span class="muted" style="flex:1">长按选择</span>
+            <span class="pill">按需加载缩略图</span>
+          </div>
+        </div>
+        <p class="caption">网格浏览<small>状态条按优先级只显示一条</small></p>
+        <div class="notes">
+          <ol>
+            <li>状态条（下载中 &gt; 有新照片 &gt; 索引中）<b>只显示一条</b>：三条同时出现会挤掉一行网格。</li>
+            <li>角标 ✓ 表示已下载；右上角信号格随时可点开诊断。</li>
+          </ol>
+        </div>
+      </div>
+
+      <div class="screen">
+        <div class="phone">
+          <div class="notch"></div>
+          <div class="statusbar"><span>9:41</span><span>⌁ 5G ▮▮▮ 82%</span></div>
+          <div class="appbar">
+            <div class="icon-btn">✕</div>
+            <div class="title">已选 <small>3</small></div>
+            <span class="pill" style="color:var(--accent-text)">全选</span>
+          </div>
+          <div class="body">
+            <div class="cells" style="padding:3px">
+              <div class="cell sel"><span class="tick"></span></div><div class="cell"></div><div class="cell sel"><span class="tick"></span></div>
+              <div class="cell"></div><div class="cell sel"><span class="tick"></span></div><div class="cell"></div>
+              <div class="cell"></div><div class="cell"></div><div class="cell"></div>
+              <div class="cell"></div><div class="cell"></div><div class="cell"></div>
+            </div>
+          </div>
+          <div class="bottombar">
+            <div class="btn sm" style="flex:1">下载 (3)</div>
+            <span class="pill">原图 ▾</span>
+            <div class="icon-btn" style="border:1px solid var(--border)">⋯</div>
+          </div>
+          <div class="sheet" style="bottom:0">
+            <div class="handle"></div>
+            <div class="row"><span>🛡</span><span>保护（相机端）</span></div>
+            <div class="row"><span>○</span><span>取消保护</span></div>
+            <div class="divider"></div>
+            <div class="row" style="color:var(--danger)"><span>🗑</span><span>删除卡上原片…</span></div>
+          </div>
+        </div>
+        <p class="caption">选择模式 + 相机端操作<small>保护/删除在"⋯"里，危险操作二次确认</small></p>
+        <div class="notes">
+          <ol>
+            <li>底栏从左到右：<b>主操作（下载）</b> → 画质切换 → 更多（相机端文件管理）。</li>
+            <li>删除是唯一不可逆操作，走红色 + 二次确认；受保护文件相机端会拒绝删除，提示要说明这一点。</li>
+            <li><b>按住任意格子滑动 = 连续批量勾选</b>（已实现：<code>DragSelection</code> 状态机）。
+              实现上要处理三件事：滑过的格子按矩形命中、反向滑回来要取消勾选、手指移出网格边缘要自动滚动。
+              开启"按日期分组"后行高不再固定，命中逻辑必须切到矩形命中而不是按索引算。</li>
+          </ol>
+        </div>
+      </div>
+
+      <!-- 按日期分组 -->
+      <div class="screen">
+        <div class="phone">
+          <div class="notch"></div>
+          <div class="statusbar"><span>9:41</span><span>⌁ 5G ▮▮▮ 82%</span></div>
+          <div class="appbar">
+            <div class="icon-btn">✕</div>
+            <div class="title">已选 <small>36</small></div>
+            <span class="pill" style="color:var(--accent-text)">全选</span>
+          </div>
+          <div class="body">
+            <div style="padding:8px 12px;display:flex;gap:6px;overflow:hidden">
+              <span class="pill">全部 1545</span>
+              <span class="pill" style="background:var(--accent);color:var(--accent-ink);font-weight:600">按日期</span>
+              <span class="pill">只看未下载</span>
+              <span class="pill">RAW+JPEG</span>
+            </div>
+            <!-- 日期头 -->
+            <div style="display:flex;align-items:center;gap:8px;padding:8px 12px;background:var(--surface-2)">
+              <span style="width:17px;height:17px;border-radius:50%;background:var(--blue);border:2px solid #fff;display:inline-block"></span>
+              <b style="font-size:13px">2026 年 9 月 15 日</b>
+              <span class="muted">36 张 · 已选 36</span>
+              <span class="spacer" style="flex:1"></span>
+              <span class="pill" style="color:var(--accent-text)">整选当天</span>
+            </div>
+            <div class="cells" style="flex:none;padding:3px">
+              <div class="cell sel"><span class="tick"></span></div><div class="cell sel"><span class="tick"></span></div><div class="cell sel"><span class="tick"></span></div>
+              <div class="cell sel"><span class="tick"></span></div><div class="cell sel"><span class="tick"></span></div><div class="cell sel"><span class="tick"></span></div>
+            </div>
+            <div style="display:flex;align-items:center;gap:8px;padding:8px 12px;background:var(--surface-2)">
+              <span style="width:17px;height:17px;border-radius:50%;border:2px solid var(--border);display:inline-block"></span>
+              <b style="font-size:13px">2026 年 9 月 14 日</b>
+              <span class="muted">128 张</span>
+              <span class="spacer" style="flex:1"></span>
+              <span class="pill" style="color:var(--accent-text)">整选当天</span>
+            </div>
+            <div class="cells" style="flex:none;padding:3px">
+              <div class="cell"></div><div class="cell"></div><div class="cell"></div>
+              <div class="cell"></div><div class="cell done"></div><div class="cell"></div>
+            </div>
+          </div>
+          <div class="bottombar">
+            <div class="btn sm" style="flex:1">下载 (36)</div>
+            <span class="pill">原图 ▾</span>
+            <div class="icon-btn" style="border:1px solid var(--border)">⋯</div>
+          </div>
+        </div>
+        <p class="caption">按日期分组 · 整选当天<small>点日期头即选中当天全部（已实现，筛选条「按日期」）</small></p>
+        <div class="notes">
+          <ol>
+            <li>日期头本身是可点的复选框：一次勾选/取消当天全部照片，是"整卡很多天"时最省事的入口。</li>
+            <li>分组的日期来自 PTP 原始拍摄时间 <code>YYYYMMDDThhmmss</code>，不依赖文件名猜测。</li>
+            <li>分组后拖动多选仍可用（按矩形命中），两者可以叠加使用。</li>
+            <li>这三个能力（拖动多选 / 按日期分组 / 只看未下载）在现版本里都已实现，
+              问题是入口在筛选条里不够显眼——本稿把它们前置到筛选条第一屏。</li>
+          </ol>
+        </div>
+      </div>
+
+    </div>
+  </section>
+
+  <!-- ============================================================ 大图 -->
+  <section id="viewer">
+    <h2>大图查看器</h2>
+    <p class="lead">
+      默认按设置档位取图（默认"中"= 相机端 1620×1080 / 约 880KB），需要细节时点右上「HD 显示原图」。
+      原图加载有真实进度与停滞提示；是否顺带保存到手机由设置决定（默认不保存）。
+    </p>
+    <div class="screens">
+
+      <div class="screen">
+        <div class="phone">
+          <div class="notch"></div>
+          <div class="statusbar" style="color:#fff"><span>9:41</span><span>⌁ 5G ▮▮▮ 82%</span></div>
+          <div class="appbar" style="border-color:rgba(255,255,255,.12)">
+            <div class="icon-btn" style="color:#fff">‹</div>
+            <div class="title" style="color:#fff">3 / 1545</div>
+            <div class="icon-btn" style="color:#fff">ⓘ</div>
+            <div class="icon-btn" style="color:var(--accent)">HD</div>
+          </div>
+          <div class="viewer" style="background:#0a0d10">
+            <div class="frame" style="position:absolute;inset:0;background:radial-gradient(120% 90% at 35% 25%,#3c4a5a 0%,#18202a 55%,#080a0d 100%)"></div>
+            <span class="badge">中 · 880KB</span>
+          </div>
+          <div style="flex:none;background:var(--surface);border-top:1px solid var(--border);padding:12px 14px">
+            <div style="font-size:13.5px;font-weight:600">DSC_1234.JPG</div>
+            <div class="muted" style="margin-top:3px">2026-09-15 21:44 · 5568×3712 · 24.6MB · JPG</div>
+            <div style="margin-top:5px;font-size:12.5px;color:var(--accent-text)">ISO 2500 · f/7.1 · 1/125s</div>
+          </div>
+        </div>
+        <p class="caption">浏览态（默认"中"画质）<small>角标如实显示当前生效档位与字节数</small></p>
+        <div class="notes">
+          <ol>
+            <li>角标写"中 · 880KB"而不是"高清"：用户要能分辨自己看的是哪一档，避免"以为在看原图"。</li>
+            <li>EXIF 只有拿到原图才有（缩略图里没有），所以浏览态提示"点「显示原图」可看 EXIF"。</li>
+          </ol>
+        </div>
+      </div>
+
+      <div class="screen">
+        <div class="phone">
+          <div class="notch"></div>
+          <div class="statusbar" style="color:#fff"><span>9:41</span><span>⌁ 5G ▮▮▮ 82%</span></div>
+          <div class="appbar" style="border-color:rgba(255,255,255,.12)">
+            <div class="icon-btn" style="color:#fff">‹</div>
+            <div class="title" style="color:#fff">3 / 1545</div>
+            <div class="icon-btn" style="color:var(--accent)">
+              <span style="width:18px;height:18px;border-radius:50%;border:2px solid var(--accent);border-top-color:transparent;display:block"></span>
+            </div>
+          </div>
+          <div class="viewer" style="background:#0a0d10">
+            <div class="frame" style="position:absolute;inset:0;background:radial-gradient(120% 90% at 35% 25%,#3c4a5a 0%,#18202a 55%,#080a0d 100%)"></div>
+            <span class="badge">中 · 880KB</span>
+            <div class="progress-card">
+              <div class="pc-head"><span>⤓</span><span>正在加载原图</span><span class="pct">42%</span></div>
+              <div class="track"><i style="width:42%"></i></div>
+              <div class="pc-meta">10.3 MB / 24.6 MB · 1.4 MB/s · 已用 8s</div>
+            </div>
+          </div>
+        </div>
+        <p class="caption">原图加载中 · 正常<small>百分比 / 已接收 / 速率 / 已用时</small></p>
+        <div class="notes">
+          <ol>
+            <li>进度来自流式读取的每块回调（1MiB 一次）；块内不上报时进度条会长时间不动，看起来就像卡死。</li>
+            <li>右上按钮的圆环也是确定进度，不是无限旋转——一眼能看出"在动"。</li>
+          </ol>
+        </div>
+      </div>
+
+      <div class="screen">
+        <div class="phone">
+          <div class="notch"></div>
+          <div class="statusbar" style="color:#fff"><span>9:41</span><span>⌁ 5G ▮▮▮ 82%</span></div>
+          <div class="appbar" style="border-color:rgba(255,255,255,.12)">
+            <div class="icon-btn" style="color:#fff">‹</div>
+            <div class="title" style="color:#fff">3 / 1545</div>
+          </div>
+          <div class="viewer" style="background:#0a0d10">
+            <div class="frame" style="position:absolute;inset:0;background:radial-gradient(120% 90% at 35% 25%,#3c4a5a 0%,#18202a 55%,#080a0d 100%)"></div>
+            <div class="progress-card warn">
+              <div class="pc-head"><span>⚠</span><span>正在加载原图</span><span class="pct">31%</span></div>
+              <div class="track"><i style="width:31%"></i></div>
+              <div class="pc-meta">7.6 MB / 24.6 MB · 已用 26s</div>
+              <div class="pc-warn">已 15 秒没有收到新数据。相机可能在唤醒/忙，也可能链路已断——可继续等，或返回后重新连接相机。</div>
+            </div>
+          </div>
+        </div>
+        <p class="caption">原图加载中 · 停滞警示<small>8 秒无数据即转警示态并解释原因</small></p>
+        <div class="notes">
+          <ol>
+            <li>速率归零后不再显示，改为"已用 26s"，避免用 0.0 MB/s 这种无信息量的数字。</li>
+            <li>文案给出两条可执行路径（继续等 / 重连），而不是只报"失败"。</li>
+          </ol>
+        </div>
+      </div>
+
+    </div>
+  </section>
+
+  <!-- ============================================================ 遥控 -->
+  <section id="remote">
+    <h2>遥控拍摄</h2>
+    <p class="lead">上方取景、下方参数与快门。点击画面指定对焦点（方框常驻、颜色即状态），参数 chip 在可编辑时描蓝边。取景中断不再只转圈。</p>
+    <div class="screens">
+
+      <div class="screen">
+        <div class="phone">
+          <div class="notch"></div>
+          <div class="statusbar"><span>9:41</span><span>⌁ 5G ▮▮▮ 82%</span></div>
+          <div class="appbar">
+            <div class="title">遥控拍摄</div>
+            <span class="pill"><span class="bars on"><i></i><i></i><i></i><i></i></span></span>
+            <div class="icon-btn">⛶</div>
+          </div>
+          <div class="body">
+            <div class="finder">
+              <div class="frame"></div>
+              <span class="chip" style="left:10px;top:10px">● LIVE 8fps</span>
+              <span class="chip" style="left:10px;top:38px">已对焦该点 (492,302)</span>
+              <span class="chip" style="right:10px;top:10px">82%</span>
+              <div class="af-box"></div>
+              <span class="chip" style="left:10px;bottom:40px">🎯 标定对焦</span>
+              <span class="chip" style="left:10px;bottom:10px">⟳ 旋转 0°</span>
+            </div>
+            <div class="parambar">
+              <div class="pcell"><em>档位</em>S</div>
+              <div class="pcell editable"><em>光圈</em>f/7.1</div>
+              <div class="pcell editable"><em>快门</em>1/125</div>
+              <div class="pcell editable"><em>ISO</em>2500</div>
+              <div class="pcell editable"><em>补偿</em>±0</div>
+              <div class="pcell"><em>电量</em>82%</div>
+            </div>
+            <div class="shutter">
+              <div class="ring"><div class="inner"></div></div>
+            </div>
+            <div class="bottombar">
+              <div class="btn ghost sm" style="flex:1">对焦</div>
+              <div class="btn ghost sm" style="flex:1">取景 / 盲拍</div>
+            </div>
+          </div>
+        </div>
+        <p class="caption">取景中 · 点击指定对焦点<small>方框常驻；黄=已指定，橙=相机未接受该点</small></p>
+        <div class="notes">
+          <ol>
+            <li><b>对焦框常驻</b>：相机上的对焦框一直亮着，手机端只闪 1.4 秒会让用户觉得"点了没反应"。</li>
+            <li>颜色语义：白=指令在途 / <b style="color:var(--accent-text)">黄=已指定该点</b> / <b style="color:var(--warn)">橙=相机接受了指令但拒绝坐标</b> / <b style="color:var(--danger)">红=对焦失败</b>。</li>
+            <li>参数 chip 描蓝边表示"当前档位下可改"；S 档只有快门可改，P/AUTO 下全部只读——不可编辑时不要给可点的样子。</li>
+            <li>"🎯 标定对焦"用于相机坐标空间与点击位置不一致时校准缩放（长按画面同样进入）。</li>
+          </ol>
+        </div>
+      </div>
+
+      <div class="screen">
+        <div class="phone">
+          <div class="notch"></div>
+          <div class="statusbar"><span>9:41</span><span>⌁ 5G ▮▮▮ 82%</span></div>
+          <div class="appbar">
+            <div class="title">遥控拍摄</div>
+            <span class="pill" style="color:var(--warn)"><span class="bars warn"><i></i><i></i><i></i><i class="off"></i></span></span>
+            <div class="icon-btn">⛶</div>
+          </div>
+          <div class="body">
+            <div class="finder" style="align-items:center">
+              <div class="frame" style="opacity:.25"></div>
+              <div style="position:absolute;left:16px;right:16px;background:rgba(8,9,11,.9);border:1px solid var(--warn);border-radius:14px;padding:16px;color:#fff;text-align:center">
+                <div style="font-size:22px">📵</div>
+                <div style="font-size:12.5px;line-height:1.55;margin-top:8px">
+                  相机没有提供取景画面。请确认：相机不在回放/菜单界面、屏幕亮着未休眠、且相机上显示的是拍摄画面。然后点下面的按钮。
+                </div>
+                <div class="btn sm" style="margin-top:12px">重新进入取景</div>
+              </div>
+            </div>
+            <div class="parambar" style="opacity:.5">
+              <div class="pcell"><em>档位</em>—</div>
+              <div class="pcell"><em>光圈</em>—</div>
+              <div class="pcell"><em>快门</em>—</div>
+              <div class="pcell"><em>ISO</em>—</div>
+            </div>
+            <div class="shutter" style="opacity:.4"><div class="ring"><div class="inner"></div></div></div>
+          </div>
+        </div>
+        <p class="caption">取景中断 · 自动重试已放弃<small>原因 + 恢复入口，不再无限转圈</small></p>
+        <div class="notes">
+          <ol>
+            <li>真机踩过：相机离开取景态后 <code>0x9203</code> 持续回 <code>NotLiveView</code>，而单独重发 <code>0x9201</code> 会"成功"却不出帧——必须<b>先 0x9202 结束再启动</b>才能真正重进。</li>
+            <li>自动重试有上限：连打 3 轮仍失败就停下并说明可能原因，把决定权交回用户。</li>
+            <li>同时限流高频失败日志：每帧一条会把 logcat 缓冲冲掉，反而丢失证据。</li>
+          </ol>
+        </div>
+      </div>
+
+      <div class="screen">
+        <div class="phone small">
+          <div class="notch"></div>
+          <div class="statusbar"><span>9:41</span><span>⌁ 5G ▮▮▮ 82%</span></div>
+          <div class="appbar"><div class="title">连接状态</div></div>
+          <div class="body pad">
+            <div class="scard">
+              <div class="kv">
+                <span class="bars on"><i></i><i></i><i></i><i></i></span>
+                <span style="font-size:13.5px;font-weight:600;margin-left:2px">已连接 · 响应 12 ms</span>
+              </div>
+              <div class="divider"></div>
+              <div class="row"><span class="lbl">传输方式</span><span class="val">Wi-Fi 直连相机</span></div>
+              <div class="row"><span class="lbl">Wi-Fi 信号</span><span class="val">3/4 格（良好） · -56 dBm</span></div>
+              <div class="row"><span class="lbl">链路速率</span><span class="val">360 Mbps</span></div>
+              <div class="row"><span class="lbl">距上次相机消息</span><span class="val">1.8 秒前</span></div>
+              <div class="row"><span class="lbl">保活探针往返</span><span class="val">12 ms</span></div>
+              <div class="divider"></div>
+              <div class="muted" style="line-height:1.7">
+                怎么读：进度条不动但仍显示"响应 12ms" → 相机在忙；
+                显示"已 30s 未收到相机消息" → 链路可能已断，请重连；
+                只有 1 格且速率很低 → 靠远/干扰，靠近再试。
+              </div>
+            </div>
+          </div>
+          <div class="bottombar">
+            <div class="btn ghost sm" style="flex:1">立即检测</div>
+            <div class="btn sm" style="flex:1">关闭</div>
+          </div>
+        </div>
+        <p class="caption">链路诊断 · 弹窗<small>把"卡住 / 相机忙 / 链路断"三件事分开</small></p>
+        <div class="notes">
+          <ol>
+            <li>弹窗内数据每 5 秒自动刷新，也可以手动"立即检测"。</li>
+            <li>Wi-Fi 层与协议层两组证据放在一起，用户不必自己推因果。</li>
+          </ol>
+        </div>
+      </div>
+
+      <!-- 盲拍模式 -->
+      <div class="screen">
+        <div class="phone">
+          <div class="notch"></div>
+          <div class="statusbar"><span>9:41</span><span>⌁ 5G ▮▮▮ 82%</span></div>
+          <div class="appbar">
+            <div class="title">遥控拍摄</div>
+            <span class="pill"><span class="bars on"><i></i><i></i><i></i><i></i></span></span>
+            <div class="icon-btn">⚙</div>
+          </div>
+          <div class="body">
+            <!-- 模式切换 -->
+            <div style="display:flex;gap:8px;padding:8px 12px;border-bottom:1px solid var(--border)">
+              <span class="pill" style="flex:1;justify-content:center">📷 实时取景</span>
+              <span class="pill" style="flex:1;justify-content:center;background:var(--accent);color:var(--accent-ink);font-weight:600">⚡ 盲拍</span>
+            </div>
+            <!-- 回看区 -->
+            <div style="flex:1;background:#0a0d10;position:relative;display:flex;align-items:center;justify-content:center">
+              <div style="position:absolute;inset:0;background:radial-gradient(120% 90% at 35% 25%,#3c4a5a 0%,#18202a 55%,#080a0d 100%)"></div>
+              <span class="chip" style="left:10px;top:10px">最近一张 · DSC_1234.JPG</span>
+              <span class="chip" style="right:10px;top:10px">第 12 张</span>
+              <span class="chip" style="left:10px;bottom:10px">长按可放大 · 双指缩放</span>
+            </div>
+            <!-- 参数条 -->
+            <div class="parambar">
+              <div class="pcell"><em>档位</em>M</div>
+              <div class="pcell editable"><em>光圈</em>f/2.8</div>
+              <div class="pcell editable"><em>快门</em>4″</div>
+              <div class="pcell editable"><em>ISO</em>400</div>
+            </div>
+            <!-- 快门 -->
+            <div class="shutter" style="flex-direction:column;gap:10px">
+              <div class="ring" style="width:72px;height:72px"><div class="inner" style="width:56px;height:56px"></div></div>
+              <div class="muted">不进入取景通道，直接触发快门（0x100E）</div>
+            </div>
+            <div class="bottombar">
+              <div class="btn ghost sm" style="flex:1">对焦</div>
+              <div class="btn ghost sm" style="flex:1">下载这张</div>
+            </div>
+          </div>
+        </div>
+        <p class="caption">遥控 · 盲拍模式<small>不进取景也能拍：省电、长曝光、相机息屏时的兜底</small></p>
+        <div class="notes">
+          <ol>
+            <li><b>为什么不进实时取景也能用</b>：盲拍走标准快门 <code>0x100E</code>，不依赖取景通道。真机上相机屏幕息屏后取景会失效，但盲拍仍可用——这是"相机息屏导致遥控完全没法用"的兜底路径。</li>
+            <li>拍完自动取回缩略图回看（同时"读走新照片"也是解锁下一次快门的前提，不能省）。</li>
+            <li>模式切换放在取景区上方而不是藏在菜单里：用户需要能一眼看出"现在到底是哪种模式"。</li>
+            <li>盲拍没有实时画面，所以必须给足替代反馈：最近一张回看 + 已拍张数 + 快门音/闪光提示。</li>
+          </ol>
+        </div>
+      </div>
+
+    </div>
+  </section>
+
+  <!-- ============================================================ 设置 -->
+  <section id="settings">
+    <h2>设置页</h2>
+    <p class="lead">只放四类：存储与下载、查看行为、关于、高级（开发者选项默认收起）。危险开关常驻风险提示。</p>
+    <div class="screens">
+      <div class="screen">
+        <div class="phone">
+          <div class="notch"></div>
+          <div class="statusbar"><span>9:41</span><span>⌁ 5G ▮▮▮ 82%</span></div>
+          <div class="appbar"><div class="icon-btn">‹</div><div class="title">设置</div></div>
+          <div class="body pad" style="overflow:hidden">
+            <div class="sect-title" style="margin-top:0">存储与下载</div>
+            <div class="scard">
+              <div class="kv"><span>📁</span><span>保存位置</span><span class="v" style="font-weight:400;color:var(--text-2)">系统相册 · Pictures/NikonSync</span></div>
+              <div class="divider"></div>
+              <div class="muted" style="margin-bottom:6px">下载画质（仅 JPEG 生效，RAW/视频始终原图）</div>
+              <div style="display:flex;gap:6px">
+                <span class="pill" style="flex:1;justify-content:center;background:var(--accent);color:var(--accent-ink);font-weight:600">原图</span>
+                <span class="pill" style="flex:1;justify-content:center">8M</span>
+                <span class="pill" style="flex:1;justify-content:center">2M</span>
+              </div>
+              <div class="divider"></div>
+              <div class="muted" style="margin-bottom:6px">大图查看画质（相册里点开照片时默认加载的规格）</div>
+              <div style="display:flex;gap:6px">
+                <span class="pill" style="flex:1;justify-content:center">低</span>
+                <span class="pill" style="flex:1;justify-content:center;background:var(--accent);color:var(--accent-ink);font-weight:600">中</span>
+                <span class="pill" style="flex:1;justify-content:center">原图</span>
+              </div>
+              <div class="muted" style="margin-top:6px;line-height:1.6">中 = 相机端高清图（1620×1080，约 880KB），清晰度与速度兼顾</div>
+              <div class="divider"></div>
+              <div class="kv"><span>⤓</span><span>查看原图时保存到手机</span>
+                <span class="v"><span style="display:inline-block;width:42px;height:24px;border-radius:999px;background:var(--border);position:relative">
+                  <i style="position:absolute;top:3px;left:3px;width:18px;height:18px;border-radius:50%;background:var(--surface);display:block;box-shadow:0 1px 3px rgba(0,0,0,.3)"></i></span></span>
+              </div>
+              <div class="muted" style="margin-top:4px">已关闭：点「显示原图」只加载用于查看，不写入相册、不计入下载记录</div>
+              <div class="divider"></div>
+              <div class="kv"><span style="color:var(--warn)">🗑</span><span>下载后删除相机原片</span>
+                <span class="v"><span style="display:inline-block;width:42px;height:24px;border-radius:999px;background:var(--border);position:relative">
+                  <i style="position:absolute;top:3px;left:3px;width:18px;height:18px;border-radius:50%;background:var(--surface);display:block;box-shadow:0 1px 3px rgba(0,0,0,.3)"></i></span></span>
+              </div>
+              <div class="muted" style="margin-top:4px;color:var(--warn)">下载成功后删除相机内原文件，谨慎开启</div>
+            </div>
+
+            <div class="sect-title" style="margin-top:14px">关于</div>
+            <div class="scard">
+              <div class="kv"><span class="k">版本</span><span class="v">1.0.0 (2034)</span></div>
+              <div class="kv" style="margin-top:6px"><span class="k">已验证机型</span><span class="v">Nikon Z50 II · 固件 1.02</span></div>
+            </div>
+            <div class="sect-title" style="margin-top:14px">高级</div>
+            <div class="scard"><div class="kv"><span>开发者选项</span><span class="v" style="color:var(--text-3);font-weight:400">协议日志 / 探针 ⌄</span></div></div>
+          </div>
+        </div>
+        <p class="caption">设置 · 存储与下载<small>危险开关常驻风险提示，不只在开启时弹一次</small></p>
+        <div class="notes">
+          <ol>
+            <li>「查看原图时保存到手机」默认<b>关</b>：看图和"把这张收进手机"是两件事。</li>
+            <li>画质说明写实测数字（640×424 / 130KB、1620×1080 / 880KB），不写"约 1600 像素"这种想当然的描述。</li>
+            <li>「下载后删除相机原片」的说明文字常驻，且用警示色；开启时必须二次确认。</li>
+          </ol>
+        </div>
+      </div>
+
+      <div class="screen">
+        <div class="phone small">
+          <div class="notch"></div>
+          <div class="statusbar"><span>9:41</span><span>⌁ 5G ▮▮▮ 82%</span></div>
+          <div class="appbar"><div class="title">下载中 <small>12 / 1545</small></div></div>
+          <div class="body pad">
+            <div class="scard">
+              <div class="kv"><span class="k">当前文件</span><span class="v">DSC_1234.JPG</span></div>
+              <div class="track" style="background:var(--surface-2);margin:10px 0 8px"><i style="width:58%;background:var(--accent)"></i></div>
+              <div class="muted">14.3 MB / 24.6 MB · 1.5 MB/s · 剩余约 3 分 20 秒</div>
+              <div class="divider"></div>
+              <div class="kv"><span class="k">已下载</span><span class="v">11 张 · 268 MB</span></div>
+              <div class="kv" style="margin-top:6px"><span class="k">跳过 / 失败</span><span class="v">0 / 0</span></div>
+            </div>
+            <div class="muted" style="margin-top:12px;line-height:1.6">
+              提示：Wi-Fi 智能设备模式实测 1.5~2.4MB/s，接近相机热点上限；
+              大文件批量传输建议用 USB 数据线（实测 27MB/s）。
+            </div>
+            <div style="flex:1"></div>
+            <div class="btn ghost">取消下载</div>
+          </div>
+        </div>
+        <p class="caption">下载进行中<small>文件级 + 单文件级双层进度</small></p>
+        <div class="notes">
+          <ol>
+            <li>双层进度：整体第几张 + 当前文件百分比，避免"到底还剩多少"的焦虑。</li>
+            <li>速度与剩余时间用实测均值计算；速度是相机热点的天花板时，直接给出"换 USB 更快"的建议。</li>
+          </ol>
+        </div>
+      </div>
+
+    </div>
+  </section>
+
+  <!-- ============================================================ 状态与流程 -->
+  <section id="states">
+    <h2>状态一览与关键流程</h2>
+    <p class="lead">每个页面在"加载 / 空 / 失败 / 离线"四种情形下的表现要统一，禁止用无限转圈代替状态。</p>
+    <div class="grid tokens">
+      <div class="card">
+        <h3>四态约定</h3>
+        <table>
+          <thead><tr><th>状态</th><th>表现</th><th>禁止</th></tr></thead>
+          <tbody>
+            <tr><td>加载</td><td>有总量时给确定进度条，无总量时才用不确定动画</td><td>无说明的转圈</td></tr>
+            <tr><td>空</td><td>灰图标 + 一句原因 + 一个动作按钮</td><td>空白页</td></tr>
+            <tr><td>失败</td><td>原因（含相机响应码）+ 下一步建议 + 重试入口</td><td>只写"失败"</td></tr>
+            <tr><td>离线</td><td>占位图 + "返回重连"；自动重连时显示第 N/M 次</td><td>静默变灰</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="card">
+        <h3>连接与取景流程</h3>
+        <table>
+          <tbody>
+            <tr><td>① 连接</td><td>直接对网关握手 → 失败且原因是 RST 时<b>跳过</b>网段扫描，提示"相机在释放上一个会话"</td></tr>
+            <tr><td>② 自动重连</td><td>2/4/8/15/20/30×4 秒（约 2.8 分钟覆盖相机释放窗口），保留相机 IP</td></tr>
+            <tr><td>③ 进取景</td><td><code>0x9201</code> 3s → 8s 两段超时；失败不吞，直接报原因</td></tr>
+            <tr><td>④ 取帧</td><td>自调度循环 + ≥20ms 间隔；失败区分 <code>NotLiveView</code> 与其他</td></tr>
+            <tr><td>⑤ 中断恢复</td><td><code>0x9202</code>→<code>0x9201</code> 强制重进，3 秒节流，3 轮失败转手动</td></tr>
+            <tr><td>⑥ 退出</td><td><code>0x9202</code>；无论是否应答都按已关闭处理，避免标志位卡死</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="card">
+        <h3>链接与协议依据</h3>
+        <table>
+          <tbody>
+            <tr><td>取景帧</td><td><code>0x9203</code>（640×424 JPEG）</td></tr>
+            <tr><td>开始/结束取景</td><td><code>0x9201</code> / <code>0x9202</code></td></tr>
+            <tr><td>指定对焦点</td><td><code>0x9205 ChangeAfArea(x,y)</code>（坐标空间待标定）</td></tr>
+            <tr><td>驱动对焦</td><td><code>0x90C1 AfDrive</code>；取消用 <code>0x9206</code></td></tr>
+            <tr><td>改参数</td><td><code>0x1016 SetDevicePropValue</code>（参数=属性码，数据=仅值）</td></tr>
+            <tr><td>中等画质</td><td><code>0x920F GetFhdPicture</code>（≤1920×1028）</td></tr>
+            <tr><td>卡容量</td><td><code>0x1005 GetStorageInfo</code></td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="card">
+        <h3>落地到 Flutter</h3>
+        <table>
+          <tbody>
+            <tr><td>令牌</td><td>用 <code>ThemeExtension</code>（或 <code>ColorScheme</code> 扩展）承载 13 个语义色；页面里禁止再出现字面色值</td></tr>
+            <tr><td>主题</td><td><code>MaterialApp.theme</code> + <code>darkTheme</code> + <code>themeMode</code>（浅色/深色/跟随系统三态）</td></tr>
+            <tr><td>持久化</td><td>设置页存 <code>themeMode</code>，与现有 settings JSON 同源</td></tr>
+            <tr><td>取景/大图</td><td>这两块容器始终用黑色底（不随主题变），只有窗外的栏与文字跟随主题</td></tr>
+            <tr><td>组件</td><td>抽 <code>ProgressCard</code> / <code>LinkStatusButton</code> / <code>StatusChip</code> / <code>AfTargetBox</code>，避免各页重复实现</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <p class="footer">NikonSync · UI 设计稿 · 与 APK 2034 的实现一致 · 非官方开源作品，与尼康公司无关</p>
+</main>
+
+<script>
+(function(){
+  var root=document.documentElement;
+  var btn=document.getElementById('themeToggle');
+  var label=document.getElementById('themeLabel');
+  var modes=['dark','light'];
+  function apply(m){
+    root.setAttribute('data-theme',m);
+    label.textContent = m==='dark' ? '深色' : '浅色';
+    try{ localStorage.setItem('nikonsync-ui-theme',m); }catch(e){}
+  }
+  var saved=null;
+  try{ saved=localStorage.getItem('nikonsync-ui-theme'); }catch(e){}
+  if(saved){ apply(saved); }
+  else if(window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches){ apply('light'); }
+  btn.addEventListener('click',function(){
+    var cur=root.getAttribute('data-theme')||'dark';
+    apply(cur==='dark'?'light':'dark');
+  });
+})();
+</script>
+</body>
+</html>

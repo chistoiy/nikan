@@ -116,6 +116,70 @@ class _SettingsPageState extends State<SettingsPage> {
                   onSelectionChanged: (s) => model.setDownloadVariant(s.first),
                   showSelectedIcon: false,
                 ),
+                const SizedBox(height: 14),
+                Padding(
+                  padding: const EdgeInsets.only(bottom: 2),
+                  child: Text('大图查看画质（相册里点开照片时默认加载的规格）',
+                      style: TextStyle(fontSize: 11.5, color: Colors.white.withValues(alpha: 0.4))),
+                ),
+                // 默认"中"：原图一张可达 20MB+，Wi-Fi 下要好几秒；需要细节时
+                // 在大图页点「显示原图」即可，不必每次都在等原图。
+                SegmentedButton<String>(
+                  segments: const [
+                    ButtonSegment(value: 'low', label: Text('低')),
+                    ButtonSegment(value: 'medium', label: Text('中')),
+                    ButtonSegment(value: 'original', label: Text('原图')),
+                  ],
+                  selected: {model.viewerQuality},
+                  onSelectionChanged: (s) => model.setViewerQuality(s.first),
+                  showSelectedIcon: false,
+                ),
+                const SizedBox(height: 6),
+                Text(
+                  // 尺寸/体积是真机实测值（2026-09-15 日志）：低=大缩略图 640×424/133KB，
+                  // 中=相机端 FHD 图 1620×1080/881KB。别写"约 1600 像素"那种想当然的数字。
+                  switch (model.viewerQuality) {
+                    'low' => '低 = 相机大缩略图（640×424，约 130KB），秒开，最省流量',
+                    'medium' => '中 = 相机端高清图（1620×1080，约 880KB），清晰度与速度兼顾',
+                    _ => '原图 = 完整尺寸（单张可达 20MB+），点开每张都取原图，Wi-Fi 下较慢'
+                        '${model.viewerSaveOriginal ? '（会保存到手机）' : '（仅查看，不保存）'}',
+                  },
+                  style: TextStyle(
+                      fontSize: 11.5, height: 1.5, color: Colors.white.withValues(alpha: 0.5)),
+                ),
+                // 「显示原图」是否顺带保存：默认关。看一张图和"把这张收进手机"
+                // 是两件事——默认落盘会让相册里悄悄多出用户没打算要的文件。
+                SwitchListTile(
+                  dense: true,
+                  contentPadding: const EdgeInsets.only(top: 6),
+                  secondary: const Icon(Icons.save_alt, size: 22),
+                  title: const Text('查看原图时保存到手机', style: TextStyle(fontSize: 14.5)),
+                  subtitle: Text(
+                    model.viewerSaveOriginal
+                        ? '已开启：点「显示原图」会同时下载到手机（相册页显示"已下载"），同一张图只传一次'
+                        : '已关闭：点「显示原图」只加载用于查看，不写入相册、不计入下载记录',
+                    style: const TextStyle(fontSize: 12),
+                  ),
+                  value: model.viewerSaveOriginal,
+                  activeThumbColor: yellow,
+                  onChanged: (v) => model.setViewerSaveOriginal(v),
+                ),
+                SwitchListTile(
+                  dense: true,
+                  contentPadding: const EdgeInsets.only(top: 8),
+                  secondary: const Icon(Icons.link, size: 22),
+                  title: const Text('RAW+JPEG 成对联动', style: TextStyle(fontSize: 14.5)),
+                  subtitle: Text(
+                    model.linkRawJpegPairs
+                        ? '已开启：勾选一张照片时自动带上它的配对文件（相机上同名的 JPG 与 RAW），'
+                            '相册里带 R+J 角标的即为成对照片'
+                        : '已关闭：JPEG 与 RAW 各自单独勾选',
+                    style: const TextStyle(fontSize: 12),
+                  ),
+                  value: model.linkRawJpegPairs,
+                  activeThumbColor: yellow,
+                  onChanged: (v) => model.setLinkRawJpegPairs(v),
+                ),
                 SwitchListTile(
                   dense: true,
                   contentPadding: const EdgeInsets.only(top: 8),

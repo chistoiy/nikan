@@ -16,6 +16,31 @@ class CameraFile {
   bool? isJpeg;
   bool hasThumb = false;
 
+  /// RAW+JPEG 成对：同一目录、同一基名的另一个文件的句柄（无配对为 null）。
+  ///
+  /// 相机开「RAW + JPEG 同时记录」时，同一张照片是两个独立对象
+  /// （`DSC_1234.JPG` 与 `DSC_1234.NEF`，句柄与大小都不同）。这里只做**标记**，
+  /// 不合并条目——见 `docs/RAW+JPEG成对照片方案.md` 的方案 A。
+  /// 配对由 [AppModel] 在枚举/索引时算好写入。
+  int? pairHandle;
+
+  bool get isPaired => pairHandle != null;
+
+  /// 文件名基名（大写，不含扩展名）。配对键用它 + 目录，避免只看文件名
+  /// 把不同文件夹里的同号文件误配成一对。
+  String? get baseName {
+    final n = name;
+    if (n == null) return null;
+    final i = n.lastIndexOf('.');
+    return (i < 0 ? n : n.substring(0, i)).toUpperCase();
+  }
+
+  /// 配对键：目录 + 基名（未加载详情时为 null）
+  String? get pairKey {
+    final b = baseName;
+    return b == null ? null : '$folder/$b';
+  }
+
   bool get infoLoaded => name != null;
 
   /// JPEG / RAW / 视频 分类（未加载详情时为 null）

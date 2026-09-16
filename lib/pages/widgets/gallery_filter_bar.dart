@@ -15,6 +15,9 @@ class GalleryFilterBar extends StatelessWidget {
     required this.onToggleUndownloaded,
     required this.groupByDay,
     required this.onToggleGroupByDay,
+    required this.pairedOnly,
+    required this.pairedCount,
+    required this.onTogglePaired,
   });
 
   final String kind; // all / jpeg / raw / video
@@ -30,6 +33,11 @@ class GalleryFilterBar extends StatelessWidget {
   /// 按拍摄日期分组显示
   final bool groupByDay;
   final VoidCallback onToggleGroupByDay;
+
+  /// 只看 RAW+JPEG 成对照片
+  final bool pairedOnly;
+  final int pairedCount;
+  final VoidCallback onTogglePaired;
 
   @override
   Widget build(BuildContext context) {
@@ -82,6 +90,23 @@ class GalleryFilterBar extends StatelessWidget {
                   onSelected: (_) => onToggleUndownloaded(),
                 ),
               ),
+            const SizedBox(width: 4),
+            // RAW+JPEG 成对筛：相机开了"同时记录"时，一张照片是两个文件，
+            // 这个筛选让用户能只看这些成对照片（便于成对下载/成对清理）
+            FilterChip(
+              label: Text(
+                '成对 $pairedCount',
+                style: TextStyle(fontSize: 12.5, color: pairedOnly ? Colors.black : Colors.white70),
+              ),
+              selected: pairedOnly,
+              selectedColor: kAccent,
+              checkmarkColor: Colors.black,
+              showCheckmark: false,
+              visualDensity: VisualDensity.compact,
+              side: BorderSide(color: pairedOnly ? kAccent : Colors.white24),
+              backgroundColor: const Color(0xFF161616),
+              onSelected: (_) => onTogglePaired(),
+            ),
             const SizedBox(width: 4),
             FilterChip(
               label: Text(

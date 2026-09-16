@@ -54,3 +54,6 @@ android/app/*.keystore
 
 # 发布产物
 dist/
+
+# 开发辅助工具的本地数据（协议日志与笔记；跨会话知识以 docs/AI交接文档.md 为准）
+.workbuddy/

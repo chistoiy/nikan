@@ -10,6 +10,7 @@ import '../models/camera_file.dart';
 import '../util/format.dart';
 import '../util/jpeg_exif.dart';
 import 'widgets/app_widgets.dart';
+import 'widgets/link_status.dart';
 import 'widgets/zoom_image.dart';
 
 /// 遥控拍摄页：盲拍 / 实时取景 双模式。
@@ -50,6 +51,20 @@ class _RemotePageState extends State<RemotePage> {
   CameraFile? _lastShot;
   int _shotCount = 0;
   bool _shooting = false;
+  bool _focusing = false;
+  String? _afNote;
+  Timer? _afNoteTimer;
+
+  /// 对焦目标框（屏幕坐标）。**常驻**：点哪儿留哪儿，直到下一次点击。
+  /// 此前是 1.4 秒淡出，用户看到的就是"手机端不显示焦点位置"——相机上的
+  /// 对焦框一直亮着，手机上却一闪而过，两边对不上。
+  Offset? _afTarget;
+
+  /// 对焦状态：focusing（指令在途）/ focused（已指定该点）/ fallback（相机未接受，
+  /// 回退到当前 AF 区域）/ failed（相机拒绝且 AF 也没驱动成功）
+  String _afState = 'idle';
+  (int, int)? _afSent; // 实际发给相机的坐标（标定与排错用）
+
   bool _downloadingLast = false;
   bool _autoDownload = false;
   bool _immersive = false;
@@ -74,6 +89,45 @@ class _RemotePageState extends State<RemotePage> {
   bool _loggedFrameDiagnostics = false;
   bool _loggedShotDiagnostics = false;
 
+  // ------------------------------------------------------------ 对焦倍数（自动）
+
+  /// 从取景帧头部解出的自动倍数（相机图像尺寸 ÷ 取景帧尺寸），x/y 各一个。
+  ///
+  /// 头部实测（384B，大端 u16）：
+  /// `off 8/10 = 640×424`（取景帧）、`off 12/14 = 5568×3712`（相机图像）。
+  /// 相机 `0x9205` 的坐标空间就是后者，所以倍数 ≈ ×8.70 / ×8.76——
+  /// 与用户实测"×8 大致一致"吻合。**这是读出来的，不用再靠肉眼估。**
+  (double, double)? _afAuto;
+
+  /// 用户是否手工覆盖了自动值（在标定面板里动过滑杆/点选）
+  bool _afManualOverride = false;
+
+  Future<void> _loadAfAutoScale() async {
+    if (_afAuto != null) return;
+    try {
+      final r = await NikonEngine.afScaleFromHeader();
+      if (r['ok'] != true) return;
+      final sx = (r['scaleX'] as num).toDouble();
+      final sy = (r['scaleY'] as num).toDouble();
+      if (sx <= 0 || sy <= 0) return;
+      _afAuto = (sx, sy);
+      AppLog.addKey('对焦倍数已自动解出：${r['info']} → ×${sx.toStringAsFixed(2)}(x) ×${sy.toStringAsFixed(2)}(y)');
+      if (mounted) setState(() {});
+    } catch (e) {
+      AppLog.addKey('读取自动对焦倍数失败：$e');
+    }
+  }
+
+  /// 当前生效的对焦倍数（自动优先，人工覆盖时用人工值）
+  (double, double) get _afScale {
+    final a = _afAuto;
+    if (a != null && !_afManualOverride) return a;
+    final k = model.afAreaScale;
+    return (k, k);
+  }
+
+  bool get _afScaleIsAuto => _afAuto != null && !_afManualOverride;
+
   Map<String, dynamic>? _params;
 
   _RemoteMode _mode = _RemoteMode.blind;
@@ -85,11 +139,18 @@ class _RemotePageState extends State<RemotePage> {
     super.initState();
     _events = model.events.listen(_onEvent);
     _loadParams();
+    _startParamsWatch();
   }
 
   @override
   void dispose() {
     _stopFrameLoop();
+    _afNoteTimer?.cancel();
+    _paramsTimer?.cancel();
+    // 还原相机自己的息屏设置：我们只是"借用"了它的常亮（本机其实不支持，会如实失败）
+    if (_keepAwakeOn) {
+      NikonEngine.keepAwake(false).catchError((_) => <String, dynamic>{});
+    }
     if (_mode == _RemoteMode.liveView) {
       NikonEngine.liveViewStop().catchError((_) {});
     }
@@ -134,7 +195,11 @@ class _RemotePageState extends State<RemotePage> {
   /// 必须节流：`shotParams()` 一次要 4 个 PTP 事务，而取景帧循环与它共用同一条串行通道，
   /// 高频刷新会直接压低帧率。其余属性码（焦距等）界面不显示，忽略。
   void _onPropChanged(int code) {
-    if (code != 0x500D && code != 0x500E && code != 0x500F) return;
+    // 0x5007 光圈 / 0x500D 快门 / 0x500E 档位 / 0x500F ISO：相机自己改的（例如
+    // S 档的自动光圈、Auto ISO 的自动 ISO）也要反映到手机上，否则用户会以为
+    // 界面坏了。焦距之类界面不显示的码忽略。
+    const watched = {0x5007, 0x500D, 0x500E, 0x500F};
+    if (!watched.contains(code)) return;
     final now = DateTime.now().millisecondsSinceEpoch;
     if (now - _lastParamsAt < _paramsRefreshMs) return;
     _lastParamsAt = now;
@@ -211,23 +276,38 @@ class _RemotePageState extends State<RemotePage> {
         AppLog.add('取景循环停止：连接已断开');
         return;
       }
+      if (_lvPaused) {
+        // 已暂停：不再向相机刷请求（每个请求都会失败并写日志，实测会冲掉 logcat），
+        // 只等用户点「重新进入取景」。
+        await Future<void>.delayed(const Duration(milliseconds: 400));
+        continue;
+      }
       final sw = Stopwatch()..start();
       try {
         final f = await NikonEngine.liveViewFrame();
         if (!_frameLoopOn || !mounted) return;
-        _notLvCount = 0;
+        _onFrameOk();
         if (f.length > 2) {
           if (!_loggedFrameDiagnostics) {
             _loggedFrameDiagnostics = true;
             AppLog.add('取景帧诊断：${describeJpegFrame(f)}');
           }
           _applyAutoRotation(f);
+          // 记一次帧原始尺寸：点击对焦要把屏幕点换算回相机帧坐标（只取一次）
+          if (_frameW == 0) {
+            final d = jpegDimensions(f);
+            if (d != null) {
+              _frameW = d.$1;
+              _frameH = d.$2;
+            }
+          }
           _frame.value = f;
           _recordGap(sw.elapsedMilliseconds);
+          // 头部里有相机图像尺寸 → 自动解出对焦倍数（一次就够）
+          unawaited(_loadAfAutoScale());
         }
-      } on PlatformException {
-        _notLvCount++;
-        if (_notLvCount >= 5) _restartLiveView();
+      } on PlatformException catch (e) {
+        _onFrameFail(e.message ?? '');
       } catch (_) {
         // 单帧失败不中断循环
       }
@@ -238,6 +318,118 @@ class _RemotePageState extends State<RemotePage> {
     }
   }
 
+  /// 取到帧 → 一切正常，清掉所有故障标记
+  void _onFrameOk() {
+    _notLvCount = 0;
+    _lvRestartFails = 0;
+    if (_lvProblem != null && mounted) {
+      setState(() => _lvProblem = null);
+    } else {
+      _lvProblem = null;
+    }
+  }
+
+  /// 取帧失败：区分"相机没进取景"（NotLiveView）与其他错误。
+  ///
+  /// 真机证据（2026-09-15 22:28~22:29 日志）：相机离开取景态后，`0x9203` 会持续
+  /// 返回 NotLiveView，而 `0x9201` 单独重发仍返回"成功"却不出帧——旧代码就在这个
+  /// 循环里每帧打一条错误日志、UI 一直转圈，用户既不知道发生了什么也没法恢复。
+  void _onFrameFail(String msg) {
+    final notLv = msg.contains('NotLiveView');
+    _notLvCount++;
+    if (_notLvCount == 5) {
+      setState(() => _lvProblem = notLv ? '相机未处于取景状态，正在重新进入…' : '取景画面中断，正在重试…');
+    }
+    // 每 5 次失败尝试一次"真的结束再启动"（内部有 3 秒节流）
+    if (_notLvCount >= 5 && _notLvCount % 5 == 0) _restartLiveView();
+    // 连打 3 轮仍回不来：停下自动重试，把决定权交给用户（并说明可能的原因）
+    if (_notLvCount >= 25) {
+      _lvPaused = true;
+      _lvProblem = notLv
+          ? '相机没有提供取景画面。请确认：相机不在回放/菜单界面、屏幕亮着未休眠、'
+              '且相机上显示的是拍摄画面。然后点「重新进入取景」。'
+          : '取景链路多次中断，已暂停自动重试。可点「重新进入取景」再试。';
+      if (mounted) setState(() {});
+    }
+  }
+
+  /// 取景掉线时重启。计数归零 + 3 秒节流：既能自愈，也不会对着死链路死命重试。
+  bool _lvRestartInFlight = false;
+  int _lvRestartFails = 0;
+
+  /// 面向用户的取景故障说明（null = 正常）
+  String? _lvProblem;
+
+  /// 自动重试已放弃（连续失败太多次）
+  bool _lvPaused = false;
+
+  void _restartLiveView() {
+    // 已经断开时不要再往空连接上发取景指令：真机日志里出现过掉线期间
+    // 连续发 0x9201 把 liveViewOn 又置回 true，导致断开时多打一次"已关闭"。
+    if (model.connState != 'connected') return;
+    // 失败瞬间客户端立即抛错会让计数飞速攒满：没有在途守卫时
+    // 2ms 内连续重启 5 次（实测），全部打在死连接上。
+    if (_lvRestartInFlight) return;
+    final now = DateTime.now().millisecondsSinceEpoch;
+    if (now - _lastLvRestartMs < 3000) return;
+    _lastLvRestartMs = now;
+    _lvRestartInFlight = true;
+    // 用"先结束再启动"而不是只发 0x9201：真机上 0x9201 会返回成功但不出帧，
+    // 只有先 0x9202 结束才能真正重进（见 CameraEngine.liveViewRestart）。
+    NikonEngine.liveViewRestart().then((_) {
+      _lvRestartFails = 0;
+      if (_cameraMaybeAsleep) {
+        _cameraMaybeAsleep = false;
+        AppLog.addKey('取景已恢复：相机不再处于待机');
+        if (mounted) setState(() {});
+      }
+    }).catchError((Object e) {
+      _lvRestartFails++;
+      // 重进取景失败（0x9201 超时）在真机上就等于"相机在待机"——这个信号比参数读取
+      // 更快也更准，所以直接判定，让故障卡片换标题直接告诉用户"去按相机按钮"。
+      if (!_cameraMaybeAsleep) {
+        _cameraMaybeAsleep = true;
+        AppLog.addKey('重进取景失败 → 判定相机可能已待机');
+      }
+      AppLog.addKey('重新进入取景失败（第 $_lvRestartFails 次）：$e');
+      if (mounted && _lvRestartFails >= 3) {
+        _lvPaused = true;
+        setState(() {
+          _lvProblem = '重新进入取景连续失败：$e\n'
+              '请确认相机不在回放/菜单界面且屏幕未休眠，再点「重新进入取景」。';
+        });
+      }
+    }).whenComplete(() {
+      _lvRestartInFlight = false;
+    });
+  }
+
+  /// 用户手动重试取景
+  Future<void> _retryLiveView() async {
+    setState(() {
+      _lvPaused = false;
+      _notLvCount = 0;
+      _lvRestartFails = 0;
+      _lvProblem = '正在重新进入取景…';
+    });
+    try {
+      await NikonEngine.liveViewRestart();
+      if (!mounted) return;
+      setState(() {
+        _lvProblem = null;
+        _cameraMaybeAsleep = false;
+      });
+      if (!_frameLoopOn) _startFrameLoop();
+    } catch (e) {
+      if (mounted) {
+        setState(() {
+          _lvProblem = '重新进入取景失败：$e';
+          _cameraMaybeAsleep = true; // 0x9201 超时 = 相机在待机（真机规律）
+        });
+      }
+    }
+  }
+
   void _recordGap(int ms) {
     if (ms <= 0) return;
     _frameGaps.add(ms);
@@ -245,18 +437,6 @@ class _RemotePageState extends State<RemotePage> {
     if (_frameGaps.length < 4) return;
     final avg = _frameGaps.reduce((a, b) => a + b) / _frameGaps.length;
     _fps = avg > 0 ? (1000 / avg).round() : 0;
-  }
-
-  /// 取景掉线时重启一次。计数归零 + 3 秒节流：既能自愈，也不会对着死链路死命重试。
-  void _restartLiveView() {
-    _notLvCount = 0;
-    // 已经断开时不要再往空连接上发取景指令：真机日志里出现过掉线期间
-    // 连续发 0x9201 把 liveViewOn 又置回 true，导致断开时多打一次"已关闭"。
-    if (model.connState != 'connected') return;
-    final now = DateTime.now().millisecondsSinceEpoch;
-    if (now - _lastLvRestartMs < 3000) return;
-    _lastLvRestartMs = now;
-    NikonEngine.liveViewStart().catchError((_) {});
   }
 
   // ------------------------------------------------------------ 画面方向
@@ -294,11 +474,88 @@ class _RemotePageState extends State<RemotePage> {
   // ------------------------------------------------------------ 动作
 
   Future<void> _loadParams() async {
+    // 防重入：事件与轮询会同时触发，不设守卫时实测 300ms 内跑 8 次
+    // （每次 4 个 PTP 事务），日志也会重复刷同一行。
+    if (_paramsLoading) return;
+    _paramsLoading = true;
     try {
+      final was = _lastParamValues;
       final p = await NikonEngine.shotParams();
-      if (mounted) setState(() => _params = p);
-    } catch (_) {}
+      if (!mounted) return;
+      setState(() => _params = p);
+      if (_paramsFailStreak > 0 || _cameraMaybeAsleep) {
+        _paramsFailStreak = 0;
+        _cameraMaybeAsleep = false;
+        AppLog.addKey('相机恢复响应（参数读取正常）');
+      }
+      _noteParamChanges(was, p);
+    } catch (e) {
+      // 不再静默：取景期间参数读取与取帧共用同一条串行通道，失败时界面会停在
+      // 旧值上，用户只会看到"ISO 不同步"却无从判断原因（本次反馈就是这一条）。
+      _paramsFailStreak++;
+      if (_paramsFailStreak >= 3 && !_cameraMaybeAsleep) {
+        _cameraMaybeAsleep = true;
+        AppLog.addKey('相机连续 $_paramsFailStreak 次读不到参数：判定为可能已待机');
+        if (mounted) setState(() {});
+      }
+      AppLog.addKey('参数刷新失败（第 $_paramsFailStreak 次）：$e');
+    } finally {
+      _paramsLoading = false;
+    }
   }
+
+  bool _paramsLoading = false;
+
+  /// 连续读参数失败次数 / "相机可能已待机"判定。
+  ///
+  /// 相机待机（屏幕灭）后取景与快门都会被拒，而表象与"未对焦"一样，
+  /// 用户完全看不出区别。参数读取连读失败是一个足够可靠的旁证——
+  /// 有了它就能在用户按快门**之前**提醒："先按一下相机按钮"。
+  int _paramsFailStreak = 0;
+  bool _cameraMaybeAsleep = false;
+
+  /// 参数值的上一次快照，用于记录"相机自己改了什么"
+  Map<String, String> _lastParamValues = {};
+
+  static const List<String> _watchedParams = ['fNumber', 'exposureTime', 'iso', 'exposureBias', 'mode'];
+
+  void _noteParamChanges(Map<String, dynamic> was, Map<String, dynamic> now) {
+    final cur = <String, String>{};
+    for (final k in _watchedParams) {
+      final d = now[k];
+      final v = d is Map ? d['value'] : null;
+      if (v != null) cur[k] = v.toString();
+    }
+    final diffs = <String>[];
+    for (final e in cur.entries) {
+      final old = was[e.key];
+      if (old != null && old != e.value) diffs.add('${_paramLabel(e.key)} $old→${e.value}');
+    }
+    _lastParamValues = cur;
+    if (diffs.isNotEmpty) AppLog.addKey('参数同步：${diffs.join("，")}');
+  }
+
+  static String _paramLabel(String k) => switch (k) {
+        'fNumber' => '光圈',
+        'exposureTime' => '快门',
+        'iso' => 'ISO',
+        'exposureBias' => '曝光补偿',
+        'mode' => '档位',
+        _ => k,
+      };
+
+  /// 参数轮询：相机在自动档下会自行改动（S 档自动光圈、Auto ISO 等），
+  /// 只靠 DevicePropChanged 事件不够——真机上出现过事件到了但界面没跟上的情况。
+  /// 2.5 秒一次、`shotParams` 共 4 个事务，对取景帧率影响可忽略。
+  void _startParamsWatch() {
+    _paramsTimer?.cancel();
+    _paramsTimer = Timer.periodic(const Duration(milliseconds: 2500), (_) {
+      if (!mounted || model.connState != 'connected' || _shooting) return;
+      _loadParams();
+    });
+  }
+
+  Timer? _paramsTimer;
 
   Future<void> _switchMode(_RemoteMode m) async {
     if (m == _mode) return;
@@ -312,6 +569,7 @@ class _RemotePageState extends State<RemotePage> {
           _notLvCount = 0;
         });
         _startFrameLoop();
+        unawaited(_enableKeepAwake());
       } catch (e) {
         if (mounted) {
           ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('实时取景启动失败：$e')));
@@ -322,8 +580,61 @@ class _RemotePageState extends State<RemotePage> {
     } else {
       _stopFrameLoop();
       await NikonEngine.liveViewStop().catchError((_) {});
+      unawaited(_disableKeepAwake());
       if (mounted) setState(() => _mode = m);
     }
+  }
+
+  // ------------------------------------------------------------ 保持相机清醒
+  //
+  // 真机现象（2026-09-15）：相机空闲十几秒就息屏，之后 0x9201 返回成功但 0x9203
+  // 恒 NotLiveView、0x9205 被接受却不生效——**必须手动按相机快门才醒**，
+  // 遥控拍摄因此完全不可用。
+  // 做法：把相机的「LCD 关闭」与「测光关闭」时间临时写到它允许的最大值，
+  // 记住原值，退出遥控时还原（不偷偷改用户设置）。
+
+  bool _keepAwakeOn = false;
+  bool _keepAwakeWarned = false;
+
+  Future<void> _enableKeepAwake() async {
+    if (_keepAwakeOn) return;
+    try {
+      final r = await NikonEngine.keepAwake(true);
+      final changed = (r['changed'] as List?)?.cast<String>() ?? const [];
+      final failed = (r['failed'] as List?)?.cast<String>() ?? const [];
+      _keepAwakeOn = changed.isNotEmpty;
+      if (changed.isNotEmpty) {
+        AppLog.addKey('相机屏幕常亮已开启：${changed.join("，")}');
+        _flashAfNote('已保持相机屏幕常亮');
+      }
+      if (failed.isNotEmpty) {
+        AppLog.addKey('相机屏幕常亮未生效：${failed.join("，")}');
+        // 只提示一次：本机（Z50 II · Wi-Fi）这组属性全部不支持，每次进取景都弹会烦
+        if (mounted && !_keepAwakeWarned) {
+          _keepAwakeWarned = true;
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: const Text(
+                '本机不支持由 App 延长相机息屏时间（探针实测 0xD064/0xD062 等均"不支持"）。\n'
+                '相机待机后遥控会失效，请在相机菜单把「电源关闭延迟」调长：\n'
+                'MENU → ✏️自定义设定菜单 → c3 电源关闭延迟。',
+              ),
+              duration: const Duration(seconds: 12),
+            ),
+          );
+        }
+      }
+    } catch (e) {
+      AppLog.addKey('相机屏幕常亮请求失败：$e');
+    }
+  }
+
+  Future<void> _disableKeepAwake() async {
+    if (!_keepAwakeOn) return;
+    _keepAwakeOn = false;
+    try {
+      await NikonEngine.keepAwake(false);
+    } catch (_) {}
   }
 
   Future<void> _shoot() async {
@@ -354,19 +665,401 @@ class _RemotePageState extends State<RemotePage> {
   }
 
   Future<void> _focus() async {
+    if (_focusing) return;
+    setState(() => _focusing = true);
     try {
-      final ok = await NikonEngine.afDrive();
-      if (mounted) {
+      final r = await NikonEngine.afDrive();
+      if (!mounted) return;
+      if (r['ok'] == true) {
+        // 成功也要有反馈：AUTO / 场景自动档下相机接管对焦，画面可能毫无变化，
+        // 只静默返回会让用户以为"点了没反应"（这正是本次反馈的现象）。
+        _flashAfNote('AF 指令已发送');
+      } else {
+        _flashAfNote('对焦失败');
+        final mode = _modeName();
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text(ok ? '对焦完成' : '对焦失败或不支持'), duration: const Duration(seconds: 1)),
+          SnackBar(
+            content: Text(
+              '对焦未能驱动：${r['reason'] ?? '相机未响应'}'
+              '${mode != null ? '\n当前档位：$mode' : ''}\n$kAfHint',
+            ),
+            duration: const Duration(seconds: 8),
+          ),
         );
       }
     } catch (e) {
       if (mounted) {
+        _flashAfNote('对焦失败');
         ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('对焦失败：$e')));
       }
+    } finally {
+      if (mounted) setState(() => _focusing = false);
     }
   }
+
+  /// 取景帧的原始像素尺寸（用于把屏幕点击点换算成相机坐标）
+  int _frameW = 0;
+  int _frameH = 0;
+
+  /// 点击取景画面：指定该点为对焦点并驱动 AF。
+  ///
+  /// 三步换算：屏幕点 → 去掉 letterbox（BoxFit.contain）→ 反旋转回帧坐标，
+  /// 再乘上 [AppModel.afAreaScale]（见下）。
+  ///
+  /// **坐标空间**：`0x9205 ChangeAfArea` 只写了"2 参数 x, y"，没有文档说坐标系。
+  /// 我们按取景帧像素（实测 640×424）发送时相机**接受**了坐标，但对焦点落到别处
+  /// ——典型的"同比例不同尺度"。因此这里乘一个可标定的系数（默认 1.0，
+  /// 长按取景画面可实时标定），而不是继续猜。
+  Future<void> _focusAt(Offset local, Size box) async {
+    final pt = _framePointFor(local, box);
+    if (pt == null) return;
+    // 先落地"我点了这里"，再发指令：指令在途时也要能看到对焦框
+    setState(() {
+      _afTarget = local;
+      _afState = 'focusing';
+      _afSent = pt;
+    });
+    if (_focusing) return;
+    setState(() => _focusing = true);
+    try {
+      final r = await NikonEngine.afArea(pt.$1, pt.$2);
+      if (!mounted) return;
+      if (r['ok'] == true && r['area'] == true) {
+        setState(() => _afState = 'focused');
+        _flashAfNote('已对焦该点 (${pt.$1},${pt.$2})');
+      } else if (r['ok'] == true) {
+        // 相机接受了指令但拒绝了坐标：如实标注，不要假装对焦框就是生效位置
+        setState(() => _afState = 'fallback');
+        _flashAfNote('相机未接受指定点，已按当前 AF 区域对焦');
+      } else {
+        setState(() => _afState = 'failed');
+        _flashAfNote('对焦失败');
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('对焦未能驱动：${r['reason'] ?? '相机未响应'}\n$kAfHint'),
+            duration: const Duration(seconds: 8),
+          ),
+        );
+      }
+    } catch (e) {
+      if (mounted) {
+        setState(() => _afState = 'failed');
+        _flashAfNote('对焦失败');
+      }
+    } finally {
+      if (mounted) setState(() => _focusing = false);
+    }
+  }
+
+  /// 屏幕坐标 → 相机坐标；点在黑边上返回 null。
+  (int, int)? _framePointFor(Offset local, Size box) {
+    final fw = _frameW, fh = _frameH;
+    if (fw <= 0 || fh <= 0 || box.width <= 0 || box.height <= 0) return null;
+    // 旋转奇数次时，显示出来的宽高是帧的高宽
+    final dispW = _rotation.isOdd ? fh.toDouble() : fw.toDouble();
+    final dispH = _rotation.isOdd ? fw.toDouble() : fh.toDouble();
+    final scale = (box.width / dispW) < (box.height / dispH)
+        ? box.width / dispW
+        : box.height / dispH;
+    final shownW = dispW * scale, shownH = dispH * scale;
+    final dx = local.dx - (box.width - shownW) / 2;
+    final dy = local.dy - (box.height - shownH) / 2;
+    if (dx < 0 || dy < 0 || dx > shownW || dy > shownH) return null; // 黑边
+    final ix = dx / scale, iy = dy / scale; // 旋转后的显示坐标
+    // 反旋转（RotatedBox 顺时针转 _rotation×90°）
+    double fx, fy;
+    switch (_rotation % 4) {
+      case 1:
+        fx = iy;
+        fy = fh - 1 - ix;
+      case 2:
+        fx = fw - 1 - ix;
+        fy = fh - 1 - iy;
+      case 3:
+        fx = fw - 1 - iy;
+        fy = ix;
+      default:
+        fx = ix;
+        fy = iy;
+    }
+    // 缩放到相机实际的 AF 坐标空间：自动倍数（取景帧头部解出）优先，人工覆盖时用人工值
+    final (kx, ky) = _afScale;
+    return (
+      (fx * kx).round().clamp(0, 200000),
+      (fy * ky).round().clamp(0, 200000),
+    );
+  }
+
+  /// 对焦动作的短暂反馈（显示在取景画面左上角的 chip 位）。
+  /// 用页面内 chip 而不是 SnackBar：连续点击时 SnackBar 会排队堆叠。
+  void _flashAfNote(String text) {
+    _afNoteTimer?.cancel();
+    setState(() => _afNote = text);
+    _afNoteTimer = Timer(const Duration(milliseconds: 1600), () {
+      if (mounted) setState(() => _afNote = null);
+    });
+  }
+
+  // ------------------------------------------------------------ 对焦坐标标定
+
+  /// 长按取景画面进入：滑动缩放系数 → 「发送测试点」→ 看相机屏幕上的对焦框
+  /// 是否落在画面 1/4 处。找到正确的系数后保存，之后所有点击都用它换算。
+  Future<void> _showAfCalibration() async {
+    if (_afCalibrating) return;
+    _afCalibrating = true;
+    try {
+      await showModalBottomSheet<void>(
+        context: context,
+        backgroundColor: const Color(0xFF1C1C1E),
+        isScrollControlled: true,
+        builder: (ctx) => _afCalibrationSheet(ctx),
+      );
+    } finally {
+      _afCalibrating = false;
+    }
+  }
+
+  bool _afCalibrating = false;
+
+  Widget _afCalibrationSheet(BuildContext ctx) {
+    final fw = _frameW > 0 ? _frameW : 640;
+    final fh = _frameH > 0 ? _frameH : 424;
+    var busy = false;
+    String? result;
+    return StatefulBuilder(
+      builder: (ctx, setSheet) => SafeArea(
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(20, 16, 20, 20),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text('对焦标定', style: TextStyle(fontSize: 16, fontWeight: FontWeight.w700)),
+              const SizedBox(height: 8),
+              // 自动值优先：倍数是从取景帧头部里读出来的，不需要肉眼估
+              Container(
+                width: double.infinity,
+                padding: const EdgeInsets.fromLTRB(12, 10, 12, 10),
+                decoration: BoxDecoration(
+                  color: const Color(0xFF22262E),
+                  borderRadius: BorderRadius.circular(10),
+                  border: Border.all(
+                    color: _afScaleIsAuto ? kAccent.withValues(alpha: 0.6) : Colors.white24,
+                  ),
+                ),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      _afAuto != null
+                          ? '自动解出（取景帧头部）：×${_afAuto!.$1.toStringAsFixed(2)}（x）'
+                              ' ×${_afAuto!.$2.toStringAsFixed(2)}（y）'
+                          : '未取到取景帧头部 → 只能人工标定',
+                      style: TextStyle(
+                        fontSize: 12.5,
+                        fontWeight: FontWeight.w600,
+                        color: _afScaleIsAuto ? kAccent : Colors.white70,
+                      ),
+                    ),
+                    if (_afAuto != null) ...[
+                      const SizedBox(height: 4),
+                      Text(
+                        _afManualOverride ? '当前已改为人工值，自动值被覆盖' : '当前按自动值换算，通常无需再调',
+                        style: const TextStyle(fontSize: 11, color: Colors.white54),
+                      ),
+                    ],
+                  ],
+                ),
+              ),
+              if (_afManualOverride)
+                Align(
+                  alignment: Alignment.centerRight,
+                  child: TextButton(
+                    onPressed: () {
+                      setState(() => _afManualOverride = false);
+                      setSheet(() {});
+                    },
+                    child: const Text('恢复自动值'),
+                  ),
+                ),
+              const SizedBox(height: 6),
+              Text(
+                '下面是**人工覆盖**（自动值不可用、或想微调时用）：发一个测试点，'
+                '看相机屏幕上对焦框落在画面哪里，点选对应位置即可反推倍数。',
+                style: TextStyle(fontSize: 11.5, height: 1.5, color: Colors.white.withValues(alpha: 0.6)),
+              ),
+              const SizedBox(height: 10),
+              Row(
+                children: [
+                  Expanded(
+                    child: OutlinedButton.icon(
+                      onPressed: busy
+                          ? null
+                          : () async {
+                              setSheet(() => busy = true);
+                              try {
+                                // 固定发"画面 1/4 处"的原始帧坐标（=160,106）
+                                await NikonEngine.afArea(fw ~/ 4, fh ~/ 4);
+                                setSheet(() => result = '已发送测试点 (${fw ~/ 4}, ${fh ~/ 4})：'
+                                    '看相机上的对焦框落在画面哪里？');
+                              } catch (e) {
+                                setSheet(() => result = '发送失败：$e');
+                              } finally {
+                                setSheet(() => busy = false);
+                              }
+                            },
+                      icon: const Icon(Icons.send, size: 16),
+                      label: const Text('发送测试点'),
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 10),
+              Text('相机上的对焦框落在：',
+                  style: TextStyle(fontSize: 12, color: Colors.white.withValues(alpha: 0.6))),
+              const SizedBox(height: 6),
+              // 发的是"画面 1/4 处"：落点比例 f 直接给出倍数 = 0.25 / f
+              Wrap(
+                spacing: 8,
+                runSpacing: 6,
+                children: [
+                  for (final opt in const [
+                    (label: '正中（1/2）', frac: 0.5),
+                    (label: '1/4 处', frac: 0.25),
+                    (label: '1/8 处', frac: 0.125),
+                    (label: '1/16 处', frac: 0.0625),
+                    (label: '1/32 处', frac: 0.03125),
+                    (label: '顶在最左/最上', frac: 0.0),
+                  ])
+                    ActionChip(
+                      label: Text(opt.label, style: const TextStyle(fontSize: 11.5)),
+                      backgroundColor: const Color(0xFF2A2D35),
+                      onPressed: () async {
+                        final k = opt.frac <= 0 ? 12.0 : (0.25 / opt.frac);
+                        final v = k.clamp(0.25, 16).toDouble();
+                        await model.setAfAreaScale(v);
+                        setState(() => _afManualOverride = true);
+                        setSheet(() {});
+                        _flashAfNote('已改为人工倍数 ×${v.toStringAsFixed(2)}');
+                      },
+                    ),
+                ],
+              ),
+              const SizedBox(height: 12),
+              Row(
+                children: [
+                  const Text('当前生效倍数', style: TextStyle(fontSize: 13)),
+                  const Spacer(),
+                  Text(
+                    _afScaleIsAuto
+                        ? '×${_afScale.$1.toStringAsFixed(2)}（自动）'
+                        : '×${_afScale.$1.toStringAsFixed(2)}（人工）',
+                    style: const TextStyle(fontSize: 13, color: kAccent, fontWeight: FontWeight.w700),
+                  ),
+                ],
+              ),
+              Slider(
+                value: model.afAreaScale.clamp(0.5, 16),
+                min: 0.5,
+                max: 16,
+                divisions: 62,
+                label: model.afAreaScale.toStringAsFixed(2),
+                activeColor: kAccent,
+                onChanged: (v) {
+                  model.setAfAreaScale(v);
+                  setState(() => _afManualOverride = true);
+                  setSheet(() {});
+                },
+              ),
+              const SizedBox(height: 12),
+              Text('取景帧 $fw×$fh · 测试点 = (${fw ~/ 4}, ${fh ~/ 4})（画面 1/4 处）',
+                  style: const TextStyle(fontSize: 11.5, color: Colors.white54)),
+              const SizedBox(height: 10),
+              Row(
+                children: [
+                  Expanded(
+                    child: OutlinedButton(
+                      onPressed: busy
+                          ? null
+                          : () async {
+                              setSheet(() => busy = true);
+                              try {
+                                final r = await NikonEngine.probeAfArea(fw, fh);
+                                for (final line in r) {
+                                  AppLog.add('AF标定 $line');
+                                }
+                                setSheet(() => result = r.isEmpty ? '无输出' : r.join('\n'));
+                              } catch (e) {
+                                setSheet(() => result = '探针失败：$e');
+                              } finally {
+                                setSheet(() => busy = false);
+                              }
+                            },
+                      child: const Text('跑标定探针'),
+                    ),
+                  ),
+                ],
+              ),
+              if (result != null) ...[
+                const SizedBox(height: 10),
+                Text(result!, style: const TextStyle(fontSize: 11.5, height: 1.5, color: kAccent)),
+              ],
+              const Divider(height: 22),
+              // 防待机"戳一下"已实测无效（每 15 秒发 DeviceReady + 重发对焦点，屏幕照灭），
+              // 所以把开关撤掉——留一个没用的开关比没有更糟。这里只留事实与出路。
+              Text(
+                '关于相机息屏\n'
+                '本机在 Wi-Fi 智能设备模式下不提供任何息屏/待机属性'
+                '（0xD064/0xD062/0xD066/0xD0B3 探针实测全为"不支持"），'
+                '定时发协议活动也留不住屏幕（已实测无效）。'
+                '唯一有效的是改相机设置：MENU → ✏️自定义设定菜单 → c3「电源关闭延迟」→ 选更长时间。',
+                style: TextStyle(fontSize: 11.5, height: 1.6, color: Colors.white.withValues(alpha: 0.6)),
+              ),
+              const Divider(height: 22),
+              Row(
+                children: [
+                  Expanded(
+                    child: FilledButton(
+                      onPressed: () {
+                        if (ctx.mounted) Navigator.pop(ctx);
+                      },
+                      child: const Text('完成'),
+                    ),
+                  ),
+                  const SizedBox(width: 10),
+                  TextButton(
+                    onPressed: () async {
+                      await model.setAfAreaScale(4.0);
+                      setSheet(() {});
+                      if (context.mounted) setState(() {});
+                    },
+                    child: const Text('恢复 ×4'),
+                  ),
+                ],
+              ),
+              Text(
+                '相机不提供"AF 坐标空间尺寸"属性（0xD0xx 探针实测全"不支持"），所以读不到、'
+                '只能这样测一次；结果会记住，之后点画面就按它换算。\n'
+                '验证：点画面正中 → 相机上的对焦框应落在正中。',
+                style: const TextStyle(fontSize: 11.5, height: 1.5, color: Colors.white54),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  /// AF 驱动失败时的可行动建议。
+  ///
+  /// 真机证据（交接文档 §19/§20）：AF 驱动是 0x90C1（libgphoto2 定义），旧的 0x90C3
+  /// 其实是 DelImageSDRAM（要求 1 个参数），所以必然 ParameterNotSupported。
+  /// 这条提示留给"码对了但相机仍拒绝"的情况——最常见的是档位/对焦模式限制，
+  /// 不能只丢一句"对焦失败或不支持"给用户。
+  static const String kAfHint =
+      '· 直接按「拍摄」——相机会自行完成对焦，不必手动驱动\n'
+      '· AUTO / 场景自动档下对焦由相机接管，需切到 P/A/S/M 才能手动驱动\n'
+      '· 镜头在 MF 时不支持 AF 驱动';
 
   Future<void> _downloadLast() async {
     final f = _lastShot;
@@ -438,16 +1131,63 @@ class _RemotePageState extends State<RemotePage> {
 
   String _isoText() => _isoValueText(_descValue('iso'));
 
+  /// 曝光补偿：0x5010，单位 1/1000 EV，dtype=INT16（负值以 u16 补码返回，
+  /// 属性 Dump 里能看到 60536 这类值 = -5000）。
+  int? _exposureBiasRaw() {
+    final v = _descValue('exposureBias');
+    if (v == null) return null;
+    final i = v.toInt();
+    return i > 32767 ? i - 65536 : i;
+  }
+
+  String _biasText() {
+    final v = _exposureBiasRaw();
+    if (v == null) return '--';
+    if (v == 0) return '±0EV';
+    final ev = v / 1000.0;
+    return '${ev > 0 ? '+' : '−'}${ev.abs().toStringAsFixed(ev.abs() % 1 == 0 ? 0 : 1)}EV';
+  }
+
   // ------------------------------------------------------------ 档位与可编辑性
   //
   // ExposureProgramMode：1=M 2=P 3=A 4=S；其他值（如 AUTO 场景）原样显示数字。
   // 置灰规则只是引导，相机仍是最终裁判——被拒时 setShotParam 会把 PtpException 提出来。
 
+  /// 档位名。0x500E = ExposureProgramMode（属性 Dump 已确认可读），
+  /// 但**尼康枚举顺序与标准 PTP 的 1=M/2=P/3=A/4=S 是否一致无法只靠 Dump 断定**，
+  /// 所以再叠一层自校准：用"哪个参数可写"反推档位（M=都可写、S=仅快门、
+  /// A=仅光圈、P/AUTO=都不可写），与数字名不一致时以可写性为准并写日志。
   String? _modeName() {
     final m = _params?['mode'];
     if (m is! Map) return null;
     final v = (m['value'] as num?)?.toInt();
-    return switch (v) { 1 => 'M', 2 => 'P', 3 => 'A', 4 => 'S', _ => v?.toString() };
+    if (v == null) return null;
+    final byNumber = switch (v) {
+      1 => 'M',
+      2 => 'P',
+      3 => 'A',
+      4 => 'S',
+      // 尼康厂商扩展档位（真机实测：用户确认 32784=AUTO、32792=SCN）
+      32784 => 'AUTO',
+      32792 => 'SCN',
+      _ => null,
+    };
+    final byWritable = _modeFromWritability();
+    if (byNumber != null && byWritable != null && byNumber != byWritable) {
+      AppLog.add('档位名冲突：0x500E=$v → $byNumber，但可写性显示 $byWritable（按 $byWritable 显示）');
+      return byWritable;
+    }
+    return byWritable ?? byNumber ?? v.toString();
+  }
+
+  /// 由"光圈/快门是否可写"反推档位（不依赖厂商枚举顺序）。
+  String? _modeFromWritability() {
+    final f = _paramWritable('fNumber');
+    final s = _paramWritable('exposureTime');
+    if (!f && !s) return null; // P/AUTO 或不支持写入：无法区分，交给数字
+    if (f && s) return 'M';
+    if (s) return 'S';
+    return 'A';
   }
 
   bool _paramWritable(String name) {
@@ -457,6 +1197,9 @@ class _RemotePageState extends State<RemotePage> {
 
   bool _paramEditable(String name) {
     if (!_paramWritable(name)) return false;
+    // 曝光补偿的"能不能改"完全由相机自己的可写标志决定（P/S/A 可，M 通常不可），
+    // 不必再叠档位规则——相机是最终裁判，写错了会被拒。
+    if (name == 'exposureBias') return true;
     switch (_modeName()) {
       case 'M':
         return true; // M：光圈/快门/ISO 全部可改
@@ -464,8 +1207,10 @@ class _RemotePageState extends State<RemotePage> {
         return name == 'fNumber'; // A：只改光圈
       case 'S':
         return name == 'exposureTime'; // S：只改快门
+      case 'P':
+        return name == 'exposureBias'; // P：可改曝光补偿
       default:
-        return false; // P / AUTO / 未知：只读
+        return false; // AUTO / 未知：只读
     }
   }
 
@@ -489,15 +1234,24 @@ class _RemotePageState extends State<RemotePage> {
     final d = _params?[name];
     if (d is! Map) return;
     final current = (d['value'] as num?)?.toInt() ?? 0;
+    // 曝光补偿的枚举表是 u16 补码（60536 其实是 -5000），先归一化再排序，
+    // 否则列表会从 +5EV 开始往下排、负值全跑到末尾。
+    int norm(int v) => name == 'exposureBias' && v > 32767 ? v - 65536 : v;
+    final cur = norm(current);
     final values = ((d['values'] as List?) ?? const [])
         .whereType<num>()
-        .map((e) => e.toInt())
+        .map((e) => norm(e.toInt()))
         .toList()
       ..sort();
-    final range = (d['range'] as List?)?.whereType<num>().map((e) => e.toInt()).toList();
+    final range = (d['range'] as List?)?.whereType<num>().map((e) => norm(e.toInt())).toList();
     String fmt(int v) => switch (name) {
       'fNumber' => _fNumberValueText(v),
       'exposureTime' => _exposureValueText(v),
+      'exposureBias' => (() {
+          if (v == 0) return '±0EV';
+          final ev = v / 1000.0;
+          return '${ev > 0 ? '+' : '−'}${ev.abs().toStringAsFixed(ev.abs() % 1 == 0 ? 0 : 1)}EV';
+        })(),
       _ => _isoValueText(v),
     };
 
@@ -514,10 +1268,10 @@ class _RemotePageState extends State<RemotePage> {
                 ListTile(
                   dense: true,
                   title: Text(fmt(v), style: TextStyle(
-                    color: v == current ? const Color(0xFF3D7BFF) : Colors.white,
-                    fontWeight: v == current ? FontWeight.w700 : FontWeight.w400,
+                    color: v == cur ? const Color(0xFF3D7BFF) : Colors.white,
+                    fontWeight: v == cur ? FontWeight.w700 : FontWeight.w400,
                   )),
-                  trailing: v == current ? const Icon(Icons.check, size: 18, color: Color(0xFF3D7BFF)) : null,
+                  trailing: v == cur ? const Icon(Icons.check, size: 18, color: Color(0xFF3D7BFF)) : null,
                   onTap: () => Navigator.pop(ctx, v),
                 ),
             ],
@@ -533,7 +1287,7 @@ class _RemotePageState extends State<RemotePage> {
         backgroundColor: const Color(0xFF1C1C1E),
         builder: (ctx) => StatefulBuilder(
           builder: (ctx, setSheet) {
-            var v = current.clamp(min, max);
+            var v = cur.clamp(min, max);
             return SafeArea(
               child: Padding(
                 padding: const EdgeInsets.all(20),
@@ -567,7 +1321,7 @@ class _RemotePageState extends State<RemotePage> {
     } else {
       return; // 无表也无范围：相机没给编辑信息，放弃
     }
-    if (picked != null && picked != current) {
+    if (picked != null && picked != cur) {
       await _applyParam(name, picked);
     }
   }
@@ -587,6 +1341,8 @@ class _RemotePageState extends State<RemotePage> {
               : AppBar(
                   title: const Text('遥控拍摄'),
                   actions: [
+                    // 取景卡住时最需要这个：一眼看出是相机忙还是链路断了
+                    LinkStatusButton(model: model),
                     if (_mode == _RemoteMode.liveView)
                       IconButton(
                         tooltip: _immersive ? '退出全屏' : '全屏取景',
@@ -598,6 +1354,9 @@ class _RemotePageState extends State<RemotePage> {
           body: SafeArea(
             child: Column(
               children: [
+                // 相机疑似待机时的提前提醒：待机后取景与快门都会被拒，
+                // 而表象与"未对焦"一样，等用户按了快门才发现就太晚了。
+                if (!disconnected && _cameraMaybeAsleep) _asleepBanner(),
                 Expanded(child: _viewArea(disconnected)),
                 if (!_immersive) _controlBar(disconnected),
               ],
@@ -609,7 +1368,7 @@ class _RemotePageState extends State<RemotePage> {
   }
 
   Widget _viewArea(bool disconnected) {
-    if (disconnected) return const DisconnectedView(message: '连接已断开');
+    if (disconnected) return DisconnectedView(message: model.connStateText);
     return _mode == _RemoteMode.liveView ? _liveViewArea() : _blindArea();
   }
 
@@ -645,19 +1404,60 @@ class _RemotePageState extends State<RemotePage> {
         if (frame == null) return _waitingFrame();
         // StackFit.expand 给出紧约束：画面铺满可用区，BoxFit.contain 只做等比内缩，
         // 不再像此前那样被 Center 居中出现大片留白
-        return Stack(
-          fit: StackFit.expand,
-          children: [
-            // 点画面任意位置 = 驱动相机 AF（取景窗对焦）
-            GestureDetector(
-              onTap: _focus,
-              child: ColoredBox(color: Colors.black, child: _orientedImage(frame, _rotation, gapless: true)),
-            ),
+        return LayoutBuilder(
+          builder: (context, cons) {
+            final box = Size(cons.maxWidth, cons.maxHeight);
+            return Stack(
+              fit: StackFit.expand,
+              children: [
+                // 点画面任意位置 = 指定该点为对焦点并驱动 AF；长按 = 对焦坐标标定
+                GestureDetector(
+                  onTapUp: (d) => _focusAt(d.localPosition, box),
+                  onLongPress: _showAfCalibration,
+                  child: ColoredBox(color: Colors.black, child: _orientedImage(frame, _rotation, gapless: true)),
+                ),
+                // 对焦点指示：**常驻**，颜色即状态（相机上的对焦框也是一直亮着的）
+                if (_afTarget != null)
+                  Positioned(
+                    left: _afTarget!.dx - 26,
+                    top: _afTarget!.dy - 26,
+                    child: IgnorePointer(child: _AfCrosshair(state: _afState)),
+                  ),
+                // 取景故障面板：说清"为什么没有画面"以及怎么办（此前只有一个转圈）
+                if (_lvProblem != null)
+                  Positioned(
+                    left: 12,
+                    right: 12,
+                    top: 0,
+                    bottom: 0,
+                    child: Center(child: _lvProblemCard(_lvProblem!)),
+                  ),
+                // 相机没接受指定点时，把实际发出去的坐标摆出来（排错的第一手证据）
+                if (_afSent != null && (_afState == 'fallback' || _afState == 'failed'))
+                  Positioned(
+                    right: 10,
+                    top: 38,
+                    child: _overlayChip('发送坐标 (${_afSent!.$1},${_afSent!.$2})'),
+                  ),
             Positioned(
               left: 10,
               top: 10,
               child: _overlayChip('● LIVE ${_fps}fps'),
             ),
+            // 点击画面 = AF。对焦指令在途时给出可见反馈：AF 驱动到合焦之间
+            // 相机没有画面变化，没有这个提示用户会以为点击没生效。
+            if (_focusing)
+              Positioned(
+                left: 10,
+                top: 38,
+                child: _overlayChip('AF 对焦中…'),
+              )
+            else if (_afNote != null)
+              Positioned(
+                left: 10,
+                top: 38,
+                child: _overlayChip(_afNote!),
+              ),
             if (model.battery >= 0)
               Positioned(
                 right: 10,
@@ -674,6 +1474,16 @@ class _RemotePageState extends State<RemotePage> {
                 onLongPress: _rotationAuto,
               ),
             ),
+            // 对焦坐标标定入口：相机接受了坐标却把对焦点放在别处时用它校准
+            Positioned(
+              left: 10,
+              bottom: 40,
+              child: _overlayChip(
+                '🎯 标定对焦',
+                tooltip: '相机上的对焦框与点击位置不一致时，点这里校准坐标缩放',
+                onTap: _showAfCalibration,
+              ),
+            ),
             if (_immersive)
               Positioned(
                 right: 10,
@@ -683,21 +1493,127 @@ class _RemotePageState extends State<RemotePage> {
                   onTap: () => setState(() => _immersive = false),
                 ),
               ),
-          ],
+              ],
+            );
+          },
         );
       },
     );
   }
 
-  Widget _waitingFrame() => Center(
+  Widget _waitingFrame() {
+    // 一直转圈是最糟的反馈：用户分不清"在连"与"已经失败"。
+    // 一旦判定取景有问题，就把原因和恢复入口直接摆出来。
+    if (_lvProblem != null) {
+      return Center(
+        child: Padding(
+          padding: const EdgeInsets.all(20),
+          child: _lvProblemCard(_lvProblem!),
+        ),
+      );
+    }
+    return Center(
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          const SizedBox(width: 24, height: 24, child: CircularProgressIndicator(strokeWidth: 2)),
+          const SizedBox(height: 12),
+          Text(
+            _lvStarting ? '正在启动实时取景…' : '等待取景画面…',
+            style: TextStyle(fontSize: 13, color: Colors.white.withValues(alpha: 0.5)),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// 相机疑似待机时的横幅（含一键唤醒尝试）。
+  ///
+  /// 判据是"连续 3 次读不到参数"，不是猜——相机待机后取景与快门都会被拒，
+  /// 表象与"未对焦"一样，等用户按了快门才发现就太晚了。
+  Widget _asleepBanner() => Container(
+        width: double.infinity,
+        color: const Color(0xFF3A2A18),
+        padding: const EdgeInsets.fromLTRB(12, 8, 8, 8),
+        child: Row(
+          children: [
+            const Icon(Icons.bedtime_outlined, size: 16, color: Color(0xFFE5A08A)),
+            const SizedBox(width: 8),
+            const Expanded(
+              child: Text(
+                '相机可能已进入待机（屏幕灭）：此时取景与快门都会被拒。\n'
+                '按一下相机任意按钮即可恢复；长期方案见「🎯 标定对焦」里的说明。',
+                style: TextStyle(fontSize: 11.5, height: 1.45, color: Color(0xFFE5A08A)),
+              ),
+            ),
+            TextButton(
+              style: TextButton.styleFrom(minimumSize: const Size(0, 36)),
+              onPressed: () async {
+                await NikonEngine.wakeUp();
+                await _loadParams();
+              },
+              child: const Text('尝试唤醒', style: TextStyle(fontSize: 12)),
+            ),
+          ],
+        ),
+      );
+
+  /// 取景故障卡片：原因 + 「唤醒并重进取景」+ 「切到盲拍」。
+  ///
+  /// 真机结论（2026-09-15）：相机待机（屏幕灭）后，`0x9201` 仍回成功但 `0x9203`
+  /// 恒 NotLiveView、`0x9205` 被接受却不生效；且本机不支持修改息屏时间
+  /// （0xD064/0xD062/0xD066/0xD0B3 全部"不支持"）。所以这里必须把话说全：
+  /// **PTP 侧不一定叫得醒它**，要按相机按钮/调菜单；同时给出"盲拍"这条不带取景的活路。
+  Widget _lvProblemCard(String msg) => Container(
+        constraints: const BoxConstraints(maxWidth: 340),
+        padding: const EdgeInsets.fromLTRB(16, 14, 16, 14),
+        decoration: BoxDecoration(
+          color: Colors.black.withValues(alpha: 0.88),
+          borderRadius: BorderRadius.circular(14),
+          border: Border.all(color: const Color(0xFFE5A08A)),
+        ),
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
-            const SizedBox(width: 24, height: 24, child: CircularProgressIndicator(strokeWidth: 2)),
-            const SizedBox(height: 12),
+            const Icon(Icons.videocam_off_outlined, size: 24, color: Color(0xFFE5A08A)),
+            if (_cameraMaybeAsleep) ...[
+              const SizedBox(height: 6),
+              const Text('相机可能已进入待机（屏幕灭）',
+                  style: TextStyle(fontSize: 14, fontWeight: FontWeight.w700, color: Color(0xFFE5A08A))),
+            ],
+            const SizedBox(height: 8),
+            Text(msg,
+                style: const TextStyle(fontSize: 12.5, height: 1.5),
+                textAlign: TextAlign.center),
+            const SizedBox(height: 8),
             Text(
-              _lvStarting ? '正在启动实时取景…' : '等待取景画面…',
-              style: TextStyle(fontSize: 13, color: Colors.white.withValues(alpha: 0.5)),
+              '相机待机（屏幕灭）后取景通道会失效，而且**连快门也会被拒**'
+              '（实测持续 DeviceBusy，表象与"未对焦"一样）：\n'
+              '· 按一下相机任意按钮唤醒后即可继续；\n'
+              '· 长期方案：MENU → ✏️自定义设定菜单 → c3「电源关闭延迟」→ 选更长时间'
+              '（本机 Wi-Fi 模式下 App 改不了它）。',
+              style: TextStyle(fontSize: 11.5, height: 1.55, color: Colors.white.withValues(alpha: 0.7)),
+              textAlign: TextAlign.left,
+            ),
+            const SizedBox(height: 12),
+            Row(
+              children: [
+                Expanded(
+                  child: FilledButton(
+                    style: FilledButton.styleFrom(minimumSize: const Size(0, 40)),
+                    onPressed: _retryLiveView,
+                    child: const Text('唤醒并重进'),
+                  ),
+                ),
+                const SizedBox(width: 10),
+                Expanded(
+                  child: OutlinedButton(
+                    style: OutlinedButton.styleFrom(minimumSize: const Size(0, 40)),
+                    onPressed: () => _switchMode(_RemoteMode.blind),
+                    child: const Text('切到盲拍'),
+                  ),
+                ),
+              ],
             ),
           ],
         ),
@@ -865,17 +1781,17 @@ class _RemotePageState extends State<RemotePage> {
           ),
           Padding(
             padding: const EdgeInsets.symmetric(vertical: 8),
-            child: Row(
-              mainAxisAlignment: MainAxisAlignment.center,
+            child: Wrap(
+              alignment: WrapAlignment.center,
+              crossAxisAlignment: WrapCrossAlignment.center,
+              spacing: 10,
+              runSpacing: 6,
               children: [
                 _modeChip(),
-                const SizedBox(width: 12),
                 _paramChip('fNumber', _fNumberText()),
-                const SizedBox(width: 12),
                 _paramChip('exposureTime', _exposureText()),
-                const SizedBox(width: 12),
                 _paramChip('iso', _isoText()),
-                const SizedBox(width: 12),
+                _paramChip('exposureBias', _biasText()),
                 _param(model.battery >= 0 ? '${model.battery}%' : '--'),
               ],
             ),
@@ -884,9 +1800,12 @@ class _RemotePageState extends State<RemotePage> {
           Row(
             children: [
               TextButton.icon(
-                onPressed: disconnected ? null : _focus,
-                icon: const Icon(Icons.center_focus_strong, size: 18),
-                label: const Text('对焦', style: TextStyle(fontSize: 13)),
+                onPressed: (disconnected || _focusing) ? null : _focus,
+                icon: _focusing
+                    ? const SizedBox(
+                        width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2))
+                    : const Icon(Icons.center_focus_strong, size: 18),
+                label: Text(_focusing ? '对焦中' : '对焦', style: const TextStyle(fontSize: 13)),
               ),
               const Spacer(),
               const Text('拍后自动下载', style: TextStyle(fontSize: 12.5)),
@@ -981,7 +1900,7 @@ class _RemotePageState extends State<RemotePage> {
     );
   }
 
-  /// 档位 chip（M/A/S/P/数字），无数据时显示 --
+  /// 档位 chip（M/A/S/P/AUTO/SCN），无数据时显示 --
   Widget _modeChip() {
     final m = _modeName();
     return Container(
@@ -993,6 +1912,67 @@ class _RemotePageState extends State<RemotePage> {
       child: Text(
         m ?? '--',
         style: const TextStyle(fontSize: 13.5, fontWeight: FontWeight.w700, color: Colors.white70),
+      ),
+    );
+  }
+}
+
+/// 对焦点指示：一个方框 + 中心点，**常驻**（相机上的对焦框也是一直亮着的，
+/// 只在手机上闪 1.4 秒会让用户觉得"手机端不显示焦点位置"）。
+///
+/// 颜色即状态：
+/// - `focusing` 白色（指令在途，附"对焦中"小字）
+/// - `focused`  尼康黄（已指定该点）
+/// - `fallback` 暖橙（相机接受了指令但拒绝坐标，实际按当前 AF 区域对焦）
+/// - `failed`   红色（对焦未驱动成功）
+class _AfCrosshair extends StatelessWidget {
+  const _AfCrosshair({required this.state});
+
+  final String state;
+
+  @override
+  Widget build(BuildContext context) {
+    final (color, label) = switch (state) {
+      'focusing' => (Colors.white, '对焦中'),
+      'focused' => (kAccent, null),
+      'fallback' => (const Color(0xFFE5A08A), '未接受该点'),
+      'failed' => (const Color(0xFFE5484D), '对焦失败'),
+      _ => (Colors.white70, null),
+    };
+    return SizedBox(
+      width: 52,
+      height: 64,
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Stack(
+            alignment: Alignment.center,
+            children: [
+              Container(
+                width: 46,
+                height: 46,
+                decoration: BoxDecoration(
+                  border: Border.all(color: color, width: 2),
+                  borderRadius: BorderRadius.circular(4),
+                  color: color.withValues(alpha: 0.06),
+                ),
+              ),
+              Container(width: 4, height: 4, decoration: BoxDecoration(color: color, shape: BoxShape.circle)),
+            ],
+          ),
+          if (label != null)
+            Padding(
+              padding: const EdgeInsets.only(top: 2),
+              child: Text(
+                label,
+                style: TextStyle(
+                  fontSize: 9.5,
+                  color: color,
+                  shadows: const [Shadow(color: Colors.black, blurRadius: 3)],
+                ),
+              ),
+            ),
+        ],
       ),
     );
   }

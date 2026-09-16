@@ -138,6 +138,25 @@ class _DebugPanelState extends State<DebugPanel> {
       needsFiles: true,
       run: NikonEngine.probeLiveView5,
     ),
+    _Probe(
+      label: '休眠/唤醒',
+      detail: '读 LCD关闭/测光关闭/自动关机 取值表 + 测 DeviceReady 是否应答'
+          '（用于查"相机息屏后遥控失效"）',
+      needsFiles: false,
+      run: (_) => NikonEngine.probeSleep(),
+    ),
+    _Probe(
+      label: '实时ISO',
+      detail: '差分法找"随 Auto ISO 变化"的属性（约 15 秒，期间请对着明暗变化处）',
+      needsFiles: false,
+      run: (_) => NikonEngine.probeLiveIso(),
+    ),
+    _Probe(
+      label: '取景头部',
+      detail: 'dump 取景帧头部全部字段（384B，找实时 ISO/光圈/快门）',
+      needsFiles: false,
+      run: (_) => NikonEngine.probeLvHeader(),
+    ),
   ];
 
   @override
@@ -176,7 +195,8 @@ class _DebugPanelState extends State<DebugPanel> {
         final w = await NikonEngine.wifiInfo();
         if (!mounted) return;
         setState(() => _wifi = w);
-        _addLog('网络: onWifi=${w['onWifi']} ssid=${w['ssid']} ip=${w['ip']} 网关=${w['gateway']}');
+        _addLog('网络: onWifi=${w['onWifi']} ssid=${w['ssid']} ip=${w['ip']} 网关=${w['gateway']} '
+            '信号=${w['signalLevel']}格(${w['rssi']}dBm) 速率=${w['linkSpeed']}Mbps');
       });
 
   Future<void> _scan() => _run('扫描相机', () async {
@@ -296,6 +316,24 @@ class _DebugPanelState extends State<DebugPanel> {
           _downloadResult = r;
           _progress = null;
         });
+      });
+
+  /// 读一次拍摄参数并逐项打日志：用于**与相机屏幕当场比对**。
+  /// 起因是 Auto ISO 下相机显示 ISO 2500、App 的 0x500F 读到 2000，
+  /// 需要同一时刻的两边数值才能判断是"属性不是实时值"还是"界面刷新不及时"。
+  Future<void> _readParamsNow() => _run('读一次拍摄参数', () async {
+        final p = await NikonEngine.shotParams();
+        for (final k in const ['fNumber', 'exposureTime', 'iso', 'exposureBias', 'mode']) {
+          final d = p[k];
+          if (d is Map) {
+            final vals = d['values'] as List?;
+            _addLog('参数 $k：当前=${d['value']} 可写=${d['writable']} '
+                '${vals != null ? "取值表 ${vals.length} 项" : ""}');
+          } else {
+            _addLog('参数 $k：无（相机未提供）');
+          }
+        }
+        _addLog('↑ 请立刻对照相机屏幕上的 ISO / 光圈 / 快门');
       });
 
   Future<void> _showCapabilities() => _run('能力清单', () async {
@@ -645,6 +683,11 @@ class _DebugPanelState extends State<DebugPanel> {
             OutlinedButton(
               onPressed: (_busy || !_connected) ? null : _showCapabilities,
               child: const Text('能力清单'),
+            ),
+            // 与相机屏幕逐项对照：Auto ISO 下 0x500F 疑非实时值，用它当场比对
+            OutlinedButton(
+              onPressed: (_busy || !_connected) ? null : _readParamsNow,
+              child: const Text('读一次参数'),
             ),
             ..._probes.map(button),
           ]),

@@ -4,7 +4,7 @@ import 'package:flutter/services.dart';
 import '../../models/camera_file.dart';
 import 'app_widgets.dart';
 
-/// 相册网格单元格：缩略图 + 类型角标 + 已下载标记 + 右下角勾选热区。
+/// 相册网格单元格：缩略图 + 类型角标 + RAW+JPEG 成对标记 + 已下载标记 + 勾选热区。
 ///
 /// 只负责呈现与手势转发；缩略图的按需加载由页面决定（涉及引擎调度）。
 class GalleryCell extends StatelessWidget {
@@ -17,12 +17,17 @@ class GalleryCell extends StatelessWidget {
     required this.onTap,
     required this.onLongPress,
     required this.onToggleSelect,
+    this.pairDownloaded = false,
   });
 
   final CameraFile file;
   final Uint8List? thumb;
   final bool selected;
   final bool downloaded;
+
+  /// 配对（RAW↔JPEG）的另一半是否已下载。成对照片最需要看见的就是这个：
+  /// "我收了 JPEG，但 RAW 还没收"。
+  final bool pairDownloaded;
   final VoidCallback onTap;
   final VoidCallback onLongPress;
   final VoidCallback onToggleSelect;
@@ -31,6 +36,7 @@ class GalleryCell extends StatelessWidget {
   Widget build(BuildContext context) {
     final isRaw = file.kind == 'raw';
     final isVideo = file.kind == 'video';
+    final paired = file.isPaired;
     return GestureDetector(
       behavior: HitTestBehavior.opaque,
       onTap: onTap,
@@ -55,12 +61,23 @@ class GalleryCell extends StatelessWidget {
             _Badge(file.ext ?? 'RAW')
           else if (isVideo)
             const _Badge('视频'),
-          if (downloaded)
-            const Positioned(
-              left: 5,
-              bottom: 5,
-              child: Icon(Icons.check_circle, size: 15, color: Color(0xFF4CD964)),
-            ),
+          // 成对标记：右上角，一眼看出这张照片在相机上是"JPG + RAW"两个文件
+          if (paired)
+            const Positioned(top: 4, right: 4, child: _Badge('R+J')),
+          // 下载状态：成对时分列显示 J / R，避免"以为整张都收了"
+          Positioned(
+            left: 5,
+            bottom: 5,
+            child: paired
+                ? _PairTicks(
+                    selfRaw: isRaw,
+                    selfDone: downloaded,
+                    pairDone: pairDownloaded,
+                  )
+                : (downloaded
+                    ? const Icon(Icons.check_circle, size: 15, color: Color(0xFF4CD964))
+                    : const SizedBox.shrink()),
+          ),
           // 22×22 的隐形勾选热区：不遮挡缩略图，点它直接进入选择模式
           Positioned(
             right: 0,
@@ -87,6 +104,56 @@ class GalleryCell extends StatelessWidget {
       ),
     );
   }
+}
+
+/// J / R 两枚下载状态标记（成对照片用）。
+///
+/// 左边是 JPEG 的状态、右边是 RAW 的状态：实心绿勾 = 已下载，空心灰圈 = 未下载。
+class _PairTicks extends StatelessWidget {
+  const _PairTicks({required this.selfRaw, required this.selfDone, required this.pairDone});
+
+  /// 当前这个格子本身是不是 RAW（决定 J/R 哪个用 selfDone）
+  final bool selfRaw;
+  final bool selfDone;
+  final bool pairDone;
+
+  @override
+  Widget build(BuildContext context) {
+    final jDone = selfRaw ? pairDone : selfDone;
+    final rDone = selfRaw ? selfDone : pairDone;
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 1),
+      decoration: BoxDecoration(
+        color: Colors.black54,
+        borderRadius: BorderRadius.circular(3),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          _tick('J', jDone),
+          const SizedBox(width: 3),
+          _tick('R', rDone),
+        ],
+      ),
+    );
+  }
+
+  Widget _tick(String label, bool done) => Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Text(label,
+              style: TextStyle(
+                fontSize: 8.5,
+                fontWeight: FontWeight.w700,
+                color: done ? const Color(0xFF4CD964) : Colors.white38,
+              )),
+          Icon(
+            done ? Icons.check_circle : Icons.circle_outlined,
+            size: 9,
+            color: done ? const Color(0xFF4CD964) : Colors.white38,
+          ),
+        ],
+      );
 }
 
 class _Badge extends StatelessWidget {
