@@ -71,8 +71,4 @@ class CameraFile {
     isVideo ??= m['isVideo'] as bool?;
     isJpeg ??= m['isJpeg'] as bool?;
   }
-
-  /// 下载去重键：文件名 + 大小
-  String dedupKey([String? nameOverride, int? sizeOverride]) =>
-      '${nameOverride ?? name}:$sizeOverride';
 }

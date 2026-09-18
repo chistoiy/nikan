@@ -301,6 +301,97 @@ internal object CameraProbes {
     }
 
     /**
+     * 无线链路基准测速（**只读、无副作用**：数据写进空 sink，不落盘、不写下载记录）。
+     *
+     * 目的：把"无线还能不能更快"从猜测变成可测量的问题。
+     * 同一张卡文件，在 **相机 AP 模式** 与 **相机 STA 模式**（相机接入家里路由器，
+     * 可走 5GHz）各跑一次，对比平均吞吐即可定位瓶颈：
+     *
+     * - 若频段为 2.4GHz 且协商速率 ≈54Mbps，说明链路是 **802.11g**——
+     *   其 TCP 实际吞吐上限约 3MB/s，此时"已经到顶"；
+     * - 若换 5GHz 后吞吐明显上升，则瓶颈在 2.4GHz 频段/相机自建 AP，值得引导用户改 STA 模式；
+     * - 若两种频段吞吐几乎一样，瓶颈在相机自己的 TCP/PTP 实现或读卡，App 无从优化。
+     *
+     * 注意：它会**真的把整个文件传一遍**，耗时与下载相同，建议挑一张 10~30MB 的照片跑。
+     */
+    fun probeLinkThroughput(handle: Long): List<String> {
+        val c = CameraEngine.need()
+        val out = ArrayList<String>()
+        val info = runCatching { CameraEngine.fileInfo(handle) }.getOrNull()
+        val name = info?.get("name") as? String ?: "handle=$handle"
+        val size = (info?.get("size") as? Number)?.toLong() ?: 0L
+        if (size <= 0) {
+            out += "无法取到对象大小（$name），已取消测速"
+            return out
+        }
+
+        // 先把链路侧证据记下来，否则"快/慢"没有参照物
+        val w = runCatching { CameraEngine.wifiInfo() }.getOrNull().orEmpty()
+        val freq = (w["frequency"] as? Number)?.toInt() ?: 0
+        val band = when {
+            freq in 2400..2500 -> "2.4GHz"
+            freq >= 4900 -> "5GHz"
+            else -> "未知（freq=$freq）"
+        }
+        val linkSpeed = (w["linkSpeed"] as? Number)?.toInt() ?: 0
+        val rssi = (w["rssi"] as? Number)?.toInt() ?: 0
+        out += "链路：$band · 协商速率 ${linkSpeed}Mbps · 信号 ${rssi}dBm"
+        out += "对象：$name（%.1fMB）· 传输模式 ${c.effectiveDlMode}".format(size / 1048576.0)
+        out += "开始测速（数据丢弃，不落盘、不写下载记录）…"
+
+        val sink = object : java.io.OutputStream() {
+            override fun write(b: Int) = Unit
+            override fun write(b: ByteArray, off: Int, len: Int) = Unit
+        }
+        val t0 = SystemClock.elapsedRealtime()
+        var lastAt = t0
+        var lastBytes = 0L
+        var worstGapMs = 0L
+        var worstGapAt = 0L
+        val written = try {
+            c.getObjectToStream(handle, size, sink) { r, _ ->
+                val now = SystemClock.elapsedRealtime()
+                val gap = now - lastAt
+                if (gap > worstGapMs) {
+                    worstGapMs = gap
+                    worstGapAt = lastBytes
+                }
+                lastAt = now
+                lastBytes = r
+            }
+        } catch (e: Exception) {
+            out += "测速中断：${e.message}"
+            return out
+        }
+        val ms = (SystemClock.elapsedRealtime() - t0).coerceAtLeast(1)
+        val mbps = (written / 1048576.0) / (ms / 1000.0)
+        out += "结果：%.1fMB / %.1fs = %.2f MB/s（%.1f Mbps）".format(
+            written / 1048576.0, ms / 1000.0, mbps, mbps * 8,
+        )
+        if (worstGapMs > 0) {
+            out += "最慢区间：${worstGapMs}ms（自 %.1fMB 处起）——远大于平均值说明有停顿，"
+                .format(worstGapAt / 1048576.0) + "不是稳定限速"
+        }
+
+        // 判读：直接给结论，别让用户自己算"还有多少空间"
+        val is11g = band == "2.4GHz" && linkSpeed in 1..60
+        out += when {
+            is11g && mbps >= 2.4 ->
+                "判读：802.11g 链路（${linkSpeed}Mbps），TCP 上限约 3MB/s，当前已基本到顶。" +
+                    "要更快只能换传输路径：相机 STA 模式接 5GHz 路由器，或改用数据线（约 27MB/s）。"
+            is11g ->
+                "判读：802.11g 链路（${linkSpeed}Mbps），理论 TCP 上限约 3MB/s，当前 %.2fMB/s 仍有空间"
+                    .format(mbps) + "——值得查是否有干扰/蓝牙共存，或改用 STA 模式走 5GHz。"
+            band == "5GHz" ->
+                "判读：已在 5GHz。若仍不到 5MB/s，瓶颈在相机自身的 Wi-Fi 实现或读卡，" +
+                    "App 侧已无优化余地（socket 缓冲区 4MB、TCP_NODELAY 均已开启）。"
+            else ->
+                "判读：频段未知（freq=$freq），无法判断上限；请把本行结果发给开发者。"
+        }
+        return out
+    }
+
+    /**
      * 高速下载探针：0x9400~0x9406 逐个尝试多种参数形态，
      * 记录响应码/数据量，用于定位新一代高速读取操作。
      */

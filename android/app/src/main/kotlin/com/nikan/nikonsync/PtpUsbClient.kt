@@ -272,6 +272,10 @@ class PtpUsbClient(
 
     /** 单次事务（无恢复）：发命令 → [数据外发] → 收 DATA/事件/RESPONSE。 */
     private fun transactInner(op: Int, params: LongArray, dataOut: ByteArray? = null): PtpSession.TransactResult {
+        // 取消下载会中断数据相位、留下未读完的字节。此时绝不能复用连接：
+        // 残留的 DATA 容器会被下一笔事务当成自己的数据读走（并按载荷长度分配内存）。
+        // 抛 IOException 让调用方的恢复路径重建连接。
+        if (needsReopen) throw IOException("取消下载后连接已作废，需重建后再操作")
         val c = conn ?: throw IOException("USB 连接未建立")
         val ein = epIn ?: throw IOException("USB 连接未建立")
         val eout = epOut ?: throw IOException("USB 连接未建立")
@@ -428,10 +432,18 @@ class PtpUsbClient(
         onProgress: (received: Long, total: Long) -> Unit,
     ): Long {
         requireValidSize(size)
+        cancelRequested = false // 上一次的取消不能影响这一次
         synchronized(txnLock) {
             var written = 0L
             try {
                 written = downloadOnce(handle, size, out, onProgress)
+            } catch (e: CancelledException) {
+                // 取消发生在数据相位中途：流里还留着相机没发完的字节，无法安全复用——
+                // 下一笔事务会把残留的 DATA 容器当成自己的数据读（甚至尝试按 GB 分配）。
+                // 因此把连接标为待重建，由下一次事务走 reopenAfterEnumeration 自愈。
+                needsReopen = true
+                log("下载已取消：连接作废，下次操作时自动重建")
+                throw e
             } catch (e: PtpException) {
                 throw e // 相机明确拒绝（句柄无效等），重传无意义
             } catch (e: IOException) {
@@ -451,6 +463,16 @@ class PtpUsbClient(
         }
     }
 
+    @Volatile private var cancelRequested = false
+
+    /** 取消下载后连接已不可用，下一笔事务必须先重建（见 [reopenAfterEnumeration]）。 */
+    @Volatile private var needsReopen = false
+
+    override fun requestCancelDownload() {
+        cancelRequested = true
+        log("收到取消下载请求，将在当前读块结束时中止")
+    }
+
     /**
      * 断点续传：GetPartialObject(0x101B) 从 offset 分块拉到 size。
      * 续传阶段每笔事务的响应参数[0]声明了实际长度，与写入量不符即失败
@@ -468,6 +490,7 @@ class PtpUsbClient(
         val chunk = 4L shl 20 // 与 Wi-Fi 侧 PARTIAL_CHUNK_BYTES 同尺寸
         var pos = offset
         while (pos < size) {
+            if (cancelRequested) throw CancelledException("已收到取消请求（续传至 ${pos / 1048576}MB）")
             val want = minOf(chunk, size - pos)
             val res = transactInner(Ptp.OP_GET_PARTIAL_OBJECT, longArrayOf(handle, pos, want))
             if (res.data.isEmpty()) throw IOException("续传第 $pos 字节处相机未返回数据")
@@ -513,6 +536,9 @@ class PtpUsbClient(
             if (h.type != CT_DATA) throw IOException("USB 收到未知容器类型 ${h.type}")
             var left = h.payloadLen
             while (left > 0) {
+                // 取消检查放在读块边界：一个读块（最多 STREAM_CHUNK）在 USB 下远小于 1 秒，
+                // 用户点取消不会等整个文件传完（曾出现"取消 4GB 视频要等 150 秒"）
+                if (cancelRequested) throw CancelledException("已收到取消请求（已收 ${total / 1048576}MB）")
                 val want = minOf(buf.size.toLong(), left).toInt()
                 readFully(c, ein, buf, want)
                 out.write(buf, 0, want)
@@ -581,6 +607,8 @@ class PtpUsbClient(
         epInt = findInterrupt(ptp)
         inLeftover = ByteArray(0)
         evtLeftover = ByteArray(0)
+        // 连接已干净重建，取消留下的作废标记随之解除
+        needsReopen = false
         log("USB 设备已重枚举并重新打开成功（${dev.deviceName}）")
         return true
     }

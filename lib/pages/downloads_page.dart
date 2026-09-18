@@ -63,10 +63,24 @@ class _DownloadsPageState extends State<DownloadsPage> {
   }
 
   void _onModelChanged() {
-    _entriesCache = null;
+    // 只有记录**内容**变了才重算：`records.all` 每次调用都会重新排序，
+    // 而模型通知是 150ms 节流的——索引/下载期间等于每 150ms 排一次全部记录。
+    final rev = model.gateway.records.revision;
+    if (rev != _recordsRevision) {
+      _recordsRevision = rev;
+      _entriesCache = null;
+      // 顺带回收已消失条目的 GlobalKey 与缩略图：两者都只增不减，
+      // 删除记录后旧对象仍被 map 持有（虽未挂载，白白占着内存）。
+      // 用 _entries 复用刚失效的缓存，不再多排一次序。
+      final alive = _entries.map((e) => e.key).toSet();
+      _cellKeys.removeWhere((k, _) => !alive.contains(k));
+      _thumbs.removeWhere((k, _) => !alive.contains(k));
+    }
     if (_sel.selected.isEmpty) return;
     _sel.prune(_entries.map((e) => e.key).toSet());
   }
+
+  int _recordsRevision = -1;
 
   /// 按日期分组（时间倒序天然成组）
   List<MapEntry<String, List<RecEntry>>> get _sections {

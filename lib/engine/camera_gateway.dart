@@ -186,7 +186,10 @@ class CameraGateway {
   }) async {
     final summary = DownloadSummary(total: picks.length);
     for (final f in picks) {
-      if (isCancelled?.call() ?? false) break;
+      if (isCancelled?.call() ?? false) {
+        summary.cancelled = true;
+        break;
+      }
       // 详情缺失时先补（多 RAW+JPEG 同拍时名字已知的 JPEG 优先已覆盖大多数场景）
       if (!f.infoLoaded) {
         try {
@@ -228,6 +231,12 @@ class CameraGateway {
         summary.downloaded++;
         summary.bytes += size;
       } catch (e) {
+        // 用户取消不是"失败"：两者对用户的含义完全不同——失败要重试/排查，
+        // 取消是预期结果。而且取消要**整批停下**，不能继续传下一张。
+        if (isCancelledError(e)) {
+          summary.cancelled = true;
+          break;
+        }
         onFileSkipped?.call(f, '下载失败：$e');
         summary.failed++;
       }
@@ -245,8 +254,27 @@ class DownloadSummary {
   int failed = 0;
   int deleted = 0;
   int bytes = 0;
+
+  /// 用户中途取消。取消不计入 [failed]，也不该被当成"全部完成"。
+  bool cancelled = false;
+
   int get done => downloaded + skipped + failed;
-  bool get allOk => failed == 0;
+
+  /// 因取消而未处理的张数（用于"剩余 N 张未传"这类可行动的说法）。
+  int get remaining => total - done;
+
+  bool get allOk => failed == 0 && !cancelled;
+}
+
+/// 判断一个异常是否代表"用户取消下载"。
+///
+/// 原生侧在分块边界检查取消标志并抛 `CancelledException`（消息含"已取消"），
+/// 经 MethodChannel 传到 Dart 时被包成 `PlatformException`，因此只能按消息识别。
+/// 抽成顶层函数是为了可单测——把它和"真实失败"混淆会让取消被计入失败数，
+/// 也会让 `download` 的降级重试把"取消"变成"换个模式再传一遍"。
+bool isCancelledError(Object e) {
+  final s = e.toString();
+  return s.contains('已取消') || s.contains('CancelledException');
 }
 
 class _Job {

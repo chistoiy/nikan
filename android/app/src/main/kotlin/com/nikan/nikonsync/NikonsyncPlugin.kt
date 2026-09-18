@@ -1,8 +1,13 @@
 package com.nikan.nikonsync
 
+import android.Manifest
 import android.app.Activity
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
+import android.hardware.usb.UsbDevice
+import android.hardware.usb.UsbManager
+import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
@@ -31,9 +36,52 @@ object NikonsyncPlugin {
     private var pendingFolderResult: MethodChannel.Result? = null
 
     private const val REQ_PICK_FOLDER = 4201
+    private const val REQ_POST_NOTIFICATIONS = 4202
 
     private fun prefs(context: Context) =
         context.getSharedPreferences("nikonsync", Context.MODE_PRIVATE)
+
+    /** 最近一次 USB 接入的设备名。事件可能在事件通道建立之前就发出并丢失，故同时留一份供查询。 */
+    @Volatile private var lastUsbAttachName: String? = null
+
+    /**
+     * 处理"插入 USB 相机把应用拉起"的 Intent。
+     *
+     * Manifest 里声明了 `USB_DEVICE_ATTACHED` 的 intent-filter（配合 device_filter.xml 的
+     * VID=0x1200），所以插上线系统会把本应用拉起来——但此前**没有任何代码处理这个 Intent**，
+     * 用户看到的是"插上相机、App 自己开了、然后什么都不做"，很容易以为坏了。
+     *
+     * 这里把它变成一条事件：连接页据此自动切到 USB 模式并给出提示。
+     */
+    fun onUsbAttachIntent(intent: Intent?) {
+        if (intent == null || intent.action != UsbManager.ACTION_USB_DEVICE_ATTACHED) return
+        @Suppress("DEPRECATION")
+        val dev = intent.getParcelableExtra(UsbManager.EXTRA_DEVICE) as? UsbDevice
+        val label = dev?.productName ?: "USB 相机"
+        lastUsbAttachName = label
+        Log.d("NikonSync", "USB 设备接入：$label（VID=${dev?.vendorId} PID=${dev?.productId}）")
+        CameraEngine.emitRaw(mapOf("type" to "usbAttached", "name" to label))
+    }
+
+    /**
+     * 申请通知权限（仅 Android 13+ 需要，POST_NOTIFICATIONS 是 API 33 引入的）。
+     *
+     * 必须由主线程调用：平台通道的轻量分支本来就在主线程，所以直接放在那里。
+     * 返回 true = 已有权限或不需要；false = 已弹出系统授权框，结果由用户决定。
+     */
+    private fun requestNotificationPermission(): Boolean {
+        val act = activity ?: return true
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return true
+        if (act.checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) ==
+            PackageManager.PERMISSION_GRANTED
+        ) {
+            return true
+        }
+        return runCatching {
+            act.requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), REQ_POST_NOTIFICATIONS)
+            false
+        }.getOrDefault(true) // 申请动作本身失败就当作"不需要"，不让上层因此报错
+    }
 
     fun register(messenger: BinaryMessenger, context: Context, engine: FlutterEngine, activity: Activity?) {
         CameraEngine.init(context)
@@ -96,6 +144,21 @@ object NikonsyncPlugin {
         when (call.method) {
             // 轻量方法直接在主线程执行
             "wifiInfo" -> result.success(CameraEngine.wifiInfo())
+            // 取消必须**直通主线程**、不能进下面的工作线程池：池里的任务会排在正在跑的
+            // 那笔下载后面，等排到它时文件早传完了，等于没取消。取消的价值全在"立刻"。
+            // 只设置一个 volatile 标志，不阻塞，因此放主线程也是安全的。
+            "cancelDownload" -> result.success(CameraEngine.cancelDownload())
+            // 通知权限（Android 13+）。Manifest 里早就声明了，但代码从没运行时申请过——
+            // 结果是保活前台服务的通知在 13+ 上**完全不可见**，用户不知道后台在跑。
+            // 返回 true = 已有权限或不需要；false = 已弹出系统授权框，结果待定。
+            "requestNotificationPermission" -> result.success(requestNotificationPermission())
+            // 查询"是否有 USB 相机刚接入"：插入时系统拉起应用那一刻事件通道可能还没建立，
+            // 事件会丢，所以连接页初始化时主动查一次。
+            "lastUsbAttach" -> result.success(lastUsbAttachName)
+            "clearUsbAttach" -> {
+                lastUsbAttachName = null
+                result.success(true)
+            }
             // 应用版本：读实际安装的包信息（AGP 8 起 BuildConfig 默认不生成，
             // 且这样拿到的是真正生效的版本，不会与 pubspec 失同步）
             "appVersion" -> {
@@ -238,6 +301,12 @@ object NikonsyncPlugin {
                         "probeHiSpeed" -> {
                             val args = call.arguments as Map<*, *>
                             CameraEngine.probeHiSpeed((args["handle"] as Number).toLong())
+                        }
+                        // 无线链路基准测速：会把整个文件真传一遍（耗时同一次下载），
+                        // 所以要留在工作线程；数据丢弃、不落盘。
+                        "probeLinkThroughput" -> {
+                            val args = call.arguments as Map<*, *>
+                            CameraEngine.probeLinkThroughput((args["handle"] as Number).toLong())
                         }
                         "probeResize" -> {
                             val args = call.arguments as Map<*, *>

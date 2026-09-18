@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  通知栏小图标（保活前台服务用）。
+  规范要求 API 21+ 的通知小图标是**单色剪影**：系统只取 alpha 通道并整体着色，
+  所以这里只用白色填充、不放彩色与渐变。
+  图形与应用图标同源：外圈 = 镜头筒，中心点 = 对焦点。
+  之前这里用的是 android.R.drawable.stat_sys_data_bluetooth（蓝牙图标），语义完全不符。
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:fillType="evenOdd"
+        android:pathData="M12,3a9,9 0 1,0 0,18a9,9 0 1,0 0,-18zM12,5.6a6.4,6.4 0 1,1 0,12.8a6.4,6.4 0 1,1 0,-12.8z" />
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M12,9.4a2.6,2.6 0 1,0 0,5.2a2.6,2.6 0 1,0 0,-5.2z" />
+</vector>

@@ -21,16 +21,14 @@ class SettingsStore {
   /// "看完再回相册点一次下载"的重复传输（同一张图只传一遍）。
   bool viewerSaveOriginal = false;
 
-  /// 取景点击对焦的坐标缩放系数。
+  /// 取景点击对焦的坐标缩放系数（**人工兜底值**）。
   ///
-  /// `ChangeAfArea(0x9205)` 的 x/y 用哪个坐标空间没有文档（libgphoto2 只写了
-  /// "2 参数 x, y"）。**2026-09-15 真机实测结论：相机空间 = 取景帧的 4 倍**
-  /// （640×424 帧 ↔ 2560×1696），原点在左上、等比。
-  /// 判据：×4 时点击位置与相机上的对焦框一致；×16 时对焦点被顶到右下角
-  /// （说明坐标超范围被截断）。相机不提供任何"AF 坐标空间尺寸"属性
-  /// （0xD0xx 探针全"不支持"），所以只能实测确定，无法自动推算。
+  /// 正常路径不靠它：`ChangeAfArea(0x9205)` 的坐标空间可以从**取景帧头部**里读出来
+  /// （`off12/14` 相机图像尺寸 ÷ `off8/10` 取景帧尺寸，x/y 各算一次 —— 见
+  /// `CameraEngine.afScaleFromHeader`），遥控页首帧后自动采用，本值只在解析失败
+  /// 或用户手工覆盖时生效。
   ///
-  /// 键名 V3：V2 存的是"×16"这个错误结论，不能沿用。
+  /// 留这个兜底是因为头部解析在个别机型/固件上可能失败，那时还得能手动调。
   double afAreaScale = 4.0;
 
   /// RAW+JPEG 成对时，勾选一个是否自动带上配对的另一个（默认开）。
@@ -38,6 +36,26 @@ class SettingsStore {
   /// 现场挑片最常见的是"要这张"——JPEG 与 RAW 都是这张照片，分开勾两次没有必要；
   /// 但只想收 JPEG 的人也不少，所以做成开关（关掉后各选各的）。
   bool linkRawJpegPairs = true;
+
+  /// 设置结构版本。
+  ///
+  /// **改动任何设置键的名字或语义时必须 +1，并在 [_migrate] 里补一条迁移，不要再给键名加后缀。**
+  /// 之前就是靠加后缀演进的（`afAreaScale` → `afAreaScaleV2` → `afAreaScaleV3`），结果是同一份
+  /// JSON 里躺着三个同名不同后缀的键，除了作者没人知道哪个生效——而"读哪个"这件事只写在代码注释里。
+  static const int schemaVersion = 1;
+
+  /// 把旧版设置就地迁移到当前 [schemaVersion]。
+  ///
+  /// v0 → v1：对焦倍数键名去后缀（`afAreaScaleV3` → `afAreaScale`），
+  /// 并删掉历史遗留、已不再读取的 `afAreaScale`（×1 时代取值）与 `afAreaScaleV2`（×16 的错误结论）。
+  static void _migrate(Map<dynamic, dynamic> raw, int from) {
+    if (from >= 1) return;
+    final v3 = raw['afAreaScaleV3'];
+    raw.remove('afAreaScale');
+    raw.remove('afAreaScaleV2');
+    raw.remove('afAreaScaleV3');
+    if (v3 != null) raw['afAreaScale'] = v3;
+  }
 
   File? _file;
   bool _loaded = false;
@@ -54,14 +72,14 @@ class SettingsStore {
       if (f.existsSync()) {
         final raw = jsonDecode(f.readAsStringSync());
         if (raw is Map) {
+          // 先迁移再读：老 JSON 里可能同时存在多个历史键名
+          _migrate(raw, (raw['schemaVersion'] as num?)?.toInt() ?? 0);
           downloadVariant = raw['downloadVariant'] as String? ?? downloadVariant;
           deleteAfterDownload = raw['deleteAfterDownload'] as bool? ?? deleteAfterDownload;
           sortMode = raw['sortMode'] as String? ?? sortMode;
           viewerQuality = raw['viewerQuality'] as String? ?? viewerQuality;
           viewerSaveOriginal = raw['viewerSaveOriginal'] as bool? ?? viewerSaveOriginal;
-          // 旧键（afAreaScale ×1 时代 / afAreaScaleV2 ×16 结论）都不读：
-          // 实测结论是 ×4，沿用旧值会把人卡在错倍数上
-          afAreaScale = (raw['afAreaScaleV3'] as num?)?.toDouble() ?? afAreaScale;
+          afAreaScale = (raw['afAreaScale'] as num?)?.toDouble() ?? afAreaScale;
           linkRawJpegPairs = raw['linkRawJpegPairs'] as bool? ?? linkRawJpegPairs;
         }
       }
@@ -76,12 +94,13 @@ class SettingsStore {
       _file = f;
       await f.writeAsString(
         jsonEncode({
+          'schemaVersion': schemaVersion,
           'downloadVariant': downloadVariant,
           'deleteAfterDownload': deleteAfterDownload,
           'sortMode': sortMode,
           'viewerQuality': viewerQuality,
           'viewerSaveOriginal': viewerSaveOriginal,
-          'afAreaScaleV3': afAreaScale,
+          'afAreaScale': afAreaScale,
           'linkRawJpegPairs': linkRawJpegPairs,
         }),
         flush: true,

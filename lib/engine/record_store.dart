@@ -55,6 +55,15 @@ class RecordStore extends ChangeNotifier {
 
   bool get loaded => _loaded;
 
+  /// 内容版本号，每次变更自增。供上层判断"缓存是否要重算"：
+  /// 单看 [length] 发现不了**同长度下的替换**（例如 [updateUri] 给旧记录补 uri）。
+  int revision = 0;
+
+  void _changed() {
+    revision++;
+    notifyListeners();
+  }
+
   List<RecEntry> get all {
     final list = _entries.values.toList()
       ..sort((a, b) => b.time.compareTo(a.time));
@@ -70,13 +79,13 @@ class RecordStore extends ChangeNotifier {
 
   void add(RecEntry e) {
     _entries[e.key] = e;
-    notifyListeners();
+    _changed();
     _scheduleSave();
   }
 
   void removeKey(String key) {
     if (_entries.remove(key) == null) return;
-    notifyListeners();
+    _changed();
     _scheduleSave();
   }
 
@@ -87,14 +96,14 @@ class RecordStore extends ChangeNotifier {
     _entries[key] = RecEntry(
       name: e.name, size: e.size, variant: e.variant, uri: uri, path: e.path, time: e.time,
     );
-    notifyListeners();
+    _changed();
     _scheduleSave();
   }
 
   void clear() {
     if (_entries.isEmpty) return;
     _entries.clear();
-    notifyListeners();
+    _changed();
     _scheduleSave();
   }
 
@@ -134,7 +143,7 @@ class RecordStore extends ChangeNotifier {
     } catch (_) {
       _entries.clear();
     }
-    notifyListeners();
+    _changed();
   }
 
   Future<void> _scheduleSave() async {

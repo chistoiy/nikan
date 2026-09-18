@@ -4,6 +4,14 @@ import java.io.IOException
 import java.io.OutputStream
 
 /**
+ * 用户主动取消下载。
+ *
+ * 必须与传输故障区分开：调用方**不应重试**，而应删除半成品文件并把结果报告为
+ * "已取消"而不是"失败"（两者对用户的含义完全不同）。
+ */
+class CancelledException(message: String = "下载已取消") : IOException(message)
+
+/**
  * PTP 会话的传输层抽象。上层逻辑（枚举/下载/遥控/保活）只依赖此接口，
  * Wi-Fi（PtpIpClient）与 USB（PtpUsbClient）各实现一份——
  * 即 USB连接方案.md §3 U2 的"PtpSession 接口"落地。
@@ -73,6 +81,15 @@ interface PtpSession {
 
     /** Wi-Fi 分块下载失败时降级整文件重试；实现无需降级时保持空实现。 */
     fun degradeToFullDownload() {}
+
+    /**
+     * 请求取消正在进行的下载。
+     *
+     * 取消**必须**由传输层自己完成：`getObjectToStream` 是一次阻塞调用，Dart 侧的
+     * 取消标志传不进循环内部——历史上"点了取消，4GB 视频仍要传完"就是这个原因。
+     * 实现应在**分块/读块边界**检查该标志并抛 [CancelledException]。
+     */
+    fun requestCancelDownload() {}
 
     /** 立即判死（保活探针失败等）；实现必须触发一次 disconnectHandler，重复调用应被忽略。 */
     fun notifyLinkDead(reason: String)

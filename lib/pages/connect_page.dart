@@ -24,6 +24,14 @@ class _ConnectPageState extends State<ConnectPage> {
   void initState() {
     super.initState();
     model.refreshWifi();
+    // 插入相机时系统会把本应用拉起（Manifest 声明了 USB_DEVICE_ATTACHED），
+    // 但那一刻事件通道可能还没建立、事件会丢，所以这里主动补查一次；
+    // 查到就把模式切到 USB，用户不必自己去点。
+    WidgetsBinding.instance.addPostFrameCallback((_) async {
+      await model.pollUsbAttach();
+      if (!mounted || model.usbAttachNotice == null) return;
+      setState(() => _connMode = 'usb');
+    });
   }
 
   void _snack(String msg) {
@@ -271,6 +279,40 @@ class _ConnectPageState extends State<ConnectPage> {
         // ① 先选方式（默认 Wi-Fi，与用户实际使用方式一致）
         _modeSwitch(),
         const SizedBox(height: 14),
+
+        // ①b 检测到 USB 接入：把它说清楚，否则用户看到的是"插上线、App 自己开了、
+        //    然后什么都不做"（这正是之前 Manifest 声明了却无人处理的后果）
+        if (model.usbAttachNotice != null) ...[
+          Container(
+            padding: const EdgeInsets.fromLTRB(14, 10, 6, 10),
+            decoration: BoxDecoration(
+              color: const Color(0xFF161616),
+              borderRadius: BorderRadius.circular(14),
+              border: Border.all(color: const Color(0xFFFFE100).withValues(alpha: 0.45)),
+            ),
+            child: Row(
+              children: [
+                const Icon(Icons.usb, size: 18, color: Color(0xFFFFE100)),
+                const SizedBox(width: 10),
+                Expanded(
+                  child: Text(
+                    '检测到 ${model.usbAttachNotice} 已通过 USB 接入，点下面的按钮连接',
+                    style: const TextStyle(fontSize: 12.5, height: 1.4),
+                  ),
+                ),
+                IconButton(
+                  icon: const Icon(Icons.close, size: 18),
+                  tooltip: '不再提示',
+                  onPressed: () async {
+                    await model.dismissUsbAttach();
+                    if (mounted) setState(() {});
+                  },
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(height: 12),
+        ],
 
         // ② 主按钮紧接着出现：不滚动就能点到
         FilledButton(

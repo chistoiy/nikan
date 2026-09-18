@@ -52,8 +52,31 @@ class HomeShell extends StatefulWidget {
   State<HomeShell> createState() => _HomeShellState();
 }
 
-class _HomeShellState extends State<HomeShell> {
+class _HomeShellState extends State<HomeShell> with WidgetsBindingObserver {
   int _tab = 0;
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    super.dispose();
+  }
+
+  /// 系统内存压力：把缩略图内存缓存（最多 400 张）丢掉，只留磁盘那份。
+  ///
+  /// 这个回调一直没人实现，而 `ThumbCache.clearMemory()` 也一直没有调用点——
+  /// 相册翻得越多、内存里攒的缩略图越多，正好是低内存时最该释放的东西。
+  /// 丢掉后网格会按需从磁盘重新读，肉眼基本无感。
+  @override
+  void didHaveMemoryPressure() {
+    appModel.gateway.thumbCache.clearMemory();
+    AppLog.add('系统内存压力：已释放缩略图内存缓存');
+  }
 
   @override
   Widget build(BuildContext context) {

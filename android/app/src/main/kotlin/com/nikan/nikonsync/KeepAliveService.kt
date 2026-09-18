@@ -37,7 +37,8 @@ class KeepAliveService : Service() {
         val notification: Notification = Notification.Builder(this, CHANNEL_ID)
             .setContentTitle("尼康速传")
             .setContentText("与相机保持连接中")
-            .setSmallIcon(android.R.drawable.stat_sys_data_bluetooth)
+            // 自绘的单色剪影图标（镜头筒 + 对焦点）。原先用系统蓝牙图标，语义不符。
+            .setSmallIcon(R.drawable.ic_stat_nikonsync)
             .setContentIntent(pi)
             .setOngoing(true)
             .build()

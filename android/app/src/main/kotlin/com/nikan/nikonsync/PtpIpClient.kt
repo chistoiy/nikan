@@ -205,10 +205,21 @@ class PtpIpClient(
         }
         deviceInfo = PtpDatasets.parseDeviceInfo(transact(Ptp.OP_GET_DEVICE_INFO).data)
         log("设备信息：$deviceInfo")
-        // 连上时报一次链路信号：UI 的信号格若与这行不符，一眼能看出取数有问题
+        // 连上时报一次链路信号：UI 的信号格若与这行不符，一眼能看出取数有问题。
+        // 频段必须一起报：54Mbps 就是 802.11g 的满速（TCP 上限约 3MB/s），
+        // 而 5GHz 下同样的"格数与 dBm"含义完全不同——不写频段就无法判断有没有提速空间。
         runCatching {
             val w = CameraEngine.wifiInfo()
-            log("链路信号：${w["signalLevel"]}/4 格（${w["rssi"]} dBm）· 速率 ${w["linkSpeed"]} Mbps")
+            val freq = (w["frequency"] as? Number)?.toInt() ?: 0
+            val band = when {
+                freq in 2400..2500 -> "2.4GHz"
+                freq >= 4900 -> "5GHz"
+                else -> "频段未知"
+            }
+            log(
+                "链路信号：${w["signalLevel"]}/4 格（${w["rssi"]} dBm）· " +
+                    "速率 ${w["linkSpeed"]} Mbps · $band",
+            )
         }
     }
 
@@ -342,6 +353,7 @@ class PtpIpClient(
     ): Long {
         if (size <= 0) throw IOException("对象大小无效（$size），拒绝下载以免生成空文件")
         lastProgressNotified = 0L
+        cancelRequested = false // 上一次的取消不能影响这一次
         val written = when (resolveDlMode(handle, size)) {
             DlMode.HISPEED -> downloadChunked(size, out, onProgress) { off, want ->
                 writeChunk(out, hiSpeedOp, handle, off, want, off, size, onProgress)
@@ -426,6 +438,9 @@ class PtpIpClient(
     ): Long {
         var offset = 0L
         while (offset < size) {
+            // 分块边界是唯一能安全取消的位置：每块都是一笔完整事务，此时流里没有
+            // 未读完的数据相位，中断不会污染连接（这与 USB 的整文件流式不同）。
+            if (cancelRequested) throw CancelledException("已收到取消请求（已下载 ${offset / 1048576}MB）")
             val want = minOf(PARTIAL_CHUNK_BYTES, size - offset)
             val read = chunk(offset, want)
             if (read <= 0L) throw IOException("分块读取提前结束（offset=$offset/$size）")
@@ -434,6 +449,13 @@ class PtpIpClient(
             onProgress(offset, size)
         }
         return offset
+    }
+
+    @Volatile private var cancelRequested = false
+
+    override fun requestCancelDownload() {
+        cancelRequested = true
+        log("收到取消下载请求，将在当前分块结束时中止")
     }
 
     /**

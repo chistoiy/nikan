@@ -84,6 +84,14 @@ class _DebugPanelState extends State<DebugPanel> {
       run: NikonEngine.probeHiSpeed,
     ),
     _Probe(
+      label: '无线测速',
+      detail: '把选中的文件真传一遍（数据丢弃、不落盘），报告平均吞吐 + 频段 + 协商速率，'
+          '并判读"还有没有提速空间"。挑一张 10~30MB 的照片跑，'
+          '在「相机 AP 模式」与「相机 STA 模式（接入 5GHz 路由器）」各跑一次即可对比。',
+      needsFiles: true,
+      run: NikonEngine.probeLinkThroughput,
+    ),
+    _Probe(
       label: '试验:相机缩放',
       detail: '相机端缩放探针 0x9207',
       needsFiles: true,

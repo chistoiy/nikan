@@ -124,12 +124,50 @@ class _GalleryPageState extends State<GalleryPage> {
     super.dispose();
   }
 
-  /// 模型变化时丢弃筛选缓存，并剔除已不在列表里的选择
+  Object? _filterFp;
+
+  /// 模型变化时按**指纹**决定要不要丢弃筛选缓存，并剔除已不在列表里的选择。
+  ///
+  /// 之前是无条件 `_filteredCache = null`：而 `AppModel._notifyThrottled` 只有 150ms 节流，
+  /// 索引期间每补全一个文件、下载期间每 300ms 报一次进度都会通知——对 5000 张的卡，
+  /// 等于每 150ms 重排一次 5000 项，并连带重建整个网格（明显的掉帧来源）。
+  ///
+  /// 指纹**必须**带上 `indexedCount`：文件详情是逐个补全的，而筛选依赖 `kind`、
+  /// 排序依赖 `name`/`dateRaw`——只比列表长度会漏掉"又一个文件的详情到了"，
+  /// 结果就是筛选与排序结果停在旧状态（与刚修掉的 `files.length % 16` 是同一类错误）。
   void _onModelChanged() {
-    _filteredCache = null;
+    final fp = _filterFingerprint();
+    if (fp != _filterFp) {
+      _filterFp = fp;
+      _filteredCache = null;
+    }
+    final identity = identityHashCode(model.files);
+    if (identity != _lastFilesIdentity) {
+      // 重新枚举（换卡/刷新/断开重连）后回收旧键：`_cellKeys` 只增不减，
+      // 换卡后上一张卡的句柄与 GlobalKey 仍被 map 持有
+      _lastFilesIdentity = identity;
+      final alive = model.files.map((f) => f.handle).toSet();
+      _cellKeys.removeWhere((h, _) => !alive.contains(h));
+    }
     if (_sel.selected.isEmpty) return;
     _sel.prune(model.files.map((f) => f.handle).toSet());
   }
+
+  int? _lastFilesIdentity;
+
+  Object _filterFingerprint() => Object.hash(
+        identityHashCode(model.files),
+        model.files.length,
+        model.indexedCount,
+        model.sortMode,
+        _kind,
+        _folder,
+        _undownloadedOnly,
+        _pairedOnly,
+        // 只有"只看未下载"依赖去重记录，其余筛选下记录变化不影响结果集。
+        // 用 revision 而不是 length：同长度下的替换（补 uri）也必须让缓存失效。
+        _undownloadedOnly ? model.gateway.records.revision : 0,
+      );
 
   // ------------------------------------------------------------ 筛选与排序
 
@@ -424,7 +462,7 @@ class _GalleryPageState extends State<GalleryPage> {
         fileFrac: model.dlFileFrac,
         speedMBps: model.dlSpeed,
         currentName: model.dlCurrentName,
-        onCancel: () => model.cancelRequested = true,
+        onCancel: () => model.cancelDownload(),
       );
     }
     if (model.hasNewPhotos) {

@@ -89,6 +89,49 @@ class NikonEngine {
 
   static Future<void> deleteObject(int handle) => _m.invokeMethod('deleteObject', {'handle': handle});
 
+  /// 请求取消当前下载。
+  ///
+  /// 真正的中断发生在**原生分块边界**：`getObjectToStream` 是一次阻塞调用，Dart 侧的
+  /// 取消回调传不进它的循环内部，所以必须让 Kotlin 侧自己去中断（见
+  /// `CameraEngine.cancelDownload`）。这里只负责把请求送过去，立即返回。
+  static Future<bool> cancelDownload() async {
+    final r = await _m.invokeMethod('cancelDownload');
+    return r == true;
+  }
+
+  /// 申请通知权限（仅 Android 13+ 需要）。
+  ///
+  /// Manifest 里一直声明着 POST_NOTIFICATIONS，但代码从没运行时申请过，
+  /// 于是保活前台服务的通知在 13+ 上完全不可见——用户不知道后台在跑，
+  /// "下载进度通知栏"这类依赖它的功能也无从谈起。
+  /// 返回 true = 已有权限或系统不需要；false = 已弹出授权框，结果待用户决定。
+  static Future<bool> requestNotificationPermission() async {
+    final r = await _m.invokeMethod('requestNotificationPermission');
+    return r == true;
+  }
+
+  /// 无线链路基准测速（只读）：把指定文件真传一遍但丢弃数据，报告
+  /// 平均吞吐、最慢区间、当前频段（2.4/5GHz）与协商速率，并给出"还有没有空间"的判读。
+  ///
+  /// 用途：同一张卡文件在「相机 AP 模式」与「相机 STA 模式（接入 5GHz 路由器）」各跑一次，
+  /// 就能判断瓶颈在 2.4GHz 频段、还是在相机自身的实现上。耗时与一次真实下载相同。
+  static Future<List<String>> probeLinkThroughput(int handle) async {
+    final r = await _m.invokeMethod('probeLinkThroughput', {'handle': handle});
+    return List<String>.from(r as List);
+  }
+
+  /// 最近一次通过 USB 接入的相机名（无则 null）。
+  ///
+  /// 插入相机会把应用拉起来，但那一刻事件通道可能还没建好、事件会丢，
+  /// 所以连接页初始化时主动查一次而不是只等事件。
+  static Future<String?> lastUsbAttach() async {
+    final r = await _m.invokeMethod('lastUsbAttach');
+    return r as String?;
+  }
+
+  /// 清掉"已提示过 USB 接入"的标记。
+  static Future<void> clearUsbAttach() => _m.invokeMethod('clearUsbAttach');
+
   static Future<void> protectObject(int handle, {bool protect = true}) =>
       _m.invokeMethod('protectObject', {'handle': handle, 'protection': protect ? 1 : 0});
 

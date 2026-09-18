@@ -5,6 +5,7 @@ import android.content.Context
 import android.content.Intent
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.graphics.ImageDecoder
 import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
@@ -27,6 +28,7 @@ import java.util.Collections
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import javax.net.SocketFactory
+import kotlin.math.roundToInt
 
 /**
  * 相机引擎：单例。管理 PTP/IP 连接生命周期、Wi-Fi 网络绑定、
@@ -53,6 +55,21 @@ object CameraEngine {
     private val keepAliveExecutor = Executors.newSingleThreadExecutor()
     private val keepAliveHandler = Handler(Looper.getMainLooper())
     private var keepAliveRunning = false
+
+    /**
+     * 是否有下载正在进行。
+     *
+     * 下载期间 PTP 通道被数据相位独占（USB 的 GetObject 要持有事务锁直到整文件读完），
+     * 保活探针发不出去、也没法及时拿到结果——排在后面的探针会在下载结束后一次性补发，
+     * 而这期间真正的断线反而没人发现。所以下载期间改用"最近是否还有进度"做活性判据。
+     */
+    @Volatile private var downloadInFlight = false
+
+    /** 最近一次链路上确实发生 I/O 的时刻（下载进度即心跳）。 */
+    @Volatile private var lastIoAt = 0L
+
+    /** 下载期间多久没有新数据就判为链路可疑。取 30s：正常下载至少每 1MB 报一次进度。 */
+    private const val DOWNLOAD_STALL_MS = 30_000L
 
     /**
      * 最近一次收到相机事件的时间。相机空闲时也在周期推 DevicePropChanged（实测 3~60s 一次），
@@ -93,6 +110,18 @@ object CameraEngine {
                             "probeOk" to probeOk,
                         ),
                     )
+                    // 下载进行中：不发探针（见 downloadInFlight 的说明），改看"最近还有没有进度"。
+                    // 进度停滞才是真问题——这比"探针排队后一次性补发"有信息量得多。
+                    if (downloadInFlight) {
+                        val idle = if (lastIoAt == 0L) 0L else SystemClock.elapsedRealtime() - lastIoAt
+                        if (idle > DOWNLOAD_STALL_MS) {
+                            probeOk = false
+                            c.notifyLinkDead("下载已 ${idle / 1000} 秒没有新数据，链路可能已断")
+                        } else {
+                            probeOk = true
+                        }
+                        return@execute
+                    }
                     if (lastEventAt != 0L && silent < EVENT_IDLE_MS) return@execute
                     val t0 = SystemClock.elapsedRealtime()
                     try {
@@ -152,6 +181,12 @@ object CameraEngine {
     private fun emit(map: Map<String, Any?>) {
         mainHandler.post { sink?.success(map) }
     }
+
+    /**
+     * 供插件层转发"非引擎来源"的事件（例如 USB 插入）。
+     * 与 [emit] 语义一致，只是把投递能力开放给同包的桥接层。
+     */
+    fun emitRaw(map: Map<String, Any?>) = emit(map)
 
     fun log(line: String) {
         Log.d(TAG, line)
@@ -867,6 +902,8 @@ object CameraEngine {
 
     private fun emitProgress(received: Long, total: Long, t0: Long) {
         val now = SystemClock.elapsedRealtime()
+        // 先记心跳再判断节流：节流只是少发几次事件，不能影响"链路上还有没有 I/O"的判断
+        lastIoAt = now
         if (now - lastProgressEmit < 300 && received < total) return
         lastProgressEmit = now
         val speed = if (now > t0) (received / 1048576.0) / ((now - t0) / 1000.0) else 0.0
@@ -890,29 +927,47 @@ object CameraEngine {
         return runCatching { Uri.parse(s) }.getOrNull()
     }
 
-    /** 手机端等比缩放 JPEG 到指定长边 */
+    /**
+     * 手机端等比缩放 JPEG 到指定长边。
+     *
+     * 用 `ImageDecoder`（API 28+，minSdk 29 下恒可用，不引入新依赖），一次解码同时解决
+     * 旧实现（BitmapFactory + createScaledBitmap）的两个问题：
+     *
+     * 1. **Orientation**：`ImageDecoder` 会自动应用 EXIF 方向。旧实现把缩放后的像素直接
+     *    `compress`，输出既不带 Orientation 标签、像素也没被摆正 —— 竖拍照片下成 8M/2M 档后
+     *    会被相册显示成横的，属于**静默的数据质量缺陷**（原图档不受影响，因为原样落盘）。
+     * 2. **内存峰值**：`setTargetSize` 直接按目标尺寸解码，不再需要先解出接近原图的位图
+     *    （Z50 II 的 5568×3712 解成 RGBA 约 82MB，且缩放前新旧位图会同时存在）。
+     */
     private fun resizeJpeg(src: File, longEdge: Int): ByteArray {
-        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-        BitmapFactory.decodeFile(src.absolutePath, bounds)
-        if (bounds.outWidth <= 0) throw IOException("JPEG 解码失败")
-        val maxDim = maxOf(bounds.outWidth, bounds.outHeight)
-        var sample = 1
-        while (maxDim / (sample * 2) >= longEdge) sample *= 2
-        val opts = BitmapFactory.Options().apply { inSampleSize = sample }
-        val srcBmp = BitmapFactory.decodeFile(src.absolutePath, opts) ?: throw IOException("JPEG 解码失败")
-        val scale = longEdge.toFloat() / maxOf(srcBmp.width, srcBmp.height)
-        val bmp = if (scale < 1f) {
-            Bitmap.createScaledBitmap(
-                srcBmp,
-                (srcBmp.width * scale).toInt().coerceAtLeast(1),
-                (srcBmp.height * scale).toInt().coerceAtLeast(1),
-                true,
-            )
-        } else srcBmp
+        val bmp = try {
+            ImageDecoder.decodeBitmap(ImageDecoder.createSource(src)) { decoder, info, _ ->
+                val w = info.size.width
+                val h = info.size.height
+                val maxDim = maxOf(w, h)
+                if (maxDim > 0 && maxDim > longEdge) {
+                    val scale = longEdge.toFloat() / maxDim
+                    decoder.setTargetSize(
+                        (w * scale).roundToInt().coerceAtLeast(1),
+                        (h * scale).roundToInt().coerceAtLeast(1),
+                    )
+                }
+                // 必须是软件位图：硬件位图的像素不能直接读，compress 前会被强制拷贝一份
+                decoder.allocator = ImageDecoder.ALLOCATOR_SOFTWARE
+                decoder.isMutableRequired = false
+            }
+        } catch (e: Exception) {
+            throw IOException("JPEG 缩放失败：${e.message}")
+        }
         val bos = java.io.ByteArrayOutputStream()
-        bmp.compress(Bitmap.CompressFormat.JPEG, 90, bos)
-        if (bmp !== srcBmp) bmp.recycle()
-        srcBmp.recycle()
+        try {
+            // 编码失败不能返回半截字节数组（否则会写出损坏的 JPEG）
+            if (!bmp.compress(Bitmap.CompressFormat.JPEG, 90, bos)) {
+                throw IOException("JPEG 编码失败")
+            }
+        } finally {
+            bmp.recycle()
+        }
         return bos.toByteArray()
     }
 
@@ -920,8 +975,27 @@ object CameraEngine {
      * 下载一个对象。画质：original 原图；2M/8M 仅对 JPEG 生效（手机端缩放）。
      * 保存位置：用户在设置里用 SAF 选过目录则写入该目录，否则写系统相册。
      * 分块模式失败时自动降级整文件下载并重试一次。
+     *
+     * 该方法只负责置/清"下载进行中"标记，实际逻辑在 [downloadInner]——
+     * 保活循环要靠这个标记决定"该不该发探针"（见 [downloadInFlight]）。
      */
     fun download(handle: Long, fileName: String, size: Long, variant: String = VARIANT_ORIGINAL): Map<String, Any?> {
+        downloadInFlight = true
+        lastIoAt = SystemClock.elapsedRealtime()
+        try {
+            return downloadInner(handle, fileName, size, variant)
+        } finally {
+            downloadInFlight = false
+            lastIoAt = 0L
+        }
+    }
+
+    private fun downloadInner(
+        handle: Long,
+        fileName: String,
+        size: Long,
+        variant: String = VARIANT_ORIGINAL,
+    ): Map<String, Any?> {
         val c = need()
         val ctx = appContext!!
         val isVideo = fileName.endsWith(".mov", true) || fileName.endsWith(".mp4", true) ||
@@ -1027,6 +1101,16 @@ object CameraEngine {
                     "path" to "$relPath/$fileName",
                     "variant" to variant,
                 )
+            } catch (e: CancelledException) {
+                // 用户取消：删掉半成品后原样上抛，**不走降级重试**——
+                // 若落到下面的通用分支，取消会变成"换个模式再传一遍"，与用户意图相反。
+                runCatching { tempFile?.delete() }
+                if (created != null) {
+                    if (isSafDoc) runCatching { DocumentsContract.deleteDocument(resolver, created) }
+                    else runCatching { resolver.delete(created, null, null) }
+                }
+                log("下载已取消：$fileName（半成品已删除）")
+                throw e
             } catch (e: Exception) {
                 runCatching { tempFile?.delete() }
                 if (created != null) {
@@ -1044,6 +1128,21 @@ object CameraEngine {
                 throw e
             }
         }
+    }
+
+    /**
+     * 请求取消当前下载。
+     *
+     * 中断发生在**传输层的分块/读块边界**（见 `PtpSession.requestCancelDownload`）：
+     * `getObjectToStream` 是一次阻塞调用，Dart 侧传进来的取消回调到不了循环内部，
+     * 所以取消标志必须设在 Kotlin 侧。返回 false 表示当前没有活动连接。
+     */
+    fun cancelDownload(): Boolean {
+        val c = client ?: return false
+        return runCatching {
+            c.requestCancelDownload()
+            true
+        }.getOrDefault(false)
     }
 
     // ------------------------------------------------------------ 相机文件管理
@@ -1883,6 +1982,9 @@ object CameraEngine {
     // 这里只留门面供 NikonsyncPlugin 调用；CameraProbes 需要的那几个成员已放宽为 internal。
 
     fun probeHiSpeed(handle: Long): List<String> = CameraProbes.probeHiSpeed(handle)
+
+    /** 无线链路基准测速（只读）：见 [CameraProbes.probeLinkThroughput] */
+    fun probeLinkThroughput(handle: Long): List<String> = CameraProbes.probeLinkThroughput(handle)
 
     fun probeResize(handle: Long): List<String> = CameraProbes.probeResize(handle)
 

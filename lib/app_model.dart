@@ -342,6 +342,42 @@ class AppModel extends ChangeNotifier {
 
   Future<void> openWifiSettings() => NikonEngine.openWifiSettings();
 
+  // ------------------------------------------------------------ USB 接入提示
+
+  /// 检测到的 USB 接入提示（连接页显示）。null = 无提示。
+  String? usbAttachNotice;
+
+  /// 主动查询原生侧记录的 USB 接入。
+  ///
+  /// 插入相机时系统会带着 USB_DEVICE_ATTACHED 拉起应用，但那一刻事件通道可能
+  /// **还没建立**，事件会丢——所以连接页初始化时补查一次，否则这个提示时灵时不灵。
+  Future<void> pollUsbAttach() async {
+    try {
+      final name = await NikonEngine.lastUsbAttach();
+      if (name != null && usbAttachNotice == null) {
+        usbAttachNotice = name;
+        notifyListeners();
+      }
+    } catch (_) {}
+  }
+
+  /// 用户已看到提示，清掉（原生侧一并清，避免每次进连接页都再提示一次）。
+  Future<void> dismissUsbAttach() async {
+    if (usbAttachNotice == null) return;
+    usbAttachNotice = null;
+    notifyListeners();
+    try {
+      await NikonEngine.clearUsbAttach();
+    } catch (_) {}
+  }
+
+  /// 申请通知权限（Android 13+ 需要）。失败不影响连接，只是没有保活通知。
+  Future<void> ensureNotificationPermission() async {
+    try {
+      await NikonEngine.requestNotificationPermission();
+    } catch (_) {}
+  }
+
   Future<void> scan() async {
     scanning = true;
     notifyListeners();
@@ -424,6 +460,9 @@ class AppModel extends ChangeNotifier {
     connState = 'connected';
     hasNewPhotos = false;
     _clearReconnect();
+    // 保活前台服务马上要起来：先在 Android 13+ 上把通知权限要到，
+    // 否则通知完全不可见，用户不知道后台在保活（Manifest 里的声明一直没人申请）。
+    unawaited(ensureNotificationPermission());
     notifyListeners();
     battery = await NikonEngine.battery();
     notifyListeners();
@@ -586,10 +625,20 @@ class AppModel extends ChangeNotifier {
     })
         .catchError((_) {})
         .whenComplete(() {
-      if (files.length % 16 == 0 || indexingDone) notifyListeners();
+      // 计数必须是"已补全详情的文件数"，**不能**用 `files.length`：那是列表总长度，
+      // 枚举完成就固定了，既不递增也不是进度。实测后果是两个极端——1500 张的卡上
+      // `1500 % 16 != 0` 恒为假（索引进度永远不刷新），1600 张时又每个文件都通知一次。
+      _indexedSinceNotify++;
+      if (_indexedSinceNotify >= 16 || indexingDone) {
+        _indexedSinceNotify = 0;
+        _notifyThrottled();
+      }
       _indexStep();
     });
   }
+
+  /// 距上次通知已补全详情的文件数（见 [_indexStep]）。
+  int _indexedSinceNotify = 0;
 
   // ------------------------------------------------------------ 下载
 
@@ -629,10 +678,29 @@ class AppModel extends ChangeNotifier {
     );
     downloading = false;
     dlFileFrac = 0;
-    dlResult = '已下载 ${summary.downloaded}，跳过 ${summary.skipped}，失败 ${summary.failed}'
-        '${deleteAfterDownload ? '，已删除相机原片 ${summary.deleted}' : ''}';
+    // 取消要单独说：把"已取消"混进"失败"会让用户以为出了故障，
+    // 而"剩余 N 张未传"才是他下一步该知道的事。
+    dlResult = summary.cancelled
+        ? '已取消（已下载 ${summary.downloaded}，剩余 ${summary.remaining} 张未传）'
+        : '已下载 ${summary.downloaded}，跳过 ${summary.skipped}，失败 ${summary.failed}'
+            '${deleteAfterDownload ? '，已删除相机原片 ${summary.deleted}' : ''}';
     notifyListeners();
     return dlResult!;
+  }
+
+  /// 取消当前下载。
+  ///
+  /// **两步缺一不可**：[cancelRequested] 只让 Dart 侧的批量循环在"下一张之前"停下，
+  /// 而正在传的那一张阻塞在原生 `getObjectToStream` 的循环里——那里的取消标志只能
+  /// 由 Kotlin 侧设置。此前只做了第一步，所以"点取消"对 4GB 视频要等它传完才生效。
+  Future<void> cancelDownload() async {
+    cancelRequested = true;
+    try {
+      await NikonEngine.cancelDownload();
+    } catch (_) {
+      // 取消请求本身失败不影响 Dart 侧已经置位的停止逻辑，不该因此弹错
+    }
+    notifyListeners();
   }
 
   // ------------------------------------------------------------ 事件
@@ -641,6 +709,11 @@ class AppModel extends ChangeNotifier {
     if (e is! Map) return;
     final map = e.cast<String, dynamic>();
     switch (map['type']) {
+      case 'usbAttached':
+        // 插入相机把应用拉起（Manifest 声明了 USB_DEVICE_ATTACHED）。此前无人处理，
+        // 表现是"App 自己开了但什么都不做"；现在连接页会切到 USB 模式并提示。
+        usbAttachNotice = map['name']?.toString() ?? 'USB 相机';
+        notifyListeners();
       case 'log':
         AppLog.add(map['line']?.toString() ?? '');
       case 'status':
