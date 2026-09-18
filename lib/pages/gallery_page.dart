@@ -50,6 +50,12 @@ class _GalleryPageState extends State<GalleryPage> {
   /// 按拍摄日期分组显示（分组后点日期头部即可整选当天）
   bool _groupByDay = false;
 
+  /// 已折叠的日期分组（键 = 日期标题）。
+  ///
+  /// 存在的理由：按天分组时，一天可能有几百张，想找前一天的就得从头滑到尾。
+  /// 折叠状态只在本次会话内保留，不做持久化——它是"临时看"的操作，不是设置。
+  final Set<String> _collapsedDays = {};
+
   /// 分组模式下的逐格命中测试表。
   /// 分组后行高不再固定（夹着日期头部），坐标换算失效，改用矩形命中
   /// ——与手机页同一套做法。
@@ -327,10 +333,121 @@ class _GalleryPageState extends State<GalleryPage> {
     Navigator.push(
       context,
       MaterialPageRoute(
-        builder: (_) =>
-            ViewerPage(model: model, files: List<CameraFile>.of(files), initialIndex: index),
+        builder: (_) => ViewerPage(
+          model: model,
+          files: List<CameraFile>.of(files),
+          initialIndex: index,
+          // 把"选中"能力带进查看器：挑图时最顺的是"放大看清 → 决定要不要 → 下一张"，
+          // 不必退出去再点角标
+          isSelected: (h) => _sel.selected.contains(h),
+          onToggleSelect: (h) => _sel.enterSelectAndToggle(h),
+        ),
       ),
     );
+  }
+
+  /// 下载结束后的统一反馈。
+  ///
+  /// 汇总串本身以前就有，但**没有下文**：用户看到"失败 3"却不知道是哪三张、为什么，
+  /// 也没法重试——而那三张往往正是他最想要的。所以有问题时额外给一个入口。
+  void _afterDownload(String result) {
+    if (result.isEmpty || !mounted) return;
+    if (model.dlIssues.isEmpty) {
+      showNotice(context, result);
+      return;
+    }
+    showNotice(
+      context,
+      result,
+      duration: const Duration(seconds: 12),
+      action: SnackBarAction(
+        label: '查看这 ${model.dlIssues.length} 张',
+        onPressed: _showDownloadIssues,
+      ),
+    );
+  }
+
+  /// 列出本次跳过/失败的文件与原因，并支持一键重试失败项。
+  Future<void> _showDownloadIssues() async {
+    final issues = List.of(model.dlIssues);
+    final failable = model.failedDownloadFiles();
+    await showModalBottomSheet<void>(
+      context: context,
+      backgroundColor: const Color(0xFF161616),
+      shape: const RoundedRectangleBorder(
+          borderRadius: BorderRadius.vertical(top: Radius.circular(16))),
+      builder: (ctx) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Padding(
+              padding: const EdgeInsets.fromLTRB(16, 14, 8, 4),
+              child: Row(
+                children: [
+                  Text('有 ${issues.length} 张没传成',
+                      style: const TextStyle(fontSize: 15, fontWeight: FontWeight.w700)),
+                  const Spacer(),
+                  IconButton(
+                    icon: const Icon(Icons.close, size: 20),
+                    tooltip: '关闭',
+                    onPressed: () => Navigator.pop(ctx),
+                  ),
+                ],
+              ),
+            ),
+            ConstrainedBox(
+              constraints: const BoxConstraints(maxHeight: 320),
+              child: ListView.separated(
+                shrinkWrap: true,
+                padding: const EdgeInsets.symmetric(horizontal: 16),
+                itemCount: issues.length,
+                separatorBuilder: (_, _) =>
+                    Divider(height: 1, color: Colors.white.withValues(alpha: 0.06)),
+                itemBuilder: (_, i) => Padding(
+                  padding: const EdgeInsets.symmetric(vertical: 9),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(issues[i].name,
+                          style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w600)),
+                      const SizedBox(height: 2),
+                      Text(issues[i].reason,
+                          style: TextStyle(
+                              fontSize: 11.5, color: Colors.white.withValues(alpha: 0.6))),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(16, 10, 16, 12),
+              child: SizedBox(
+                width: double.infinity,
+                height: 46,
+                child: FilledButton.icon(
+                  onPressed: failable.isEmpty
+                      ? null
+                      : () {
+                          Navigator.pop(ctx);
+                          _retryFailed(failable);
+                        },
+                  icon: const Icon(Icons.refresh, size: 18),
+                  label: Text(
+                    failable.isEmpty
+                        ? '其中没有可重试的失败项'
+                        : '重试失败的 ${failable.length} 张',
+                  ),
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Future<void> _retryFailed(List<CameraFile> picks) async {
+    _afterDownload(await model.download(picks));
   }
 
   Future<void> _download() async {
@@ -341,9 +458,7 @@ class _GalleryPageState extends State<GalleryPage> {
     if (picks.isEmpty) return;
     final result = await model.download(picks);
     if (!mounted) return;
-    if (result.isNotEmpty) {
-      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(result)));
-    }
+    _afterDownload(result);
     _sel.exitSelect();
   }
 
@@ -373,9 +488,7 @@ class _GalleryPageState extends State<GalleryPage> {
     if (ok != true) return;
     final result = await model.download(picks);
     if (!mounted) return;
-    if (result.isNotEmpty) {
-      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(result)));
-    }
+    _afterDownload(result);
   }
 
   /// 相机端操作：保护 / 取消保护 / 删除卡上原片。
@@ -536,7 +649,7 @@ class _GalleryPageState extends State<GalleryPage> {
 
   @override
   Widget build(BuildContext context) {
-    return AnimatedBuilder(
+    final page = AnimatedBuilder(
       animation: model,
       builder: (context, _) {
         if (model.connState != 'connected') {
@@ -582,6 +695,15 @@ class _GalleryPageState extends State<GalleryPage> {
         );
       },
     );
+    // 返回键**逐层退**：多选态下先退出多选，再按一次才离开相册页。
+    // 此前多选态按返回会直接退页（在根页就是退出应用），选了半天全丢。
+    return PopScope(
+      canPop: !_sel.selectMode,
+      onPopInvokedWithResult: (didPop, _) {
+        if (!didPop) _sel.exitSelect();
+      },
+      child: page,
+    );
   }
 
   PreferredSizeWidget _normalAppBar() => AppBar(
@@ -604,13 +726,17 @@ class _GalleryPageState extends State<GalleryPage> {
 
   PreferredSizeWidget _selectionAppBar() {
     final allSelected = _sel.allSelected(_filtered.map((f) => f.handle));
+    // 下载中锁定"改选择"的入口（全选/取消全选），与格子点击、滑动选择保持一致；
+    // 「取消」按钮仍可用——万一确实要退出多选态，不该把人困住。
+    final locked = model.downloading;
     return AppBar(
       leading: IconButton(icon: const Icon(Icons.close), onPressed: _sel.exitSelect),
-      title: Text('已选 ${_sel.selected.length}'),
+      title: Text(locked ? '下载中 · 已选 ${_sel.selected.length}' : '已选 ${_sel.selected.length}'),
       actions: [
         TextButton(
-          onPressed: () => _sel.toggleAll(_filtered.map((f) => f.handle)),
-          child: Text(allSelected ? '取消全选' : '全选', style: const TextStyle(color: kAccent)),
+          onPressed: locked ? null : () => _sel.toggleAll(_filtered.map((f) => f.handle)),
+          child: Text(allSelected ? '取消全选' : '全选',
+              style: TextStyle(color: locked ? Colors.white38 : kAccent)),
         ),
       ],
     );
@@ -649,10 +775,14 @@ class _GalleryPageState extends State<GalleryPage> {
     childAspectRatio: _cellAspect,
   );
 
-  /// 滑动选择的手势宿主：两种布局共用同一套指针处理
+  /// 滑动选择的手势宿主：两种布局共用同一套指针处理。
+  /// 下载进行中忽略滑动（选择集已锁定），否则拖到一半就开始传、选择还在变，很容易误操作。
   Widget _selectionHost(Widget child) => Listener(
         behavior: HitTestBehavior.translucent,
-        onPointerMove: (d) => _sel.updateDrag(d.position),
+        onPointerMove: (d) {
+          if (model.downloading) return;
+          _sel.updateDrag(d.position);
+        },
         onPointerUp: (_) => _sel.endDrag(),
         onPointerCancel: (_) => _sel.endDrag(),
         child: child,
@@ -667,7 +797,7 @@ class _GalleryPageState extends State<GalleryPage> {
         itemBuilder: (context, i) => _cell(files[i], i, files),
       );
 
-  /// 按天分组视图：点日期头部即整选/取消当天的照片。
+  /// 按天分组视图：点日期头部即整选/取消当天的照片，左侧箭头可折叠该天。
   /// 分组后行高不固定，因此滑动选择改用逐格命中（见 _hitIndex）。
   Widget _groupedGrid(List<CameraFile> files) {
     final sections = _daySections(files);
@@ -677,49 +807,78 @@ class _GalleryPageState extends State<GalleryPage> {
       slivers: [
         for (final s in sections) ...[
           SliverToBoxAdapter(child: _dayHeader(s)),
-          SliverGrid(
-            gridDelegate: _gridDelegate,
-            delegate: SliverChildBuilderDelegate(
-              (context, i) => _cell(s.files[i], s.base + i, files),
-              childCount: s.files.length,
+          // 折叠后不渲染这一天的网格：既省构建，也让用户能直接看到下一天
+          if (!_collapsedDays.contains(s.day))
+            SliverGrid(
+              gridDelegate: _gridDelegate,
+              delegate: SliverChildBuilderDelegate(
+                (context, i) => _cell(s.files[i], s.base + i, files),
+                childCount: s.files.length,
+              ),
             ),
-          ),
         ],
         const SliverPadding(padding: EdgeInsets.only(bottom: 96)),
       ],
     );
   }
 
+  /// 日期头：左侧箭头 = 折叠/展开，其余区域 = 整选当天。
+  ///
+  /// 两个动作必须分开：合在一个手势里的话，想折叠却整选了当天（或反之），
+  /// 而"整选当天"在几百张的卡上并不好撤销。
   Widget _dayHeader(({String day, int base, List<CameraFile> files}) s) {
     final handles = s.files.map((f) => f.handle).toList();
     final allSel = _sel.allSelected(handles);
     final selCount = handles.where(_sel.selected.contains).length;
-    return Semantics(
-      button: true,
-      label: '${s.day}，${s.files.length} 张，点击${allSel ? '取消选择' : '全选'}当天',
-      child: InkWell(
-        onTap: () => _sel.toggleGroup(handles),
-        child: Padding(
-          padding: const EdgeInsets.fromLTRB(14, 12, 14, 6),
-          child: Row(
-            children: [
-              Text(s.day,
-                  style: const TextStyle(fontSize: 13.5, fontWeight: FontWeight.w600)),
-              const SizedBox(width: 8),
-              Text('${s.files.length} 张',
-                  style: TextStyle(
-                      fontSize: 11.5, color: Colors.white.withValues(alpha: 0.45))),
-              if (selCount > 0) ...[
-                const SizedBox(width: 8),
-                Text('已选 $selCount', style: const TextStyle(fontSize: 11.5, color: kAccent)),
-              ],
-              const Spacer(),
-              Icon(allSel ? Icons.check_circle : Icons.add_circle_outline,
-                  size: 18, color: allSel ? kAccent : Colors.white24),
-            ],
+    final collapsed = _collapsedDays.contains(s.day);
+    // 下载进行中不允许改选择集（见 _cell 的说明）
+    final locked = model.downloading;
+    return Row(
+      children: [
+        IconButton(
+          icon: AnimatedRotation(
+            turns: collapsed ? -0.25 : 0,
+            duration: const Duration(milliseconds: 140),
+            child: const Icon(Icons.expand_more, size: 22),
+          ),
+          tooltip: collapsed ? '展开 ${s.day}' : '折叠 ${s.day}',
+          visualDensity: VisualDensity.compact,
+          color: Colors.white70,
+          onPressed: () => setState(() {
+            if (!_collapsedDays.remove(s.day)) _collapsedDays.add(s.day);
+          }),
+        ),
+        Expanded(
+          child: Semantics(
+            button: true,
+            label: '${s.day}，${s.files.length} 张，点击${allSel ? '取消选择' : '全选'}当天',
+            child: InkWell(
+              onTap: locked ? null : () => _sel.toggleGroup(handles),
+              child: Padding(
+                padding: const EdgeInsets.fromLTRB(0, 12, 14, 6),
+                child: Row(
+                  children: [
+                    Text(s.day,
+                        style: const TextStyle(fontSize: 13.5, fontWeight: FontWeight.w600)),
+                    const SizedBox(width: 8),
+                    Text(collapsed ? '${s.files.length} 张 · 已折叠' : '${s.files.length} 张',
+                        style: TextStyle(
+                            fontSize: 11.5, color: Colors.white.withValues(alpha: 0.45))),
+                    if (selCount > 0) ...[
+                      const SizedBox(width: 8),
+                      Text('已选 $selCount',
+                          style: const TextStyle(fontSize: 11.5, color: kAccent)),
+                    ],
+                    const Spacer(),
+                    Icon(allSel ? Icons.check_circle : Icons.add_circle_outline,
+                        size: 18, color: allSel ? kAccent : Colors.white24),
+                  ],
+                ),
+              ),
+            ),
           ),
         ),
-      ),
+      ],
     );
   }
 
@@ -729,6 +888,11 @@ class _GalleryPageState extends State<GalleryPage> {
         if (mounted) model.gateway.ensureLoaded(f, withThumb: true);
       });
     }
+    // 下载进行中：**锁定选择集**，但保留看大图。
+    // 理由：下载清单是按下按钮那一刻的快照，此刻改选择并不会改变正在传的内容，
+    // 却会让用户以为"我把这张取消了"——之前点一下图片就取消选中，正是这个误导。
+    // 而"想看看到底传的是哪张"是非常自然的需求，所以点击语义改成开查看器。
+    final locked = model.downloading;
     return GalleryCell(
       key: _keyOf(f.handle),
       file: f,
@@ -736,12 +900,17 @@ class _GalleryPageState extends State<GalleryPage> {
       selected: _sel.selected.contains(f.handle),
       downloaded: model.isDownloaded(f),
       pairDownloaded: model.isPairDownloaded(f),
-      onTap: () => _sel.selectMode ? _sel.toggle(f.handle) : _openViewer(index, files),
-      onLongPress: () {
-        HapticFeedback.mediumImpact();
-        _sel.beginDrag(index);
-      },
-      onToggleSelect: () => _sel.enterSelectAndToggle(f.handle),
+      // 点缩略图**始终**是看大图：挑选时总得放大确认才敢下手，图多时尤其如此。
+      // 勾选交给右下角的圈——选择模式下它常驻可见（非选择模式点它进入选择模式）。
+      onTap: () => _openViewer(index, files),
+      onLongPress: locked
+          ? null
+          : () {
+              HapticFeedback.mediumImpact();
+              _sel.beginDrag(index);
+            },
+      onToggleSelect: locked ? null : () => _sel.enterSelectAndToggle(f.handle),
+      inSelectMode: _sel.selectMode,
     );
   }
 
@@ -759,13 +928,22 @@ class _GalleryPageState extends State<GalleryPage> {
         color: const Color(0xFF0F0F0F),
         child: model.downloading
             ? SizedBox(
-                height: 32,
-                child: Center(
-                  child: Text(
-                    '${model.dlDone}/${model.dlTotal}'
-                    '${model.dlSpeed > 0 ? ' · ${model.dlSpeed.toStringAsFixed(1)}MB/s' : ''}',
-                    style: const TextStyle(fontSize: 13, color: Colors.white54),
-                  ),
+                height: 46,
+                child: Column(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    Text(
+                      '${model.dlDone}/${model.dlTotal}'
+                      '${model.dlSpeed > 0 ? ' · ${model.dlSpeed.toStringAsFixed(1)}MB/s' : ''}',
+                      style: const TextStyle(fontSize: 13, color: Colors.white70),
+                    ),
+                    // 说清"为什么点了没反应"：此刻改选择不会影响已经在传的清单，
+                    // 所以选择被锁定，但看大图仍然可用
+                    const Text(
+                      '下载中，选择已锁定（仍可点开大图）',
+                      style: TextStyle(fontSize: 11, color: Colors.white38),
+                    ),
+                  ],
                 ),
               )
             : Row(

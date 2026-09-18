@@ -15,9 +15,10 @@ class GalleryCell extends StatelessWidget {
     required this.selected,
     required this.downloaded,
     required this.onTap,
-    required this.onLongPress,
-    required this.onToggleSelect,
+    this.onLongPress,
+    this.onToggleSelect,
     this.pairDownloaded = false,
+    this.inSelectMode = false,
   });
 
   final CameraFile file;
@@ -29,8 +30,20 @@ class GalleryCell extends StatelessWidget {
   /// "我收了 JPEG，但 RAW 还没收"。
   final bool pairDownloaded;
   final VoidCallback onTap;
-  final VoidCallback onLongPress;
-  final VoidCallback onToggleSelect;
+
+  /// 长按起选。传 null 表示当前**不允许改选择集**（例如下载进行中：
+  /// 此刻改选择不会影响已经在传的清单，只会让用户以为"取消掉了"，所以直接禁用）。
+  final VoidCallback? onLongPress;
+
+  /// 右下角勾选热区。为 null 时整个热区不渲染（例如下载进行中不允许改选择集）。
+  final VoidCallback? onToggleSelect;
+
+  /// 是否处于选择模式。
+  ///
+  /// 为 true 时右下角**常驻一个可见的勾选圈**：因为此时"点缩略图"是打开大图
+  /// （挑选时总要看清楚才敢下手），勾选就得有一个明确、看得见的落点，
+  /// 不能还靠一块隐形热区——那样用户根本不知道该点哪儿。
+  final bool inSelectMode;
 
   @override
   Widget build(BuildContext context) {
@@ -40,7 +53,7 @@ class GalleryCell extends StatelessWidget {
     return GestureDetector(
       behavior: HitTestBehavior.opaque,
       onTap: onTap,
-      onLongPressStart: (_) => onLongPress(),
+      onLongPressStart: onLongPress == null ? null : (_) => onLongPress!(),
       child: Stack(
         fit: StackFit.expand,
         children: [
@@ -78,23 +91,41 @@ class GalleryCell extends StatelessWidget {
                     ? const Icon(Icons.check_circle, size: 15, color: Color(0xFF4CD964))
                     : const SizedBox.shrink()),
           ),
-          // 22×22 的隐形勾选热区：不遮挡缩略图，点它直接进入选择模式
-          Positioned(
-            right: 0,
-            bottom: 0,
-            child: GestureDetector(
-              behavior: HitTestBehavior.opaque,
-              onTap: () {
-                HapticFeedback.selectionClick();
-                onToggleSelect();
-              },
-              child: const Padding(
-                padding: EdgeInsets.all(8),
-                child: SizedBox(width: 22, height: 22),
+          // 右下角：
+          // - 选择模式下常驻一个**可见的勾选圈**（点它切换选中）——此时点缩略图是"看大图"，
+          //   勾选必须有个看得见的落点，不能还靠隐形热区；
+          // - 非选择模式保留隐形热区，点它进入选择模式并选中该张。
+          if (onToggleSelect != null)
+            Positioned(
+              right: 0,
+              bottom: 0,
+              child: GestureDetector(
+                behavior: HitTestBehavior.opaque,
+                onTap: () {
+                  HapticFeedback.selectionClick();
+                  onToggleSelect!();
+                },
+                child: Padding(
+                  padding: EdgeInsets.all(inSelectMode ? 2 : 8),
+                  child: SizedBox(
+                    width: inSelectMode ? 34 : 22,
+                    height: inSelectMode ? 34 : 22,
+                    child: inSelectMode
+                        ? Center(
+                            child: Icon(
+                              selected ? Icons.check_circle : Icons.circle_outlined,
+                              size: 22,
+                              color: selected ? kAccent : Colors.white,
+                              shadows: const [Shadow(color: Colors.black87, blurRadius: 5)],
+                            ),
+                          )
+                        : null,
+                  ),
+                ),
               ),
             ),
-          ),
-          if (selected)
+          // 已选但当前没有勾选入口时（例如下载进行中：选择被锁定）仍要能看出选了什么
+          if (selected && onToggleSelect == null)
             const Positioned(
               right: 8,
               bottom: 8,

@@ -3,6 +3,40 @@ import 'package:flutter/material.dart';
 /// 全局强调色（尼康黄）。此前在 6 个文件里各写一份字面量。
 const Color kAccent = Color(0xFFFFE100);
 
+/// 统一的可关闭提示条。
+///
+/// 为什么不用裸 `SnackBar`：它默认**只能下滑、或等超时才消失**，点其它任何位置都没用。
+/// 而错误提示往往一显示就是 8 秒——这期间它挡着底部按钮、用户想关又关不掉，
+/// 实测反馈就是"必须手动把它滑下去才能继续操作"。
+///
+/// 这里统一成三条出路，任意一条都能立刻关掉：
+/// 1. **点提示条本体**（最容易发现，也最符合直觉）；
+/// 2. 右侧的「关闭」按钮（明确可见，用于不知道该点哪里的人）；
+/// 3. 原来的下滑手势（保留，习惯下滑的人不受影响）。
+void showNotice(
+  BuildContext context,
+  String text, {
+  Duration duration = const Duration(seconds: 4),
+  SnackBarAction? action,
+}) {
+  final messenger = ScaffoldMessenger.of(context);
+  void dismiss() => messenger.hideCurrentSnackBar();
+  messenger
+    ..hideCurrentSnackBar()
+    ..showSnackBar(
+      SnackBar(
+        duration: duration,
+        content: GestureDetector(
+          behavior: HitTestBehavior.opaque,
+          onTap: dismiss,
+          child: Text(text),
+        ),
+        // 调用方自带操作按钮时不再追加「关闭」，否则右侧会挤成一团
+        action: action ?? SnackBarAction(label: '关闭', onPressed: dismiss),
+      ),
+    );
+}
+
 /// 卡片容器：调试面板与设置页共用同一套装饰。
 class AppCard extends StatelessWidget {
   const AppCard({super.key, required this.child, this.padding = const EdgeInsets.all(14)});

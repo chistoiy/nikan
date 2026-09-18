@@ -1,7 +1,7 @@
 import 'dart:async';
-import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
 import '../app_model.dart';
 import '../engine/app_log.dart';
@@ -31,11 +31,22 @@ class ViewerPage extends StatefulWidget {
     required this.model,
     required this.files,
     required this.initialIndex,
+    this.isSelected,
+    this.onToggleSelect,
   });
 
   final AppModel model;
   final List<CameraFile> files;
   final int initialIndex;
+
+  /// 当前这张是否已被选中（配套 [onToggleSelect]）。为 null 表示这个入口不支持选择。
+  final bool Function(int handle)? isSelected;
+
+  /// 在查看器内切换"选中"。
+  ///
+  /// 为什么查看器里也要能选：挑图最自然的流程是"放大看清 → 决定要不要 → 下一张"。
+  /// 如果必须退出去、找到那张、再点角标，翻一张就要来回切两次，图多时非常费劲。
+  final void Function(int handle)? onToggleSelect;
 
   @override
   State<ViewerPage> createState() => _ViewerPageState();
@@ -94,6 +105,10 @@ class _ViewerPageState extends State<ViewerPage> {
 
   CameraFile? get _current =>
       (_index >= 0 && _index < widget.files.length) ? widget.files[_index] : null;
+
+  /// 该句柄当前是否被选中（不支持选择的入口恒为 false）
+  bool _isSel(int? handle) =>
+      handle != null && (widget.isSelected?.call(handle) ?? false);
 
   /// 当前这张用哪个档位：跟随设置。用户点了「显示原图」后缓存里已是原图，
   /// `_ensure` 的档位比较会自然跳过（rank(original) ≥ rank(设置值)）。
@@ -281,6 +296,22 @@ class _ViewerPageState extends State<ViewerPage> {
         title: Text('${_index + 1} / ${widget.files.length}',
             style: const TextStyle(fontSize: 15)),
         actions: [
+          // 选中开关：放在 AppBar 而不是浮层上，既不挡画面，翻页时也能一直点
+          if (widget.onToggleSelect != null)
+            IconButton(
+              tooltip: _isSel(_current?.handle) ? '取消选中这张' : '选中这张',
+              icon: Icon(
+                _isSel(_current?.handle) ? Icons.check_circle : Icons.circle_outlined,
+                color: _isSel(_current?.handle) ? kAccent : Colors.white,
+              ),
+              onPressed: () {
+                final f = _current;
+                if (f == null) return;
+                HapticFeedback.selectionClick();
+                widget.onToggleSelect!(f.handle);
+                setState(() {}); // 立刻反映到图标（并让返回后的列表计数同步）
+              },
+            ),
           IconButton(
             tooltip: '信息',
             icon: Icon(_showInfo ? Icons.info : Icons.info_outline),

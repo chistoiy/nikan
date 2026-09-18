@@ -6,11 +6,15 @@ import android.content.Intent
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.ImageDecoder
+import android.hardware.usb.UsbManager
 import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
+import android.net.NetworkRequest
 import android.net.Uri
 import android.net.wifi.WifiManager
+import android.net.wifi.WifiNetworkSpecifier
+import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
@@ -25,6 +29,7 @@ import java.io.IOException
 import java.net.Inet4Address
 import java.net.InetSocketAddress
 import java.util.Collections
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import javax.net.SocketFactory
@@ -208,8 +213,269 @@ object CameraEngine {
         appContext!!.getSystemService(ConnectivityManager::class.java)
 
     /** 当前 Wi-Fi 网络（相机热点没有互联网，也不能要求有）。 */
-    fun wifiNetwork(): Network? = cm().allNetworks.firstOrNull { n ->
+    fun wifiNetwork(): Network? = apNetwork ?: cm().allNetworks.firstOrNull { n ->
         cm().getNetworkCapabilities(n)?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true
+    }
+
+    /**
+     * 扫描附近的 Wi-Fi 热点，供「选择相机热点」用——**避免让用户手抄一长串 SSID**。
+     *
+     * 为什么不直接用 `WifiInfo.getSSID()` 拿当前热点名：本应用的 `NEARBY_WIFI_DEVICES`
+     * 声明了 `neverForLocation`，系统在 Android 13+ 上会把 SSID 抹成 `<unknown ssid>`。
+     * 而扫描结果里的 SSID 是可用的（这正是该权限的用途），所以改用"让用户从列表里选"。
+     *
+     * 需要运行时权限（13+ = NEARBY_WIFI_DEVICES，10~12 = ACCESS_FINE_LOCATION），
+     * 拿不到就返回空列表，由 UI 提示去授权。
+     */
+    fun scanWifiNetworks(): List<Map<String, Any?>> {
+        val ctx = appContext ?: return emptyList()
+        return runCatching {
+            @Suppress("DEPRECATION")
+            val wm = ctx.applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+            if (!wm.isWifiEnabled) {
+                log("扫描附近 Wi-Fi：系统 Wi-Fi 未开启")
+                return emptyList()
+            }
+            if (!hasWifiScanPermission()) {
+                log("扫描附近 Wi-Fi：缺少运行时权限（13+ 需 NEARBY_WIFI_DEVICES，10~12 需定位）")
+                return emptyList()
+            }
+            // 主动触发一次扫描：只读扫描结果可能为空——系统缓存里的结果有有效期，
+            // 而且新装的 App 从来没触发过扫描时缓存里就是空的（真机踩过：列表一片空白）
+            @Suppress("DEPRECATION")
+            val started = runCatching { wm.startScan() }.getOrDefault(false)
+            if (started) Thread.sleep(1200) // 等驱动回填结果（阻塞在调用方的工作线程上）
+            @Suppress("DEPRECATION")
+            val results = wm.scanResults ?: emptyList()
+            log("扫描附近 Wi-Fi：startScan=$started，拿到 ${results.size} 条结果")
+            // 同名去重，保留信号最强的那条
+            val best = LinkedHashMap<String, android.net.wifi.ScanResult>()
+            for (r in results) {
+                val ssid = r.SSID
+                if (ssid.isNullOrEmpty()) continue
+                val cur = best[ssid]
+                if (cur == null || r.level > cur.level) best[ssid] = r
+            }
+            best.values.sortedByDescending { it.level }.map { r ->
+                val cap = r.capabilities ?: ""
+                mapOf(
+                    "ssid" to r.SSID,
+                    "level" to r.level,
+                    // WPA/WEP 都算需要密码；相机热点固定是 WPA2
+                    "secured" to (cap.contains("WPA") || cap.contains("WEP")),
+                    "capabilities" to cap,
+                )
+            }
+        }.getOrElse { e ->
+            log("扫描附近 Wi-Fi 失败：${e.message}")
+            emptyList()
+        }
+    }
+
+    /**
+     * 尽力读出**当前所连热点的 SSID**，读不到返回 null。
+     *
+     * 为什么要单独试这条路：Android 13+ 上 `WifiInfo.getSSID()` 常被抹成 `<unknown ssid>`，
+     * 而 `NetworkCapabilities.getSsid()`（API 30+）在拿到 NEARBY_WIFI_DEVICES 后往往可读——
+     * 能读到就不必让用户再从扫描列表里挑一次。
+     */
+    fun currentSsidOrNull(): String? {
+        val ctx = appContext ?: return null
+        return runCatching {
+            // 正路：NetworkCapabilities.transportInfo 拿出 WifiInfo（API 29+）。
+            // ⚠️ NetworkCapabilities 本身没有 getSsid()——这一点容易凭印象写错。
+            val cap = cm().activeNetwork?.let { cm().getNetworkCapabilities(it) }
+            val info = cap?.transportInfo as? android.net.wifi.WifiInfo
+            val fromCap = info?.ssid
+            if (!fromCap.isNullOrEmpty() && !fromCap.startsWith("<")) return fromCap
+            @Suppress("DEPRECATION")
+            val wm = ctx.applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+            @Suppress("DEPRECATION")
+            val fromWifi = wm.connectionInfo?.ssid
+            if (!fromWifi.isNullOrEmpty() && !fromWifi.startsWith("<")) return fromWifi
+            null
+        }.getOrElse { e ->
+            log("读取当前 SSID 失败：${e.message}")
+            null
+        }
+    }
+
+    /** 当前是否持有扫描所需的运行时权限（13+ = NEARBY_WIFI_DEVICES，否则 ACCESS_FINE_LOCATION） */
+    fun hasWifiScanPermission(): Boolean {
+        val ctx = appContext ?: return false
+        val perm = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            android.Manifest.permission.NEARBY_WIFI_DEVICES
+        } else {
+            android.Manifest.permission.ACCESS_FINE_LOCATION
+        }
+        return ctx.checkSelfPermission(perm) == android.content.pm.PackageManager.PERMISSION_GRANTED
+    }
+
+    /**
+     * 手机**已保存过**的热点名（去重后按名称排序）。
+     *
+     * ⚠️ **Android 10+ 上这个方法对普通应用恒返回空列表**——官方行为变更明文规定：
+     * "只有系统应用和 DPC 支持手动配置系统 WLAN 网络列表"，对其他应用
+     * `getConfiguredNetworks()` 恒返回空、`addNetwork/updateNetwork` 恒返回 -1、
+     * `removeNetwork/reassociate/enableNetwork/disableNetwork/reconnect/disconnect`
+     * 恒返回 false。**网上流传的 "getConfiguredNetworks + enableNetwork + reconnect
+     * 连接已保存网络" 的方案只适用于 Android 9 及以下**，Q+ 上整条链路是空操作。
+     * 本机已实证（权限已授予仍返回 0 个）。官方替代：`WifiNetworkSpecifier` /
+     * `WifiNetworkSuggestion`（都要求应用自己提供凭据）。
+     *
+     * 保留本方法的意义：兼容极少数仍在跑 Android 9 的旧设备，以及系统应用场景；
+     * 在 Android 10+ 上它只会返回空（随后走 specifier 带凭据的路径）。
+     */
+    fun savedWifiSsids(): List<String> {
+        val ctx = appContext ?: return emptyList()
+        if (!hasWifiScanPermission()) {
+            log("读取已保存热点：缺少运行时权限")
+            return emptyList()
+        }
+        return runCatching {
+            @Suppress("DEPRECATION")
+            val wm = ctx.applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+            val out = LinkedHashSet<String>()
+            @Suppress("DEPRECATION")
+            for (c in wm.configuredNetworks ?: emptyList<android.net.wifi.WifiConfiguration>()) {
+                // configuredNetworks 的 SSID 带引号（"\"SSID\""），必须剥掉
+                val s = c.SSID?.trim()?.trim('"') ?: continue
+                if (s.isNotEmpty()) out.add(s)
+            }
+            log("读取已保存热点：${out.size} 个")
+            out.sorted()
+        }.getOrElse { e ->
+            log("读取已保存热点失败：${e.message}")
+            emptyList()
+        }
+    }
+
+    // ---------------------------------------------------- 相机热点一键入网
+
+    /**
+     * 通过 `WifiNetworkSpecifier` 连上的**相机自建热点**（AP 模式，App 专属连接）。
+     *
+     * 为什么需要它：Android 10+ 禁止 App 静默切换 Wi-Fi，用户要连相机热点必须"手动去系统设置"
+     * ——这是 AP 模式最烦的一步。用 specifier 可以在 App 内弹一次系统确认框就完成入网。
+     *
+     * ⚠️ 该连接是 **App 专属**的：系统仍保留用户与家里路由器的连接，本应用的流量走相机热点。
+     * 所以必须 `bindProcessToNetwork`，并让 [wifiNetwork] 优先返回它——否则
+     * `socketFactory()` 会拿到路由器的 Network，socket 就被绑到错的网络上去了。
+     */
+    @Volatile
+    private var apNetwork: Network? = null
+
+    @Volatile
+    private var apCallback: ConnectivityManager.NetworkCallback? = null
+
+    /** 当前是否处于"App 专属的相机热点"连接 */
+    fun cameraApActive(): Boolean = apNetwork != null
+
+    /**
+     * 加入相机热点。**会弹出系统确认框**，用户点「连接」后才算成功。
+     *
+     * @param ssid 相机热点名（相机屏幕上显示的那个；通常由上次连接成功后自动记住）
+     * @param passphrase 相机热点密码。**传空字符串时按"手机里已保存过该热点"处理**：
+     *   系统会拿已保存的凭据去连，用户不必再输密码——这是"第一次手动连过、
+     *   之后就能一键自动连"的关键（Android 不允许 App 读系统里保存的 Wi-Fi 密码，
+     *   但允许 App 请求连接一个已保存的网络）。
+     */
+    fun joinCameraAp(ssid: String, passphrase: String): Map<String, Any?> {
+        val ctx = appContext ?: throw IOException("尚未初始化")
+        val manager = ctx.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+        leaveCameraAp() // 先清掉上一次，避免回调叠加
+
+        val specifierBuilder = WifiNetworkSpecifier.Builder().setSsid(ssid)
+        if (passphrase.isNotEmpty()) {
+            // 相机热点是 WPA2-PSK（尼康默认）。空串时**不设置凭据**，
+            // 让系统用"已保存的网络"去匹配——即用户之前手动连过一次的那个。
+            specifierBuilder.setWpa2Passphrase(passphrase)
+        }
+        val request = NetworkRequest.Builder()
+            .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
+            // 相机热点**没有互联网**：不显式移除 INTERNET 能力要求的话，
+            // 系统会认为该网络"不可用"，onAvailable 永远不来（这是个经典坑）
+            .removeCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+            .setNetworkSpecifier(specifierBuilder.build())
+            .build()
+
+        val latch = CountDownLatch(1)
+        val startedAt = SystemClock.elapsedRealtime()
+        var failure: String? = null
+        val cb = object : ConnectivityManager.NetworkCallback() {
+            override fun onAvailable(network: Network) {
+                apNetwork = network
+                // 绑到本进程：之后扫描、握手、传输的 socket 都会走相机热点
+                runCatching { manager.bindProcessToNetwork(network) }
+                    .onFailure { failure = "已连上热点但绑定失败：${it.message}" }
+                latch.countDown()
+            }
+
+            override fun onUnavailable() {
+                val ms = SystemClock.elapsedRealtime() - startedAt
+                // 秒回 vs 拖了几秒才失败，原因完全不同，所以要分开说：
+                // 前者是"系统压根没试"（用户在确认框上点取消/关掉），后者才是凭据问题。
+                // 混成一条"密码可能不对"会把用户支去改密码（真机反馈过）。
+                failure = when {
+                    ms < 1500 ->
+                        "系统没有连接该热点（${ms}ms）：多半是你在系统确认框里点了取消。" +
+                            "再点一次「一键连接」即可"
+                    passphrase.isEmpty() ->
+                        "系统没能连上「$ssid」：手机里没有保存过这个热点，所以不知道该用什么密码连。" +
+                            "可以：① 到系统 Wi-Fi 设置里手动连它一次（只需一次，之后免密一键连）；" +
+                            "② 在这里填一次热点密码"
+                    else ->
+                        "系统没能连上「$ssid」：密码不对（等 $ms ms 后放弃）。" +
+                            "密码见相机屏幕：网络菜单 → 连接至智能设备 → Wi-Fi 连接"
+                }
+                log("加入热点失败：$failure")
+                latch.countDown()
+            }
+
+            override fun onLost(network: Network) {
+                if (apNetwork == network) {
+                    apNetwork = null
+                    runCatching { manager.bindProcessToNetwork(null) }
+                }
+            }
+        }
+        apCallback = cb
+
+        try {
+            manager.requestNetwork(request, cb)
+        } catch (e: SecurityException) {
+            leaveCameraAp()
+            throw IOException("缺少「附近的设备/位置」权限，无法自动加入热点：${e.message}")
+        } catch (e: Exception) {
+            leaveCameraAp()
+            throw IOException("请求加入热点失败：${e.message}")
+        }
+
+        // 等用户点确认（系统确认框没有超时回调，这里自己等）
+        val ok = latch.await(90, TimeUnit.SECONDS)
+        failure?.let {
+            leaveCameraAp()
+            throw IOException(it)
+        }
+        if (!ok) {
+            leaveCameraAp()
+            throw IOException("等待确认超时：请在系统弹框里点「连接」")
+        }
+        log("已加入相机热点 \"$ssid\"（App 专属连接）")
+        return mapOf("ok" to true, "ssid" to ssid, "ip" to (cm().getLinkProperties(apNetwork!!)?.linkAddresses?.firstOrNull()?.address?.hostAddress ?: ""))
+    }
+
+    /** 退出 App 专属的相机热点连接，恢复系统默认网络（通常断开相机时调用） */
+    fun leaveCameraAp() {
+        val ctx = appContext ?: return
+        val manager = ctx.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+        apCallback?.let { runCatching { manager.unregisterNetworkCallback(it) } }
+        apCallback = null
+        if (apNetwork != null) {
+            runCatching { manager.bindProcessToNetwork(null) }
+            apNetwork = null
+            log("已退出 App 专属的相机热点连接")
+        }
     }
 
     fun socketFactory(): SocketFactory? = wifiNetwork()?.socketFactory
@@ -270,6 +536,48 @@ object CameraEngine {
             ctx.startActivity(Intent(Settings.Panel.ACTION_WIFI).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
         } catch (_: Exception) {
             ctx.startActivity(Intent(Settings.ACTION_WIFI_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+        }
+    }
+
+    /**
+     * 打开本应用的系统设置页。
+     *
+     * 用途：权限被"拒绝两次"后系统不再弹框，只能引导用户手动去开——
+     * 否则用户会卡在"点了没反应"上（真机反馈过：热点列表一直空白）。
+     */
+    /**
+     * 当前插着、且带 **PTP/静态影像接口** 的 USB 设备名（无则 null）。
+     *
+     * 为什么要主动查而不是等广播：`USB_DEVICE_ATTACHED` 的清单声明只有在用户
+     * 把本应用设为"默认处理程序"时才会把 Intent 送到我们这；多数 ROM
+     * （真机为 HyperOS）会弹一个选择框，甚至什么都不投——表现就是
+     * "插上相机，App 里没有任何反应，还得手动点连接"。
+     *
+     * 接口判据与 [PtpUsbClient] 里挑接口的规则一致：class 6 = Still Imaging，
+     * subclass 1 + protocol 1 = PTP。
+     */
+    fun usbCameraPresent(): String? {
+        val ctx = appContext ?: return null
+        return runCatching {
+            val mgr = ctx.getSystemService(Context.USB_SERVICE) as? UsbManager ?: return null
+            val dev = mgr.deviceList.values.firstOrNull { d ->
+                (0 until d.interfaceCount).any { i ->
+                    val c = d.getInterface(i)
+                    c.interfaceClass == 6 && c.interfaceSubclass == 1 && c.interfaceProtocol == 1
+                }
+            } ?: return null
+            dev.productName ?: "USB 相机"
+        }.getOrNull()
+    }
+
+    fun openAppSettings() {
+        val ctx = appContext!!
+        runCatching {
+            ctx.startActivity(
+                Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS)
+                    .setData(Uri.fromParts("package", ctx.packageName, null))
+                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
+            )
         }
     }
 
@@ -544,6 +852,10 @@ object CameraEngine {
             "supportsLargeThumb" to di.supportsOperation(Ptp.OP_NIKON_GET_LARGE_THUMB),
             "supportsObjectAdded" to di.supportsEvent(Ptp.EVT_OBJECT_ADDED),
             "cameraName" to c.cameraName,
+            // 本次连上的地址（USB 会话是 `usb:` 伪地址，Dart 侧会据此排除）。
+            // 必须暴露：智能连接（connectSmart）全在原生侧扫描并握手，Dart 根本不知道
+            // 连的是哪个地址——不返回的话"记住设备/自动重连"就永远是空的。
+            "ip" to cameraIp,
         )
     }
 
@@ -633,6 +945,9 @@ object CameraEngine {
     fun disconnect() {
         autoReconnecting = false // 用户手动断开：取消进行中的自动重连
         disconnectQuiet()
+        // 若之前是用"App 专属连接"加入的相机热点，断开时一并退出：
+        // 否则手机会一直挂在那个没有互联网的热点上（系统通知也一直挂着）。
+        leaveCameraAp()
         emit(mapOf("type" to "status", "state" to "disconnected", "reason" to "手动断开"))
     }
 
@@ -2179,6 +2494,37 @@ object CameraEngine {
                 )?.use { cur ->
                     if (cur.moveToFirst()) {
                         return ContentUris.withAppendedId(collection, cur.getLong(0)).toString()
+                    }
+                }
+            }
+        }
+        return null
+    }
+
+    /**
+     * 按文件名查媒体库里的**相对路径**（如 `Pictures/NikonSync`）。
+     *
+     * 早期版本的下载记录只有文件名、没有保存路径，于是本机页把它们统统归到
+     * "未知位置"一组。这里用 MediaStore 的 RELATIVE_PATH 把位置补回来
+     * （API 29+ 的标准列，本项目 minSdk=29；查不到就返回 null，调用方保持原样）。
+     */
+    fun mediaRelativePath(name: String): String? {
+        val ctx = appContext!!
+        for (collection in listOf(
+            MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
+            MediaStore.Video.Media.EXTERNAL_CONTENT_URI,
+        )) {
+            runCatching {
+                ctx.contentResolver.query(
+                    collection,
+                    arrayOf(MediaStore.MediaColumns.RELATIVE_PATH),
+                    MediaStore.MediaColumns.DISPLAY_NAME + "=?",
+                    arrayOf(name),
+                    MediaStore.MediaColumns._ID + " DESC",
+                )?.use { cur ->
+                    if (cur.moveToFirst()) {
+                        val p = cur.getString(0)
+                        if (!p.isNullOrEmpty()) return p.trimEnd('/')
                     }
                 }
             }

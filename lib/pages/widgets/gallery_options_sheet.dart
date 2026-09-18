@@ -2,20 +2,22 @@ import 'package:flutter/material.dart';
 
 import 'app_widgets.dart';
 
-/// 相册页选项弹窗：文件类型 / 文件夹 / 排序 / 下载画质。
+/// 相册页选项弹窗：文件类型 / 文件夹 / 排序 /（可选）下载画质。
 ///
 /// 全是无状态的"选一个就回调"，因此抽成函数，页面只负责传入当前值。
+/// 「下载画质」段只在 [variant] 非空时显示——本机（已下载）页没有这个概念，
+/// 但类型/文件夹/排序三段是共用的，所以做成可选段而不是复制一份。
 Future<void> showGalleryOptionsSheet({
   required BuildContext context,
   required List<String> folders,
   required String kind,
   required String folder,
   required String sortMode,
-  required String variant,
+  String? variant,
   required ValueChanged<String> onKind,
   required ValueChanged<String> onFolder,
   required ValueChanged<String> onSort,
-  required ValueChanged<String> onVariant,
+  ValueChanged<String>? onVariant,
 }) {
   void pick(BuildContext ctx, VoidCallback apply) {
     apply();
@@ -45,10 +47,12 @@ Future<void> showGalleryOptionsSheet({
           optionTile(ctx, '最早优先', sortMode == 'oldest', () => pick(ctx, () => onSort('oldest'))),
           optionTile(ctx, '文件名 A→Z', sortMode == 'nameAsc', () => pick(ctx, () => onSort('nameAsc'))),
           optionTile(ctx, '文件名 Z→A', sortMode == 'nameDesc', () => pick(ctx, () => onSort('nameDesc'))),
-          const _SectionLabel('下载画质（仅 JPEG 生效）', top: 14),
-          optionTile(ctx, '原图', variant == 'original', () => pick(ctx, () => onVariant('original'))),
-          optionTile(ctx, '8M（长边 3840）', variant == '8M', () => pick(ctx, () => onVariant('8M'))),
-          optionTile(ctx, '2M（长边 1920）', variant == '2M', () => pick(ctx, () => onVariant('2M'))),
+          if (variant != null && onVariant != null) ...[
+            const _SectionLabel('下载画质（仅 JPEG 生效）', top: 14),
+            optionTile(ctx, '原图', variant == 'original', () => pick(ctx, () => onVariant('original'))),
+            optionTile(ctx, '8M（长边 3840）', variant == '8M', () => pick(ctx, () => onVariant('8M'))),
+            optionTile(ctx, '2M（长边 1920）', variant == '2M', () => pick(ctx, () => onVariant('2M'))),
+          ],
         ],
       ),
     ),

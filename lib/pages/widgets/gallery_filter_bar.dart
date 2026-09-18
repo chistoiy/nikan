@@ -18,6 +18,8 @@ class GalleryFilterBar extends StatelessWidget {
     required this.pairedOnly,
     required this.pairedCount,
     required this.onTogglePaired,
+    this.showUndownloaded = true,
+    this.showPaired = true,
   });
 
   final String kind; // all / jpeg / raw / video
@@ -38,6 +40,12 @@ class GalleryFilterBar extends StatelessWidget {
   final bool pairedOnly;
   final int pairedCount;
   final VoidCallback onTogglePaired;
+
+  /// 是否显示「未下载」快捷筛。本机（已下载）页没有"未下载"的概念，置 false。
+  final bool showUndownloaded;
+
+  /// 是否显示「成对」筛。本机页的成对关系尚未建立，置 false。
+  final bool showPaired;
 
   @override
   Widget build(BuildContext context) {
@@ -71,7 +79,7 @@ class GalleryFilterBar extends StatelessWidget {
             chip('RAW', 'raw'),
             chip('视频', 'video'),
             // 未下载快捷筛：待下载清零后仍保留（否则筛空了就没法关掉它）
-            if (undownloadedCount > 0 || undownloadedOnly)
+            if (showUndownloaded && (undownloadedCount > 0 || undownloadedOnly))
               Padding(
                 padding: const EdgeInsets.only(right: 8),
                 child: FilterChip(
@@ -93,21 +101,23 @@ class GalleryFilterBar extends StatelessWidget {
             const SizedBox(width: 4),
             // RAW+JPEG 成对筛：相机开了"同时记录"时，一张照片是两个文件，
             // 这个筛选让用户能只看这些成对照片（便于成对下载/成对清理）
-            FilterChip(
-              label: Text(
-                '成对 $pairedCount',
-                style: TextStyle(fontSize: 12.5, color: pairedOnly ? Colors.black : Colors.white70),
+            if (showPaired) ...[
+              FilterChip(
+                label: Text(
+                  '成对 $pairedCount',
+                  style: TextStyle(fontSize: 12.5, color: pairedOnly ? Colors.black : Colors.white70),
+                ),
+                selected: pairedOnly,
+                selectedColor: kAccent,
+                checkmarkColor: Colors.black,
+                showCheckmark: false,
+                visualDensity: VisualDensity.compact,
+                side: BorderSide(color: pairedOnly ? kAccent : Colors.white24),
+                backgroundColor: const Color(0xFF161616),
+                onSelected: (_) => onTogglePaired(),
               ),
-              selected: pairedOnly,
-              selectedColor: kAccent,
-              checkmarkColor: Colors.black,
-              showCheckmark: false,
-              visualDensity: VisualDensity.compact,
-              side: BorderSide(color: pairedOnly ? kAccent : Colors.white24),
-              backgroundColor: const Color(0xFF161616),
-              onSelected: (_) => onTogglePaired(),
-            ),
-            const SizedBox(width: 4),
+              const SizedBox(width: 4),
+            ],
             FilterChip(
               label: Text(
                 '按天分组',

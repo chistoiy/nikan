@@ -322,6 +322,8 @@ class _RemotePageState extends State<RemotePage> {
   void _onFrameOk() {
     _notLvCount = 0;
     _lvRestartFails = 0;
+    // 顺带清掉"已关闭"记录：下次再出故障要能重新提示
+    _dismissedProblem = null;
     if (_lvProblem != null && mounted) {
       setState(() => _lvProblem = null);
     } else {
@@ -359,6 +361,13 @@ class _RemotePageState extends State<RemotePage> {
 
   /// 面向用户的取景故障说明（null = 正常）
   String? _lvProblem;
+
+  /// 用户手动关掉过的故障文案。
+  ///
+  /// 与 [_lvProblem] 文案相等时不再显示——这样"关掉"是有效的，
+  /// 但一旦**换了一条故障**（或取景恢复正常后又出问题）会重新弹出，
+  /// 不会因为关过一次就再也看不到警告。
+  String? _dismissedProblem;
 
   /// 自动重试已放弃（连续失败太多次）
   bool _lvPaused = false;
@@ -572,7 +581,7 @@ class _RemotePageState extends State<RemotePage> {
         unawaited(_enableKeepAwake());
       } catch (e) {
         if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('实时取景启动失败：$e')));
+          showNotice(context, '实时取景启动失败：$e');
         }
       } finally {
         if (mounted) setState(() => _lvStarting = false);
@@ -612,15 +621,12 @@ class _RemotePageState extends State<RemotePage> {
         // 只提示一次：本机（Z50 II · Wi-Fi）这组属性全部不支持，每次进取景都弹会烦
         if (mounted && !_keepAwakeWarned) {
           _keepAwakeWarned = true;
-          ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(
-              content: const Text(
-                '本机不支持由 App 延长相机息屏时间（探针实测 0xD064/0xD062 等均"不支持"）。\n'
-                '相机待机后遥控会失效，请在相机菜单把「电源关闭延迟」调长：\n'
-                'MENU → ✏️自定义设定菜单 → c3 电源关闭延迟。',
-              ),
-              duration: const Duration(seconds: 12),
-            ),
+          showNotice(
+            context,
+            '本机不支持由 App 延长相机息屏时间（探针实测 0xD064/0xD062 等均"不支持"）。\n'
+            '相机待机后遥控会失效，请在相机菜单把「电源关闭延迟」调长：\n'
+            'MENU → ✏️自定义设定菜单 → c3 电源关闭延迟。',
+            duration: const Duration(seconds: 12),
           );
         }
       }
@@ -654,10 +660,9 @@ class _RemotePageState extends State<RemotePage> {
       _loadParams();
     } catch (e) {
       if (mounted) {
-        // 对焦优先的说明含相机菜单路径，需要更长的展示时间才看得完
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('拍摄失败：$e'), duration: const Duration(seconds: 8)),
-        );
+        // 对焦优先的说明含相机菜单路径，需要更长的展示时间才看得完。
+        // 这类长文案尤其需要"点一下就能关"——否则它会在底部挡 8 秒。
+        showNotice(context, '拍摄失败：$e', duration: const Duration(seconds: 8));
       }
     } finally {
       if (mounted) setState(() => _shooting = false);
@@ -677,20 +682,17 @@ class _RemotePageState extends State<RemotePage> {
       } else {
         _flashAfNote('对焦失败');
         final mode = _modeName();
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text(
-              '对焦未能驱动：${r['reason'] ?? '相机未响应'}'
-              '${mode != null ? '\n当前档位：$mode' : ''}\n$kAfHint',
-            ),
-            duration: const Duration(seconds: 8),
-          ),
+        showNotice(
+          context,
+          '对焦未能驱动：${r['reason'] ?? '相机未响应'}'
+          '${mode != null ? '\n当前档位：$mode' : ''}\n$kAfHint',
+          duration: const Duration(seconds: 8),
         );
       }
     } catch (e) {
       if (mounted) {
         _flashAfNote('对焦失败');
-        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('对焦失败：$e')));
+        showNotice(context, '对焦失败：$e');
       }
     } finally {
       if (mounted) setState(() => _focusing = false);
@@ -734,11 +736,10 @@ class _RemotePageState extends State<RemotePage> {
       } else {
         setState(() => _afState = 'failed');
         _flashAfNote('对焦失败');
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text('对焦未能驱动：${r['reason'] ?? '相机未响应'}\n$kAfHint'),
-            duration: const Duration(seconds: 8),
-          ),
+        showNotice(
+          context,
+          '对焦未能驱动：${r['reason'] ?? '相机未响应'}\n$kAfHint',
+          duration: const Duration(seconds: 8),
         );
       }
     } catch (e) {
@@ -1068,7 +1069,7 @@ class _RemotePageState extends State<RemotePage> {
     try {
       final r = await model.download([f]);
       if (mounted && r.isNotEmpty) {
-        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(r)));
+        showNotice(context, r);
       }
     } finally {
       if (mounted) setState(() => _downloadingLast = false);
@@ -1224,7 +1225,7 @@ class _RemotePageState extends State<RemotePage> {
       }
     } catch (e) {
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('设置失败：$e')));
+        showNotice(context, '设置失败：$e');
       }
     }
     _loadParams(); // 设置可能联动其他参数，统一后台刷新
@@ -1423,14 +1424,25 @@ class _RemotePageState extends State<RemotePage> {
                     top: _afTarget!.dy - 26,
                     child: IgnorePointer(child: _AfCrosshair(state: _afState)),
                   ),
-                // 取景故障面板：说清"为什么没有画面"以及怎么办（此前只有一个转圈）
-                if (_lvProblem != null)
-                  Positioned(
-                    left: 12,
-                    right: 12,
-                    top: 0,
-                    bottom: 0,
-                    child: Center(child: _lvProblemCard(_lvProblem!)),
+                // 取景故障面板：说清"为什么没有画面"以及怎么办（此前只有一个转圈）。
+                // 可关闭：点卡片外的遮罩、点右上角 ×、或点两个操作按钮都行——
+                // 此前只有"唤醒并重进/切到盲拍"两条路，想先看一眼画面再决定都做不到。
+                if (_lvProblem != null && _lvProblem != _dismissedProblem)
+                  Positioned.fill(
+                    child: GestureDetector(
+                      behavior: HitTestBehavior.opaque,
+                      onTap: () => setState(() => _dismissedProblem = _lvProblem),
+                      child: ColoredBox(
+                        color: Colors.black.withValues(alpha: 0.42),
+                        child: Center(
+                          child: GestureDetector(
+                            // 卡片自身的点击不透传给遮罩，避免点在文字上就被关掉
+                            onTap: () {},
+                            child: _lvProblemCard(_lvProblem!),
+                          ),
+                        ),
+                      ),
+                    ),
                   ),
                 // 相机没接受指定点时，把实际发出去的坐标摆出来（排错的第一手证据）
                 if (_afSent != null && (_afState == 'fallback' || _afState == 'failed'))
@@ -1558,26 +1570,41 @@ class _RemotePageState extends State<RemotePage> {
         ),
       );
 
-  /// 取景故障卡片：原因 + 「唤醒并重进取景」+ 「切到盲拍」。
+  /// 取景故障卡片：原因 + 「唤醒并重进取景」+ 「切到盲拍」+ 右上角关闭。
   ///
   /// 真机结论（2026-09-15）：相机待机（屏幕灭）后，`0x9201` 仍回成功但 `0x9203`
   /// 恒 NotLiveView、`0x9205` 被接受却不生效；且本机不支持修改息屏时间
   /// （0xD064/0xD062/0xD066/0xD0B3 全部"不支持"）。所以这里必须把话说全：
   /// **PTP 侧不一定叫得醒它**，要按相机按钮/调菜单；同时给出"盲拍"这条不带取景的活路。
+  ///
+  /// **必须有明确的关闭入口**：用户经常只是"想先看一眼、再决定要不要重试"，
+  /// 而这张卡片盖在取景画面上，关不掉就等于挡住了唯一的信息来源。
   Widget _lvProblemCard(String msg) => Container(
         constraints: const BoxConstraints(maxWidth: 340),
-        padding: const EdgeInsets.fromLTRB(16, 14, 16, 14),
+        padding: const EdgeInsets.fromLTRB(16, 6, 16, 14),
         decoration: BoxDecoration(
-          color: Colors.black.withValues(alpha: 0.88),
+          color: Colors.black.withValues(alpha: 0.9),
           borderRadius: BorderRadius.circular(14),
           border: Border.all(color: const Color(0xFFE5A08A)),
         ),
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
-            const Icon(Icons.videocam_off_outlined, size: 24, color: Color(0xFFE5A08A)),
+            Row(
+              children: [
+                const Icon(Icons.videocam_off_outlined, size: 22, color: Color(0xFFE5A08A)),
+                const Spacer(),
+                IconButton(
+                  icon: const Icon(Icons.close, size: 20),
+                  tooltip: '关闭提示（不会重进取景）',
+                  visualDensity: VisualDensity.compact,
+                  color: Colors.white70,
+                  onPressed: () => setState(() => _dismissedProblem = _lvProblem),
+                ),
+              ],
+            ),
             if (_cameraMaybeAsleep) ...[
-              const SizedBox(height: 6),
+              const SizedBox(height: 2),
               const Text('相机可能已进入待机（屏幕灭）',
                   style: TextStyle(fontSize: 14, fontWeight: FontWeight.w700, color: Color(0xFFE5A08A))),
             ],
@@ -1614,6 +1641,11 @@ class _RemotePageState extends State<RemotePage> {
                   ),
                 ),
               ],
+            ),
+            const SizedBox(height: 8),
+            Text(
+              '点卡片外、或右上角 × 可关闭本提示（不会重进取景）',
+              style: TextStyle(fontSize: 11, color: Colors.white.withValues(alpha: 0.5)),
             ),
           ],
         ),

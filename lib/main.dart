@@ -55,6 +55,10 @@ class HomeShell extends StatefulWidget {
 class _HomeShellState extends State<HomeShell> with WidgetsBindingObserver {
   int _tab = 0;
 
+  /// 手机页是否处于选择模式（由该页上报）。
+  /// 返回键的处理在本层，而选择状态在手机页内部，所以要把它同步上来。
+  bool _phoneHasSelection = false;
+
   @override
   void initState() {
     super.initState();
@@ -80,13 +84,41 @@ class _HomeShellState extends State<HomeShell> with WidgetsBindingObserver {
 
   @override
   Widget build(BuildContext context) {
+    // 返回键**逐层退**，而不是一按就退出应用：
+    //   ① 手机页正在多选 → 先取消多选（用户想退出的是选择，不是应用）
+    //   ② 不在相机页 → 先回相机页
+    //   ③ 都没有 → 才真的退出
+    // 此前没有任何返回拦截：在手机页按返回会直接退出应用，多选态下尤其容易误触。
+    return PopScope(
+      canPop: _tab == 0 && !_phoneHasSelection,
+      onPopInvokedWithResult: (didPop, _) {
+        if (didPop) return;
+        if (_phoneHasSelection) {
+          _phoneKey.currentState?.exitSelection();
+          return;
+        }
+        if (_tab != 0) setState(() => _tab = 0);
+      },
+      child: _buildShell(context),
+    );
+  }
+
+  final GlobalKey<DownloadsPageState> _phoneKey = GlobalKey<DownloadsPageState>();
+
+  Widget _buildShell(BuildContext context) {
     return Scaffold(
       backgroundColor: const Color(0xFF0A0A0A),
       body: IndexedStack(
         index: _tab,
         children: [
           ConnectPage(model: appModel),
-          DownloadsPage(model: appModel),
+          DownloadsPage(
+            key: _phoneKey,
+            model: appModel,
+            onSelectionChanged: (v) {
+              if (v != _phoneHasSelection) setState(() => _phoneHasSelection = v);
+            },
+          ),
         ],
       ),
       bottomNavigationBar: NavigationBarTheme(

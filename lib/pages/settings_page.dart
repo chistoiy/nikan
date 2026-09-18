@@ -180,6 +180,55 @@ class _SettingsPageState extends State<SettingsPage> {
                   activeThumbColor: yellow,
                   onChanged: (v) => model.setLinkRawJpegPairs(v),
                 ),
+                // ---- 自动连接 ----
+                SwitchListTile(
+                  dense: true,
+                  contentPadding: const EdgeInsets.only(top: 8),
+                  secondary: const Icon(Icons.wifi_find, size: 22),
+                  title: const Text('连上相机热点后自动连接', style: TextStyle(fontSize: 14.5)),
+                  subtitle: Text(
+                    model.autoConnectWifi
+                        ? '已开启：手机加入「${model.settings.lastCameraSsid ?? "记住的相机热点"}」时会自动连上，'
+                            '不必再点一次（只认这台相机，连着家里路由不会乱连）'
+                        : '已关闭：每次都需要手动点「连接相机」',
+                    style: const TextStyle(fontSize: 12),
+                  ),
+                  value: model.autoConnectWifi,
+                  activeThumbColor: yellow,
+                  onChanged: (v) => model.setAutoConnectWifi(v),
+                ),
+                SwitchListTile(
+                  dense: true,
+                  contentPadding: const EdgeInsets.only(top: 8),
+                  secondary: const Icon(Icons.usb, size: 22),
+                  title: const Text('插入 USB 相机时自动连接', style: TextStyle(fontSize: 14.5)),
+                  subtitle: Text(
+                    model.autoConnectUsb
+                        ? '已开启：插上数据线（或系统因此拉起本应用）后自动连接；'
+                            '失败会退回"手动点连接"的提示'
+                        : '已关闭：只提示检测到相机，由你点按钮连接',
+                    style: const TextStyle(fontSize: 12),
+                  ),
+                  value: model.autoConnectUsb,
+                  activeThumbColor: yellow,
+                  onChanged: (v) => model.setAutoConnectUsb(v),
+                ),
+                if (model.settings.hasRememberedCamera)
+                  ListTile(
+                    dense: true,
+                    contentPadding: const EdgeInsets.only(top: 4),
+                    leading: const Icon(Icons.bookmark_remove_outlined, size: 22),
+                    title: const Text('忘记记住的相机', style: TextStyle(fontSize: 14.5)),
+                    subtitle: Text(
+                      '当前记住：${model.settings.lastCameraName ?? model.settings.lastCameraSsid ?? "（未知）"}'
+                      '${model.settings.lastCameraIp != null ? " · ${model.settings.lastCameraIp}" : ""}',
+                      style: const TextStyle(fontSize: 12),
+                    ),
+                    onTap: () async {
+                      await model.forgetCamera();
+                      if (context.mounted) setState(() {});
+                    },
+                  ),
                 SwitchListTile(
                   dense: true,
                   contentPadding: const EdgeInsets.only(top: 8),

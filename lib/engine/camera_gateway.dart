@@ -13,11 +13,16 @@ import '../models/camera_file.dart';
 class CameraGateway {
   CameraGateway() {
     thumbCache.pruneDiskIfNeeded();
+    localThumbCache.pruneDiskIfNeeded();
     records.load();
   }
 
   // NikonEngine 为纯静态封装
   final ThumbCache thumbCache = ThumbCache();
+
+  /// 已下载到手机的照片的缩略图缓存（本机页用，键为"文件名+大小"）。
+  /// 与相机侧的分开：两边键空间与失效条件完全不同，混在一起必然互相顶掉。
+  final LocalThumbCache localThumbCache = LocalThumbCache();
   final RecordStore records = RecordStore();
 
   final Queue<_Job> _hi = Queue();

@@ -100,6 +100,17 @@ class RecordStore extends ChangeNotifier {
     _scheduleSave();
   }
 
+  /// 修补旧记录缺失的保存路径（早期版本的记录只有文件名，全被归到"未知位置"）
+  void updatePath(String key, String path) {
+    final e = _entries[key];
+    if (e == null || (e.path ?? '').isNotEmpty) return;
+    _entries[key] = RecEntry(
+      name: e.name, size: e.size, variant: e.variant, uri: e.uri, path: path, time: e.time,
+    );
+    _changed();
+    _scheduleSave();
+  }
+
   void clear() {
     if (_entries.isEmpty) return;
     _entries.clear();

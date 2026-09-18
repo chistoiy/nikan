@@ -42,4 +42,21 @@ class MainActivity : FlutterActivity() {
         super.onActivityResult(requestCode, resultCode, data)
         NikonsyncPlugin.onActivityResult(requestCode, resultCode, data)
     }
+
+    /**
+     * 运行时权限的结果**必须**转发给插件。
+     *
+     * 本插件是手工注册的（不走 Flutter 生成的注册表），所以引擎的
+     * `onRequestPermissionsResult` 分发到不了它——此前完全没转发，
+     * 结果是"授权框弹了，但没人知道用户选了什么"，Dart 只能轮询权限位去猜，
+     * 用户犹豫几秒就被判成失败（真机踩过）。
+     */
+    override fun onRequestPermissionsResult(
+        requestCode: Int,
+        permissions: Array<out String>,
+        grantResults: IntArray,
+    ) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        NikonsyncPlugin.onPermissionResult(requestCode, permissions, grantResults)
+    }
 }

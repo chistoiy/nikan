@@ -120,13 +120,101 @@ class NikonEngine {
     return List<String>.from(r as List);
   }
 
+  /// 按文件名查媒体库里的相对路径（如 `Pictures/NikonSync`），查不到返回 null。
+  /// 用于补全早期版本记录里缺失的保存位置（它们此前全被归到"未知位置"）。
+  static Future<String?> mediaRelativePath(String name) async {
+    final r = await _m.invokeMethod('mediaRelativePath', {'name': name});
+    return r as String?;
+  }
+
+  /// 尽力读出**当前所连热点的 SSID**（读不到返回 null）。
+  ///
+  /// 走 `NetworkCapabilities.transportInfo`（API 29+）拿 `WifiInfo`，再退回
+  /// `WifiManager.connectionInfo`。
+  ///
+  /// ⚠️ 读不到时先确认 [hasWifiScanPermission]，**不要**急着归因于"Android 13+
+  /// 抹掉了 SSID"：没授予 NEARBY_WIFI_DEVICES 时，系统返回的就是 `<unknown ssid>`，
+  /// 现象完全一样（本项目真机上就是这么误判过一轮）。
+  static Future<String?> currentSsid() async =>
+      await _m.invokeMethod('currentSsid') as String?;
+
+  /// 打开本应用的系统设置页（权限被拒两次后引导用户手动开启）
+  static Future<void> openAppSettings() => _m.invokeMethod('openAppSettings');
+
+  /// 扫描附近 Wi-Fi 热点：返回 `[{ssid, level, secured, capabilities}]`。
+  ///
+  /// 用于"选择相机热点"——**避免让用户手抄一长串 SSID**。
+  /// 没有扫描权限时返回空列表（**先看日志里的 `扫描附近 Wi-Fi：…` 那行**，
+  /// 它会说明是权限问题、Wi-Fi 未开，还是确实一条都没扫到）。
+  static Future<List<Map<String, dynamic>>> scanWifiNetworks() async {
+    final r = await _m.invokeMethod('scanWifiNetworks');
+    return (r as List).map((e) => Map<String, dynamic>.from(e as Map)).toList();
+  }
+
+  /// 手机**已保存过**的热点名（去重）。
+  ///
+  /// 这份列表通常比"现扫"更好用：相机热点是用户手动连过一次的，名字必然在这里；
+  /// 而 `startScan` 在新装应用/系统限流时可能长时间为空（真机踩过）。
+  static Future<List<String>> savedWifiSsids() async {
+    final r = await _m.invokeMethod('savedWifiSsids');
+    return ((r as List?) ?? const []).map((e) => e.toString()).toList();
+  }
+
+  /// 是否已持有扫描所需权限
+  static Future<bool> hasWifiScanPermission() async =>
+      (await _m.invokeMethod('hasWifiScanPermission')) == true;
+
+  /// 申请扫描所需权限。返回状态串：
+  /// `granted`（已有）/ `asked`（已弹框，等用户作答）/ `blocked`（已问过且不再弹框，
+  /// 只能去应用设置）/ `no-activity` / `error`。
+  static Future<String> requestWifiScanPermission() async =>
+      (await _m.invokeMethod('requestWifiScanPermission'))?.toString() ?? 'error';
+
+  /// 权限是否已由用户作答：`granted` / `denied` / `pending`。
+  /// Dart 靠它等待系统授权框，而不是"数着秒数猜超时"。
+  static Future<String> wifiPermissionState() async =>
+      (await _m.invokeMethod('wifiPermissionState'))?.toString() ?? 'pending';
+
+  /// 加入相机自建热点（AP 模式）——**App 内一键，不用跳系统设置**。
+  ///
+  /// 会弹出系统确认框「连接到 SSID？」，用户点连接后才返回。
+  /// 该连接是 App 专属的（系统仍保留用户与家里路由器的连接），
+  /// 断开相机时会自动退出（见原生 `disconnect`）。
+  ///
+  /// 阻塞最多约 90 秒等用户确认，调用方不要放在 UI 同步路径上。
+  static Future<Map<String, dynamic>> joinCameraAp(String ssid, String passphrase) async {
+    final r = await _m.invokeMethod('joinCameraAp', {
+      'ssid': ssid,
+      'passphrase': passphrase,
+    });
+    return Map<String, dynamic>.from(r as Map);
+  }
+
+  /// 退出 App 专属的相机热点连接（恢复系统默认网络）
+  static Future<bool> leaveCameraAp() async =>
+      (await _m.invokeMethod('leaveCameraAp')) == true;
+
+  /// 当前是否处于 App 专属的相机热点连接
+  static Future<bool> cameraApActive() async =>
+      (await _m.invokeMethod('cameraApActive')) == true;
+
   /// 最近一次通过 USB 接入的相机名（无则 null）。
   ///
-  /// 插入相机会把应用拉起来，但那一刻事件通道可能还没建好、事件会丢，
-  /// 所以连接页初始化时主动查一次而不是只等事件。
+  /// 只反映"系统投递过 ATTACHED Intent"这一条路，**多数 ROM 不会投**
+  /// （HyperOS 实测如此）。要判断"现在是否插着相机"请用 [usbCameraPresent]。
   static Future<String?> lastUsbAttach() async {
     final r = await _m.invokeMethod('lastUsbAttach');
     return r as String?;
+  }
+
+  /// 现在 USB 总线上是否有相机（返回设备名，无则 null）。
+  ///
+  /// 这是判断"要不要自动连 USB 相机"的**可靠依据**：不去等系统的 ATTACHED 广播，
+  /// 直接问 `UsbManager.deviceList` 里有没有带 PTP 接口的设备。
+  static Future<String?> usbCameraPresent() async {
+    final r = await _m.invokeMethod('usbCameraPresent');
+    if (r is String && r.isNotEmpty) return r;
+    return null;
   }
 
   /// 清掉"已提示过 USB 接入"的标记。
